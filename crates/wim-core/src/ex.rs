@@ -294,16 +294,7 @@ fn run_keys_on_line(
     effects: &mut Vec<Effect>,
 ) {
     editor.set_cursor(Position::new(line, 0));
-    for key in keys {
-        let mut produced = editor.handle_key(*key);
-        let failed = produced
-            .iter()
-            .any(|effect| matches!(effect, Effect::Error(_)));
-        effects.append(&mut produced);
-        if failed {
-            break;
-        }
-    }
+    editor.feed_keys(keys, effects);
     editor.leave_pending_modes();
 }
 

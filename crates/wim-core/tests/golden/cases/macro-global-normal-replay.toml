@@ -1,0 +1,11 @@
+name = ":g/pattern/norm @q plays a macro on every line that matches"
+input = '''
+let b
+import a
+import c'''
+keys = "qqA;<Esc>q:g/^import/norm @q<CR>"
+expected = '''
+let b;
+import a;
+import c;'''
+expected_cursor = [2, 8]

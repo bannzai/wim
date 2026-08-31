@@ -38,6 +38,10 @@ impl RegisterContent {
 /// registers, and no appending form `"A`. A yank or a delete always fills the unnamed
 /// register, and fills a named one as well when the command named one; a paste reads the
 /// register it names, and the unnamed one when it names none.
+///
+/// A macro recorded with `q{a-z}` shares this storage: it is kept as its keys written out in
+/// the key notation, so `"qp` puts a macro into the buffer as text and `@q` reads it back out
+/// of a register a paste could have filled.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Registers {
     unnamed: Option<RegisterContent>,
@@ -51,6 +55,12 @@ impl Registers {
             self.named.insert(name, content.clone());
         }
         self.unnamed = Some(content);
+    }
+
+    /// Fills `name` and leaves the unnamed register as it was, which is how a recorded macro
+    /// lands in a register without changing what a paste would put back.
+    pub fn store_named(&mut self, name: char, content: RegisterContent) {
+        self.named.insert(name, content);
     }
 
     /// What `name` holds, or the unnamed register when no name was given. `None` when the

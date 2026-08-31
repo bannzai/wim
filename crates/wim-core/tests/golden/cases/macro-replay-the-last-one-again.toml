@@ -1,0 +1,11 @@
+name = "@@ plays the macro @ played last"
+input = '''
+a
+b
+c'''
+keys = "qmA!<Esc>jq@m@@"
+expected = '''
+a!
+b!
+c!'''
+expected_cursor = [2, 1]

@@ -1,12 +1,14 @@
 //! The editor state machine: keys in, buffer and cursor out.
 
+use std::collections::BTreeMap;
+
 use crate::buffer::Buffer;
 use crate::command::{Command, InsertAnchor, Operator, OperatorTarget};
 use crate::edit;
 use crate::effect::Effect;
 use crate::ex;
 use crate::grammar::Grammar;
-use crate::key::{KeyCode, KeyEvent, KeyParseError, parse_keys};
+use crate::key::{KeyCode, KeyEvent, KeyParseError, format_keys, parse_keys};
 use crate::mode::Mode;
 use crate::motion::{self, Motion, MotionContext, MotionKind};
 use crate::position::Position;
@@ -24,6 +26,29 @@ struct LastEdit {
     command: Command,
     insert_keys: Vec<KeyEvent>,
 }
+
+/// The macro `q{a-z}` is filling: the register it will land in, and the keys typed into it
+/// so far.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Recording {
+    register: char,
+    keys: Vec<KeyEvent>,
+}
+
+/// How deep `@` playbacks may nest.
+///
+/// A macro that plays another one is ordinary; a macro that plays itself is how a loop is
+/// written in Vim, and the usual end of one is a key inside it failing. This limit is what
+/// ends the ones that never fail, and it is far past the nesting a macro written by hand
+/// uses.
+const MACRO_DEPTH_LIMIT: usize = 32;
+
+/// How many keys one `@` may feed, the keys of the macros it plays included.
+///
+/// A macro applied to a whole file legitimately runs for thousands of keys — `1000@q` is the
+/// Vim idiom for "until it fails" — so the limit is well past what a real run needs and only
+/// catches a playback that would not stop on its own.
+const MACRO_STEP_LIMIT: usize = 100_000;
 
 /// A buffer, a cursor and the mode that decides what keys mean.
 ///
@@ -50,6 +75,20 @@ pub struct Editor {
     /// Whether an Ex command is running. The whole of one is a single undo unit, so the
     /// commands it drives open none of their own.
     running_ex: bool,
+    /// The positions `m{a-z}` named, which `` ` `` and `'` move back to.
+    marks: BTreeMap<char, Position>,
+    /// The macro `q` is filling, `None` when nothing is being recorded.
+    recording: Option<Recording>,
+    /// The macro `@@` plays again.
+    last_macro: Option<char>,
+    /// How deeply the `@` playbacks running are nested, and how many keys they have fed
+    /// between them, which [`MACRO_DEPTH_LIMIT`] and [`MACRO_STEP_LIMIT`] cut off.
+    macro_depth: usize,
+    macro_steps: usize,
+    /// How deeply the editor is typing keys at itself — playing a macro, or running the keys
+    /// of a `:norm` — rather than reading keys a user typed. A recording keeps only typed
+    /// keys, as Vim's does.
+    fed_keys: usize,
 }
 
 impl Editor {
@@ -100,15 +139,48 @@ impl Editor {
         self.last_search.as_ref()
     }
 
+    /// The register `q` is recording into, which a host may show, `None` when nothing is
+    /// being recorded.
+    pub fn recording_register(&self) -> Option<char> {
+        self.recording.as_ref().map(|recording| recording.register)
+    }
+
+    /// Where `m` put the mark `name`, `None` when it was never set or a change took its line
+    /// away.
+    pub fn mark(&self, name: char) -> Option<Position> {
+        self.marks.get(&name).copied()
+    }
+
     /// Reads one key in the current mode.
+    ///
+    /// A recording keeps the key, unless the editor is typing it at itself; the marks are
+    /// moved over whatever the key changed.
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        if self.fed_keys == 0
+            && let Some(recording) = &mut self.recording
+        {
+            recording.keys.push(key);
+        }
+        // Comparing the buffers costs a walk of the text, which is worth doing only when
+        // there is a mark to move.
+        let before = (!self.marks.is_empty()).then(|| self.buffer.clone());
+        let effects = self.run_key(key);
+        if let Some(before) = before
+            && before.line_count() != self.buffer.line_count()
+        {
+            self.move_marks(&before);
+        }
+        effects
+    }
+
+    fn run_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         match self.mode {
             Mode::Insert => return self.handle_insert_key(key),
             // A command line is text being typed, so the Normal mode grammar never sees it.
             Mode::CommandLine => return self.handle_command_line_key(key),
             _ => {}
         }
-        let command = self.grammar.feed(key, self.mode);
+        let command = self.grammar.feed(key, self.mode, self.recording.is_some());
         let effects = self.apply(command);
         if !matches!(self.mode, Mode::Insert | Mode::CommandLine) {
             self.mode = if self.grammar.is_operator_pending() {
@@ -293,6 +365,21 @@ impl Editor {
             }
             Command::RepeatSearch { reverse, count } => return self.repeat_search(count, reverse),
             Command::SearchWord { backward, count } => return self.search_word(count, backward),
+            Command::RecordMacro { register } => {
+                self.recording = Some(Recording {
+                    register,
+                    keys: Vec::new(),
+                });
+            }
+            Command::StopRecording => self.stop_recording(),
+            Command::PlayMacro { register, count } => return self.play_macro(register, count),
+            Command::SetMark(name) => {
+                self.marks.insert(name, self.cursor);
+            }
+            Command::JumpMark {
+                name,
+                to_line_start,
+            } => return self.jump_mark(name, to_line_start),
             Command::Cancel => self.visual_anchor = None,
             Command::Pending => {}
             Command::Rejected(key) => {
@@ -540,6 +627,134 @@ impl Editor {
         self.repeat_search(count, false)
     }
 
+    /// Ends the recording `q` started, keeping its keys in the register it named, written out
+    /// in the key notation so that a paste can put them into the buffer as text.
+    ///
+    /// The `q` that ended the recording is not part of the macro. [`Editor::handle_key`] has
+    /// already kept it, as it keeps every typed key, so it comes back off here.
+    fn stop_recording(&mut self) {
+        let Some(mut recording) = self.recording.take() else {
+            return;
+        };
+        recording.keys.pop();
+        self.registers.store_named(
+            recording.register,
+            RegisterContent::charwise(format_keys(&recording.keys)),
+        );
+    }
+
+    /// `@{a-z}` and `@@`: types the keys a register holds, `count` times over.
+    fn play_macro(&mut self, register: Option<char>, count: Option<usize>) -> Vec<Effect> {
+        let Some(name) = register.or(self.last_macro) else {
+            return vec![Effect::Error("there is no macro to play again".to_owned())];
+        };
+        let Some(content) = self.registers.get(Some(name)).cloned() else {
+            return vec![Effect::Error(format!("register \"{name} is empty"))];
+        };
+        let keys = match parse_keys(&content.text) {
+            Ok(keys) => keys,
+            Err(error) => {
+                return vec![Effect::Error(format!(
+                    "register \"{name} does not hold keys: {error}"
+                ))];
+            }
+        };
+        self.last_macro = Some(name);
+        if self.macro_depth >= MACRO_DEPTH_LIMIT {
+            return vec![Effect::Error(format!(
+                "macros are nested more than {MACRO_DEPTH_LIMIT} deep"
+            ))];
+        }
+        if self.macro_depth == 0 {
+            self.macro_steps = 0;
+        }
+        self.macro_depth += 1;
+        let mut effects = Vec::new();
+        for _ in 0..at_least_one(count) {
+            if !self.feed_keys(&keys, &mut effects) {
+                break;
+            }
+        }
+        self.macro_depth -= 1;
+        effects
+    }
+
+    /// Types `keys` at the editor the way a macro and `:norm` do: keys it feeds itself rather
+    /// than keys a user typed, so a recording in progress keeps none of them.
+    ///
+    /// Returns whether every key ran without complaining. The first that reports an error ends
+    /// the run, which is what stops a macro at the first thing it cannot do, and a macro that
+    /// feeds more than [`MACRO_STEP_LIMIT`] keys is stopped the same way.
+    pub(crate) fn feed_keys(&mut self, keys: &[KeyEvent], effects: &mut Vec<Effect>) -> bool {
+        self.fed_keys += 1;
+        let mut ran = true;
+        for key in keys {
+            if self.macro_depth > 0 {
+                self.macro_steps += 1;
+                if self.macro_steps > MACRO_STEP_LIMIT {
+                    effects.push(Effect::Error(format!(
+                        "a macro ran for more than {MACRO_STEP_LIMIT} keys"
+                    )));
+                    ran = false;
+                    break;
+                }
+            }
+            let mut produced = self.handle_key(*key);
+            ran = !produced
+                .iter()
+                .any(|effect| matches!(effect, Effect::Error(_)));
+            effects.append(&mut produced);
+            if !ran {
+                break;
+            }
+        }
+        self.fed_keys -= 1;
+        ran
+    }
+
+    /// `` ` `` and `'`: moves to a mark, `'` to the first non-blank of the line it is on.
+    fn jump_mark(&mut self, name: char, to_line_start: bool) -> Vec<Effect> {
+        let Some(mark) = self.mark(name) else {
+            return vec![Effect::Error(format!("mark {name} is not set"))];
+        };
+        let mark = self.buffer.clamp(mark);
+        self.set_cursor(if to_line_start {
+            motion::first_non_blank(&self.buffer, mark.line)
+        } else {
+            mark
+        });
+        Vec::new()
+    }
+
+    /// Moves the marks over a change that added or took away lines.
+    ///
+    /// Tracking is by line and best-effort rather than the exact tracking Vim does through
+    /// every edit: a mark below the first line that differs moves by however many lines came
+    /// or went, and a mark on a line that went away is dropped. A change inside a line leaves
+    /// the marks on it where they are, so a mark's column can end up past the end of its line;
+    /// a jump clamps it back onto the line.
+    fn move_marks(&mut self, before: &Buffer) {
+        // A line past the end of a buffer reads as empty, so a change that only added or took
+        // away empty lines at the end finds no line that differs; those lines came or went at
+        // the end of the shorter buffer.
+        let changed_at = (0..before.line_count().max(self.buffer.line_count()))
+            .find(|line| before.line_text(*line) != self.buffer.line_text(*line))
+            .unwrap_or_else(|| before.line_count().min(self.buffer.line_count()));
+        let added = self.buffer.line_count() as isize - before.line_count() as isize;
+        self.marks.retain(|_, mark| {
+            if mark.line < changed_at {
+                return true;
+            }
+            match mark.line.checked_add_signed(added) {
+                Some(line) if line >= changed_at => {
+                    mark.line = line;
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+
     /// Moves the cursor onto a position it can occupy, which is how an Ex command running over
     /// a range walks from line to line.
     pub(crate) fn set_cursor(&mut self, pos: Position) {
@@ -561,11 +776,12 @@ impl Editor {
     /// command at the end of a `:normal`. Two `<Esc>`s are enough: one leaves Insert or
     /// Visual mode, and a second drops the keys a half-typed command left pending.
     pub(crate) fn leave_pending_modes(&mut self) {
+        let mut closing = Vec::new();
         for _ in 0..2 {
             if self.mode == Mode::Normal && !self.grammar.is_pending() {
                 break;
             }
-            self.handle_key(KeyEvent::key(KeyCode::Esc));
+            self.feed_keys(&[KeyEvent::key(KeyCode::Esc)], &mut closing);
         }
     }
 
@@ -583,7 +799,10 @@ impl Editor {
     /// entered Insert mode: that unit runs until `<Esc>`, and the keys typed until then
     /// belong to it. A command that altered nothing is neither kept nor repeatable.
     fn close_change(&mut self, command: Command) {
-        if self.running_ex {
+        // Playing a macro is a way of typing keys rather than a change of its own: the
+        // commands it played opened and closed their own units, and the last of them is the
+        // change `.` repeats.
+        if self.running_ex || matches!(command, Command::PlayMacro { .. }) {
             return;
         }
         if self.mode == Mode::Insert {
@@ -1503,6 +1722,127 @@ mod tests {
     fn a_line_that_is_only_a_number_moves_the_cursor_to_it() {
         assert_eq!(run("a\n  b\nc", ":2<CR>").cursor(), Position::new(1, 2));
         assert_eq!(run("a\nb\nc", ":$<CR>").cursor(), Position::new(2, 0));
+    }
+
+    #[test]
+    fn a_recording_holds_the_keys_typed_between_the_two_qs() {
+        assert_eq!(run("abc", "qa").recording_register(), Some('a'));
+
+        let editor = run("abc", "qaxq");
+        assert_eq!(editor.recording_register(), None);
+        assert_eq!(
+            editor.registers().get(Some('a')),
+            Some(&RegisterContent::charwise("x".to_owned())),
+            "the q that ended the recording is not part of the macro"
+        );
+        assert_eq!(
+            editor.registers().get(None).map(|held| held.text.as_str()),
+            Some("a"),
+            "recording into a register leaves the unnamed one to the delete the macro made"
+        );
+    }
+
+    #[test]
+    fn a_recording_keeps_the_keys_typed_at_it_and_not_the_ones_it_typed_itself() {
+        let editor = run("ab\ncd", "qa:%norm x<CR>q");
+        assert_eq!(editor.text(), "b\nd");
+        assert_eq!(
+            editor
+                .registers()
+                .get(Some('a'))
+                .map(|held| held.text.as_str()),
+            Some(":%norm x<CR>"),
+            "the keys :norm typed on each line are not keys the user typed"
+        );
+
+        let editor = run("abcdef", "qbxqqa@b@bq");
+        assert_eq!(
+            editor
+                .registers()
+                .get(Some('a'))
+                .map(|held| held.text.as_str()),
+            Some("@b@b"),
+            "a nested playback is kept as the @ that asked for it"
+        );
+    }
+
+    #[test]
+    fn playing_a_macro_types_its_keys_again() {
+        assert_eq!(run("a\nb\nc", "qaA!<Esc>jq@a@@").text(), "a!\nb!\nc!");
+        assert_eq!(run("1\n2\n3\n4", "qaA;<Esc>jq3@a").text(), "1;\n2;\n3;\n4;");
+        assert_eq!(
+            run("ab\ncd", "qaxq@au").text(),
+            "b\ncd",
+            "the commands a macro played are undone one at a time"
+        );
+        assert_eq!(
+            run("a b c d", "qadwq@a.").text(),
+            "d",
+            ". repeats the last change the macro made rather than the whole macro"
+        );
+    }
+
+    #[test]
+    fn playing_a_macro_reports_what_it_could_not_do() {
+        assert_eq!(error("ab", "@a"), "register \"a is empty");
+        assert_eq!(error("ab", "@@"), "there is no macro to play again");
+    }
+
+    #[test]
+    fn a_macro_that_plays_itself_stops_at_the_nesting_limit() {
+        let mut editor = Editor::new("ab");
+        let effects = editor
+            .handle_keys("qaA!<Esc>@aq@a")
+            .expect("key string should parse");
+        assert_eq!(
+            editor.text(),
+            format!("ab{}", "!".repeat(MACRO_DEPTH_LIMIT + 1)),
+            "the recording itself typed the first one, and the playbacks the rest"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Error(complaint) if complaint.contains("nested")
+            )),
+            "{effects:?}"
+        );
+    }
+
+    #[test]
+    fn a_mark_is_a_position_the_jump_keys_go_back_to() {
+        assert_eq!(
+            run("alpha\nbravo", "jllmagg`a").cursor(),
+            Position::new(1, 2)
+        );
+        assert_eq!(
+            run("alpha\n  bravo", "j4lmagg'a").cursor(),
+            Position::new(1, 2),
+            "' goes to the first non-blank of the marked line"
+        );
+        assert_eq!(error("ab", "`a"), "mark a is not set");
+    }
+
+    #[test]
+    fn a_mark_moves_with_the_lines_a_change_adds_or_takes_away() {
+        assert_eq!(
+            run("a\nb\nc", "jjmaggOx<Esc>").mark('a'),
+            Some(Position::new(3, 0)),
+            "a line opened above the mark pushes it down"
+        );
+        assert_eq!(
+            run("a\nb\nc", "jjmaggdd").mark('a'),
+            Some(Position::new(1, 0))
+        );
+        assert_eq!(
+            run("a\nb\nc", "jmajdd").mark('a'),
+            Some(Position::new(1, 0)),
+            "a change below the mark leaves it alone"
+        );
+        assert_eq!(
+            run("a\nb\nc", "jmadd").mark('a'),
+            None,
+            "a mark on a line that went away is dropped"
+        );
     }
 
     #[test]

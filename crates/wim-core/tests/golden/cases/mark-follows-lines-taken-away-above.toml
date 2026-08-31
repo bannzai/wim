@@ -1,0 +1,10 @@
+name = "a mark moves up with its line when a change takes lines away above it"
+input = '''
+alpha
+bravo
+charlie'''
+keys = "jjmaggdd'ax"
+expected = '''
+bravo
+harlie'''
+expected_cursor = [1, 0]

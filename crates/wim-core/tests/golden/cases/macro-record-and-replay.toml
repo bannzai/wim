@@ -1,0 +1,11 @@
+name = "q records the keys typed until the next q, and @ types them again"
+input = '''
+one
+two
+three'''
+keys = "qaI- <Esc>jq@a"
+expected = '''
+- one
+- two
+three'''
+expected_cursor = [2, 1]

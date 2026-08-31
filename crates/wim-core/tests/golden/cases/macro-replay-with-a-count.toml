@@ -1,0 +1,13 @@
+name = "a count on @ plays the macro that many times over"
+input = '''
+1
+2
+3
+4'''
+keys = "qaA;<Esc>jq3@a"
+expected = '''
+1;
+2;
+3;
+4;'''
+expected_cursor = [3, 1]

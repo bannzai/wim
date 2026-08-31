@@ -1,0 +1,11 @@
+name = "` moves back to the position a mark holds"
+input = '''
+alpha
+bravo
+charlie'''
+keys = "jllmagg`ax"
+expected = '''
+alpha
+brvo
+charlie'''
+expected_cursor = [1, 2]

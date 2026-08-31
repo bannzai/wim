@@ -22,6 +22,17 @@ enum Stage {
     AwaitReplacement,
     /// `"` is waiting for the letter that names the register.
     AwaitRegisterName,
+    /// `q` is waiting for the letter that names the register to record into.
+    AwaitMacroRegister,
+    /// `@` is waiting for the letter that names the macro to play, or for the second `@`.
+    AwaitMacroPlayback,
+    /// `m` is waiting for the letter to name the cursor's position with.
+    AwaitMarkName,
+    /// `` ` `` or `'` is waiting for the letter that names the mark to move to.
+    AwaitMarkJump {
+        /// `'` rather than `` ` ``.
+        to_line_start: bool,
+    },
 }
 
 /// Collects keys until they spell out a [`Command`].
@@ -30,6 +41,10 @@ enum Stage {
 /// counts multiplied together the way Vim multiplies them, so `2d3w` reaches as far as
 /// `d6w`. Keys that cannot continue what has been typed are rejected and drop the pending
 /// keys with them, and `<Esc>` drops them on request.
+///
+/// The commands that name a register or a mark — `q{a-z}`, `@{a-z}`, `m{a-z}`, `` `{a-z} ``
+/// and `'{a-z}` — wait for the letter that names it the way `f` waits for the character to
+/// search for.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Grammar {
     register: Option<char>,
@@ -45,7 +60,10 @@ impl Grammar {
     ///
     /// `mode` only tells Visual apart from Normal: a selection takes counts and motions, and
     /// reads an operator as acting on the selection itself rather than waiting for a range.
-    pub fn feed(&mut self, key: KeyEvent, mode: Mode) -> Command {
+    ///
+    /// `recording` is whether a macro is being recorded, which is the one thing outside the
+    /// keys that changes what one means: `q` ends a recording rather than starting one.
+    pub fn feed(&mut self, key: KeyEvent, mode: Mode, recording: bool) -> Command {
         if key.code == KeyCode::Esc {
             self.reset();
             return Command::Cancel;
@@ -88,6 +106,47 @@ impl Grammar {
                     'g' => self.finish_motion(Motion::FirstLine),
                     _ => self.reject(key),
                 };
+            }
+            Stage::AwaitMacroRegister => {
+                self.stage = Stage::Start;
+                if !character.is_ascii_lowercase() {
+                    return self.reject(key);
+                }
+                return self.emit(Command::RecordMacro {
+                    register: character,
+                });
+            }
+            Stage::AwaitMacroPlayback => {
+                self.stage = Stage::Start;
+                let count = self.count();
+                return match character {
+                    '@' => self.emit(Command::PlayMacro {
+                        register: None,
+                        count,
+                    }),
+                    name if name.is_ascii_lowercase() => self.emit(Command::PlayMacro {
+                        register: Some(name),
+                        count,
+                    }),
+                    _ => self.reject(key),
+                };
+            }
+            Stage::AwaitMarkName => {
+                self.stage = Stage::Start;
+                if !character.is_ascii_lowercase() {
+                    return self.reject(key);
+                }
+                return self.emit(Command::SetMark(character));
+            }
+            Stage::AwaitMarkJump { to_line_start } => {
+                self.stage = Stage::Start;
+                if !character.is_ascii_lowercase() {
+                    return self.reject(key);
+                }
+                return self.emit(Command::JumpMark {
+                    name: character,
+                    to_line_start,
+                });
             }
             Stage::AwaitTextObject { around } => {
                 self.stage = Stage::Start;
@@ -227,6 +286,33 @@ impl Grammar {
                 self.stage = Stage::AwaitReplacement;
                 Command::Pending
             }
+            // A recording ends on the `q` that is typed on its own, so the key that starts
+            // one is the same key that stops it.
+            'q' if recording => self.emit(Command::StopRecording),
+            'q' => {
+                self.stage = Stage::AwaitMacroRegister;
+                Command::Pending
+            }
+            '@' => {
+                self.stage = Stage::AwaitMacroPlayback;
+                Command::Pending
+            }
+            'm' => {
+                self.stage = Stage::AwaitMarkName;
+                Command::Pending
+            }
+            '`' => {
+                self.stage = Stage::AwaitMarkJump {
+                    to_line_start: false,
+                };
+                Command::Pending
+            }
+            '\'' => {
+                self.stage = Stage::AwaitMarkJump {
+                    to_line_start: true,
+                };
+                Command::Pending
+            }
             ':' | '/' | '?' => self.emit(Command::EnterCommandLine(character)),
             'n' => self.emit(Command::RepeatSearch {
                 reverse: false,
@@ -363,10 +449,16 @@ mod tests {
     }
 
     fn resolve_in(keys: &str, mode: Mode) -> Command {
+        resolve_while(keys, mode, false)
+    }
+
+    /// Feeds every key of `keys`, `recording` saying whether a macro is being recorded, and
+    /// returns what the last one resolved to.
+    fn resolve_while(keys: &str, mode: Mode, recording: bool) -> Command {
         let mut grammar = Grammar::default();
         let mut last = Command::Pending;
         for key in parse_keys(keys).expect("key string should parse") {
-            last = grammar.feed(key, mode);
+            last = grammar.feed(key, mode, recording);
         }
         last
     }
@@ -377,7 +469,7 @@ mod tests {
         let parsed = parse_keys(keys).expect("key string should parse");
         for key in &parsed[..parsed.len() - 1] {
             assert_eq!(
-                grammar.feed(*key, Mode::Normal),
+                grammar.feed(*key, Mode::Normal, false),
                 Command::Pending,
                 "{key} of {keys} should be pending"
             );
@@ -458,12 +550,12 @@ mod tests {
     fn an_operator_waits_for_its_target() {
         let mut grammar = Grammar::default();
         assert_eq!(
-            grammar.feed(KeyEvent::char('d'), Mode::Normal),
+            grammar.feed(KeyEvent::char('d'), Mode::Normal, false),
             Command::Pending
         );
         assert!(grammar.is_operator_pending());
         assert_eq!(
-            grammar.feed(KeyEvent::char('w'), Mode::Normal),
+            grammar.feed(KeyEvent::char('w'), Mode::Normal, false),
             operate(Operator::Delete, None, OperatorTarget::Motion(WORD))
         );
         assert!(!grammar.is_operator_pending());
@@ -701,19 +793,66 @@ mod tests {
     }
 
     #[test]
+    fn the_macro_and_mark_keys_wait_for_the_letter_that_names_them() {
+        assert_pending_until_last("qa");
+        assert_eq!(resolve("qa"), Command::RecordMacro { register: 'a' });
+        assert_eq!(
+            resolve_while("q", Mode::Normal, true),
+            Command::StopRecording,
+            "while a macro is being recorded, q ends it instead of starting another"
+        );
+        assert_pending_until_last("3@a");
+        assert_eq!(
+            resolve("3@a"),
+            Command::PlayMacro {
+                register: Some('a'),
+                count: Some(3)
+            }
+        );
+        assert_eq!(
+            resolve("@@"),
+            Command::PlayMacro {
+                register: None,
+                count: None
+            }
+        );
+        assert_eq!(resolve("ma"), Command::SetMark('a'));
+        assert_eq!(
+            resolve("`a"),
+            Command::JumpMark {
+                name: 'a',
+                to_line_start: false
+            }
+        );
+        assert_eq!(
+            resolve("'a"),
+            Command::JumpMark {
+                name: 'a',
+                to_line_start: true
+            }
+        );
+        assert_eq!(resolve("mA"), Command::Rejected(KeyEvent::char('A')));
+        assert_eq!(
+            resolve("d`"),
+            Command::Rejected(KeyEvent::char('`')),
+            "a mark is not a range an operator can take"
+        );
+    }
+
+    #[test]
     fn escape_drops_the_keys_typed_so_far() {
         let mut grammar = Grammar::default();
         for key in parse_keys("\"a2d3").expect("key string should parse") {
-            grammar.feed(key, Mode::Normal);
+            grammar.feed(key, Mode::Normal, false);
         }
         assert!(grammar.is_pending());
         assert_eq!(
-            grammar.feed(KeyEvent::key(KeyCode::Esc), Mode::Normal),
+            grammar.feed(KeyEvent::key(KeyCode::Esc), Mode::Normal, false),
             Command::Cancel
         );
         assert!(!grammar.is_pending());
         assert_eq!(
-            grammar.feed(KeyEvent::char('w'), Mode::Normal),
+            grammar.feed(KeyEvent::char('w'), Mode::Normal, false),
             Command::Move {
                 motion: WORD,
                 count: None
@@ -725,10 +864,10 @@ mod tests {
     #[test]
     fn a_key_that_continues_nothing_is_rejected_and_drops_the_pending_keys() {
         let mut grammar = Grammar::default();
-        grammar.feed(KeyEvent::char('2'), Mode::Normal);
-        grammar.feed(KeyEvent::char('d'), Mode::Normal);
+        grammar.feed(KeyEvent::char('2'), Mode::Normal, false);
+        grammar.feed(KeyEvent::char('d'), Mode::Normal, false);
         assert_eq!(
-            grammar.feed(KeyEvent::char('z'), Mode::Normal),
+            grammar.feed(KeyEvent::char('z'), Mode::Normal, false),
             Command::Rejected(KeyEvent::char('z'))
         );
         assert!(!grammar.is_pending());

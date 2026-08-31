@@ -1,0 +1,5 @@
+name = "a recording keeps the @ that played another macro, not the keys that macro typed"
+input = "abcdef"
+keys = "qbxqqa@b@bq@a"
+expected = "f"
+expected_cursor = [0, 0]

@@ -151,6 +151,30 @@ pub enum Command {
         /// How many matches to walk.
         count: Option<usize>,
     },
+    /// `q{a-z}`: keep the keys typed from here on in a register.
+    RecordMacro {
+        /// The register the keys will land in.
+        register: char,
+    },
+    /// `q` while a macro is being recorded: stop, and fill the register.
+    StopRecording,
+    /// `@{a-z}` and `@@`: type the keys a register holds.
+    PlayMacro {
+        /// The register to read, `None` for `@@`, which is the last one played again.
+        register: Option<char>,
+        /// How many times to type them.
+        count: Option<usize>,
+    },
+    /// `m{a-z}`: name the cursor's position.
+    SetMark(char),
+    /// `` `{a-z} `` and `'{a-z}`: move to a position named earlier.
+    JumpMark {
+        /// The mark to move to.
+        name: char,
+        /// `'` rather than `` ` ``: the first non-blank of the mark's line rather than the
+        /// column the mark holds.
+        to_line_start: bool,
+    },
     /// The keys so far are a prefix of a command; more are needed.
     Pending,
     /// `<Esc>`: drop the keys typed so far and leave the mode they were typed in.
