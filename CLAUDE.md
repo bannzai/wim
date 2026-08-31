@@ -10,7 +10,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`) は CI が行う。ローカルの Homebrew Rust には wasm32 の std が無いため実行しない。
+wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`) は CI が行う。ローカルの Homebrew Rust には wasm32 の std が無いため実行しない。`web/` のデモとその Playwright E2E (`make e2e`) も wasm ビルドを前提とするため、同じ理由でローカルでは動かず CI で検証する。
 
 ## 設計原則
 

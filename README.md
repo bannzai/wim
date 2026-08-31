@@ -4,8 +4,21 @@
 
 Vim 互換ではなく「Vim の文法を持つ新エディタ」です。オペレータ + カウント + モーション、レジスタ、キーマクロ、Ex コマンドの最小サブセットといった Vim の文法は残し、VimScript・Vim 独自の正規表現方言・既存プラグイン互換は捨てます。モーダル編集コアを 1 つの pure crate (`crates/wim-core`) に閉じ込め、headless CLI (`crates/vimacro`) / デーモン / ブラウザ (Wasm) の 3 形態で同じコアを動かします。
 
+- ブラウザデモ: https://bannzai.github.io/wim/
 - ロードマップ: https://github.com/bannzai/wim/issues/12
 - 設計の詳細: [documents/PROJECT.md](documents/PROJECT.md)
+
+## ブラウザデモ
+
+https://bannzai.github.io/wim/ で、`crates/wim-core` をそのまま Wasm にしたエディタが動きます (`crates/wim-wasm` のバインディング + `web/` の Canvas 描画)。`i` `a` `o` で Insert、`Esc` で Normal に戻り、`hjkl` `w` `b` `0` `$` の移動、`x` `dd` `yy` `p` `u` の編集、`:` の Ex コマンドが使えます。日本語入力 (IME)・ファイル操作・シンタックスハイライトはまだ入っていません。
+
+main への push で GitHub Actions が Wasm をビルドして Pages へデプロイします。手元で動かすには wasm32 ターゲットの Rust と、Cargo.lock と同じバージョンの `wasm-bindgen-cli` が要ります:
+
+```sh
+rustup target add wasm32-unknown-unknown
+make install-wasm-bindgen
+make web  # http://127.0.0.1:4173/
+```
 
 ## vimacro
 
@@ -71,7 +84,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`) は CI が行います。
+wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`) と、デモページに対する Playwright の E2E (`make e2e`) は CI が行います。
 
 ## License
 

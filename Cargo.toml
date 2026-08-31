@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/wim-core",
     "crates/wim-protocol",
+    "crates/wim-wasm",
     "crates/wim-daemon",
     "crates/vimacro",
     "crates/wim",
@@ -19,6 +20,7 @@ wim-core = { path = "crates/wim-core", version = "0.0.0" }
 wim-protocol = { path = "crates/wim-protocol", version = "0.0.0" }
 wim-daemon = { path = "crates/wim-daemon", version = "0.0.0" }
 ropey = "1.6"
+wasm-bindgen = "0.2"
 unicode-segmentation = "1.12"
 regex = "1.11"
 clap = { version = "4.5", features = ["derive"] }

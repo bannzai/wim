@@ -1,0 +1,17 @@
+[package]
+name = "wim-wasm"
+version = "0.0.0"
+description = "wasm-bindgen bindings that let a browser drive wim-core."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# cdylib is what wasm-bindgen reads; rlib keeps the crate usable from `cargo test` and clippy
+# on a native target, where the bindings themselves are never called.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wim-core.workspace = true
+serde_json.workspace = true
+wasm-bindgen.workspace = true

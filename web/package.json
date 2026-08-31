@@ -1,0 +1,13 @@
+{
+  "name": "wim-web",
+  "private": true,
+  "type": "module",
+  "description": "Browser demo of wim, driven by the wim-wasm bindings.",
+  "scripts": {
+    "serve": "node serve.mjs",
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0"
+  }
+}
