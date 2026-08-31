@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wim — a Vim-grammar editor in Rust &amp; Wasm</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --background: #12141a;
+        --foreground: #d8dee9;
+        --muted: #6a7383;
+      }
+
+      body {
+        margin: 0;
+        padding: 24px;
+        background: var(--background);
+        color: var(--foreground);
+        font-family: system-ui, sans-serif;
+      }
+
+      main {
+        margin: 0 auto;
+        max-width: 880px;
+      }
+
+      h1 {
+        font-size: 18px;
+        font-weight: 600;
+      }
+
+      p {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.7;
+      }
+
+      canvas {
+        display: block;
+        width: 100%;
+        max-width: 880px;
+        border: 1px solid #2b303b;
+        border-radius: 6px;
+      }
+
+      a {
+        color: inherit;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>wim — a Vim-grammar editor in Rust &amp; Wasm</h1>
+      <p>
+        キーボードで直接編集できます。<code>i</code> / <code>a</code> / <code>o</code> で Insert、<code>Esc</code> で Normal、
+        <code>hjkl</code> <code>w</code> <code>b</code> <code>0</code> <code>$</code> で移動、<code>x</code> <code>dd</code>
+        <code>yy</code> <code>p</code> <code>u</code> と <code>:</code> の Ex コマンドが使えます。日本語入力 (IME) とファイル操作はまだ入っていません。
+      </p>
+      <canvas id="screen" width="880" height="440"></canvas>
+      <p><a href="https://github.com/bannzai/wim">github.com/bannzai/wim</a></p>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
