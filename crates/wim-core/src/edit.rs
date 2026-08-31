@@ -12,6 +12,16 @@ use crate::position::Position;
 use crate::register::RegisterContent;
 use crate::textobject::TextRange;
 
+/// The most text one paste may put into the buffer.
+///
+/// A paste is `count` copies of a register, and the grammar saturates a count typed with
+/// more digits than a number can hold, so `999999999999999999999p` asks for a string no
+/// allocator can hand out: `String::repeat` aborts the process rather than failing. The cap
+/// is 64 MiB because that is far past any paste made on purpose — a whole source file
+/// pasted a hundred times over is still well inside it — while staying inside the 4 GiB
+/// address space of the wasm32 build the core has to keep working in.
+pub const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
+
 /// The text `range` holds, without touching the buffer.
 pub fn yank(buffer: &Buffer, range: TextRange) -> RegisterContent {
     let text = buffer.text_between(range.start, range.end);
@@ -64,18 +74,24 @@ pub fn change(buffer: &mut Buffer, range: TextRange) -> (RegisterContent, Positi
 /// cursor ends on the last grapheme put in. Linewise text goes onto lines of its own below
 /// the cursor's line, or above it with `before`, and the cursor ends on the first non-blank
 /// of the first line put in.
+///
+/// `None` when the copies would come to more than [`MAX_PASTE_BYTES`], which is a paste that
+/// cannot be carried out rather than one that goes wrong.
 pub fn paste(
     buffer: &mut Buffer,
     cursor: Position,
     content: &RegisterContent,
     before: bool,
     count: usize,
-) -> Position {
+) -> Option<Position> {
+    if content.text.len().checked_mul(count)? > MAX_PASTE_BYTES {
+        return None;
+    }
     let text = content.text.repeat(count);
     if content.linewise {
         let line = if before { cursor.line } else { cursor.line + 1 };
         buffer.insert_lines(line, &text);
-        return first_non_blank(buffer, line);
+        return Some(first_non_blank(buffer, line));
     }
     let at = if before || buffer.line_len(cursor.line) == 0 {
         cursor
@@ -84,20 +100,21 @@ pub fn paste(
     };
     let last = buffer.char_index(at) + text.chars().count();
     buffer.insert(at, &text);
-    buffer.clamp(buffer.position_at_char(last.saturating_sub(1)))
+    Some(buffer.clamp(buffer.position_at_char(last.saturating_sub(1))))
 }
 
 /// Replaces the `count` graphemes at the cursor with `replacement`, Vim's `r`.
 ///
 /// `None` when the line holds fewer than `count` graphemes from the cursor on, which Vim
-/// treats as a command that does nothing at all.
+/// treats as a command that does nothing at all. A count so large that the column past the
+/// last grapheme cannot be counted to is one such count.
 pub fn replace(
     buffer: &mut Buffer,
     cursor: Position,
     replacement: char,
     count: usize,
 ) -> Option<Position> {
-    let end = cursor.col + count;
+    let end = cursor.col.checked_add(count)?;
     if end > buffer.line_len(cursor.line) {
         return None;
     }
@@ -245,14 +262,14 @@ mod tests {
         let content = RegisterContent::charwise("XY".to_owned());
         assert_eq!(
             paste(&mut buffer, Position::new(0, 0), &content, false, 1),
-            Position::new(0, 2)
+            Some(Position::new(0, 2))
         );
         assert_eq!(buffer.to_string(), "aXYb");
 
         let mut buffer = Buffer::new("ab");
         assert_eq!(
             paste(&mut buffer, Position::new(0, 0), &content, true, 2),
-            Position::new(0, 3)
+            Some(Position::new(0, 3))
         );
         assert_eq!(buffer.to_string(), "XYXYab");
 
@@ -268,20 +285,49 @@ mod tests {
         let mut buffer = Buffer::new("ab\ncd");
         assert_eq!(
             paste(&mut buffer, Position::new(0, 1), &content, false, 1),
-            Position::new(1, 2)
+            Some(Position::new(1, 2))
         );
         assert_eq!(buffer.to_string(), "ab\n  xy\ncd");
 
         let mut buffer = Buffer::new("ab\ncd");
         assert_eq!(
             paste(&mut buffer, Position::new(0, 1), &content, true, 2),
-            Position::new(0, 2)
+            Some(Position::new(0, 2))
         );
         assert_eq!(buffer.to_string(), "  xy\n  xy\nab\ncd");
 
         let mut buffer = Buffer::new("ab");
         paste(&mut buffer, Position::new(0, 0), &content, false, 1);
         assert_eq!(buffer.to_string(), "ab\n  xy", "no trailing newline grows");
+    }
+
+    #[test]
+    fn a_paste_no_allocation_could_hold_is_refused() {
+        let mut buffer = Buffer::new("ab");
+        let content = RegisterContent::charwise("XY".to_owned());
+        assert_eq!(
+            paste(
+                &mut buffer,
+                Position::new(0, 0),
+                &content,
+                false,
+                usize::MAX
+            ),
+            None,
+            "the copies would come to more than a string can hold"
+        );
+        assert_eq!(
+            paste(
+                &mut buffer,
+                Position::new(0, 0),
+                &content,
+                false,
+                MAX_PASTE_BYTES
+            ),
+            None,
+            "and to more than the cap even when they can be counted"
+        );
+        assert_eq!(buffer.to_string(), "ab", "a refused paste alters nothing");
     }
 
     #[test]
@@ -293,6 +339,11 @@ mod tests {
         );
         assert_eq!(buffer.to_string(), "xxう");
         assert_eq!(replace(&mut buffer, Position::new(0, 1), 'x', 3), None);
+        assert_eq!(
+            replace(&mut buffer, Position::new(0, 1), 'x', usize::MAX),
+            None,
+            "a count that cannot even be counted to the line end with"
+        );
         assert_eq!(buffer.to_string(), "xxう");
     }
 

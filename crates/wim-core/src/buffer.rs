@@ -102,19 +102,6 @@ impl Buffer {
         self.rope.slice(start.min(end)..start.max(end)).to_string()
     }
 
-    /// The first position at which this buffer and `other` no longer hold the same text,
-    /// which is where a change between them happened. Buffers that match all the way give
-    /// the end of this one.
-    pub fn first_difference(&self, other: &Buffer) -> Position {
-        let (mine, theirs) = (self.to_string(), other.to_string());
-        let shared = mine
-            .chars()
-            .zip(theirs.chars())
-            .take_while(|(mine, theirs)| mine == theirs)
-            .count();
-        self.clamp(self.position_at_char(shared))
-    }
-
     pub fn insert(&mut self, pos: Position, text: &str) {
         let index = self.char_index(pos);
         self.rope.insert(index, text);
@@ -376,23 +363,5 @@ mod tests {
         let mut buffer = Buffer::new("ab\ncd");
         buffer.insert_lines(1, "xy\n");
         assert_eq!(buffer.to_string(), "ab\nxy\ncd");
-    }
-
-    #[test]
-    fn the_first_difference_is_where_two_buffers_stop_matching() {
-        assert_eq!(
-            Buffer::new("ab\ncd").first_difference(&Buffer::new("ab\nxd")),
-            Position::new(1, 0)
-        );
-        assert_eq!(
-            Buffer::new("ab\ncd").first_difference(&Buffer::new("ab\ncd")),
-            Position::new(1, 1),
-            "buffers that match run out at their end"
-        );
-        assert_eq!(
-            Buffer::new("ab").first_difference(&Buffer::new("ab\ncd")),
-            Position::new(0, 1),
-            "the shorter buffer clamps onto its last grapheme"
-        );
     }
 }

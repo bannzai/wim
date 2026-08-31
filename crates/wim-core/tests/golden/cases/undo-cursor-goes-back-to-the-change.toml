@@ -1,0 +1,11 @@
+name = "u puts the cursor back on the line the change was made on, not on the next line that reads the same"
+input = '''
+a
+a
+'''
+keys = "ddu"
+expected = '''
+a
+a
+'''
+expected_cursor = [0, 0]

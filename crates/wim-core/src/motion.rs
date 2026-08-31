@@ -116,19 +116,29 @@ pub fn resolve(
                 false,
             )
         }),
+        // Counts saturate rather than wrap when they are typed with more digits than a
+        // number can hold, so a count is added to a line or a column without ever counting
+        // past what a `usize` holds; every target is clamped to the buffer anyway.
         Motion::Right => {
             let len = buffer.line_len(cursor.line);
-            (len > 0)
-                .then(|| charwise(Position::new(cursor.line, (cursor.col + n).min(len)), false))
+            (len > 0).then(|| {
+                charwise(
+                    Position::new(cursor.line, cursor.col.saturating_add(n).min(len)),
+                    false,
+                )
+            })
         }
-        Motion::Down => (cursor.line + n <= last_line)
-            .then(|| linewise(desired(buffer, cursor.line + n, context.desired_col))),
+        Motion::Down => cursor
+            .line
+            .checked_add(n)
+            .filter(|line| *line <= last_line)
+            .map(|line| linewise(desired(buffer, line, context.desired_col))),
         Motion::Up => (n <= cursor.line)
             .then(|| linewise(desired(buffer, cursor.line - n, context.desired_col))),
         Motion::LineStart => Some(charwise(Position::new(cursor.line, 0), false)),
         Motion::FirstNonBlank => Some(charwise(first_non_blank(buffer, cursor.line), false)),
         Motion::LineEnd => {
-            let line = (cursor.line + n - 1).min(last_line);
+            let line = cursor.line.saturating_add(n - 1).min(last_line);
             Some(charwise(Position::new(line, buffer.last_col(line)), true))
         }
         Motion::WordForward { big } => word_forward(buffer, cursor, n, big),

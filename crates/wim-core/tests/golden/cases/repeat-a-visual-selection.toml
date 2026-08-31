@@ -1,0 +1,5 @@
+name = ". applies the shape the selection had again, from where the cursor then is"
+input = "abcdef"
+keys = "vldl."
+expected = "cf"
+expected_cursor = [0, 1]

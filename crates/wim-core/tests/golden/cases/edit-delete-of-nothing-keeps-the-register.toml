@@ -1,0 +1,5 @@
+name = "d0 in column 0 takes nothing, so p still puts back the yank before it"
+input = "abc"
+keys = "yld0p"
+expected = "aabc"
+expected_cursor = [0, 1]
