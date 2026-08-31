@@ -17,10 +17,19 @@ pub struct Root {
 
 impl Root {
     /// Anchors a daemon at `path`.
+    ///
+    /// A root that is not a directory is refused here rather than serving: the paths a request
+    /// names are read from it, so a regular file as the root would leave `fs.list` and every child
+    /// path failing while `fs.read` and `fs.write` on `"."` worked on that one file.
     pub async fn new(path: impl AsRef<Path>) -> io::Result<Self> {
-        Ok(Self {
-            path: fs::canonicalize(path).await?,
-        })
+        let path = fs::canonicalize(path).await?;
+        if !fs::metadata(&path).await?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{}: a daemon serves a directory", path.display()),
+            ));
+        }
+        Ok(Self { path })
     }
 
     /// The directory itself.
@@ -189,6 +198,16 @@ mod tests {
             .await
             .expect_err("a file under a missing directory should be refused");
         assert_eq!(error.code, ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_root_that_is_not_a_directory_is_refused() {
+        let (directory, _root) = root().await;
+        let file = directory.path().join("secret.md");
+        let error = Root::new(&file)
+            .await
+            .expect_err("a regular file should not be served as a root");
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
     }
 
     #[test]
