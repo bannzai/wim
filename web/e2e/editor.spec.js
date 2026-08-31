@@ -55,6 +55,20 @@ function isColour(pixel, [red, green, blue]) {
   return pixel.red === red && pixel.green === green && pixel.blue === blue;
 }
 
+/**
+ * Dispatches a synthetic keydown carrying `init`, answering whether the demo took the key.
+ *
+ * `page.keyboard` cannot hold AltGr down, and a key the demo leaves alone is only observable as
+ * the `preventDefault` it did not call, which a dispatched event reports back.
+ */
+function dispatchKey(page, init) {
+  return page.evaluate(
+    (options) =>
+      !window.dispatchEvent(new KeyboardEvent("keydown", { ...options, cancelable: true })),
+    init,
+  );
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/index.html");
   await page.waitForFunction(() => window.wimDemo !== undefined);
@@ -94,7 +108,59 @@ test("dd deletes a line and reports damage down to the end of the buffer", async
 
   const state = await page.evaluate(() => window.wimDemo.state());
   expect(state.lines).toEqual(before.slice(1));
-  expect(state.damage).toEqual({ start: 0, end: before.length - 1 });
+  // Past the end of the buffer left behind: the row the last line vacated has to be drawn over.
+  expect(state.damage).toEqual({ start: 0, end: before.length });
+});
+
+test("deleting the last line damages the row it was drawn on", async ({ page }) => {
+  await page.evaluate((text) => window.wimDemo.load(text), numberedLines(5));
+  const canvas = page.locator("#screen");
+
+  await page.keyboard.press("Shift+G");
+  await page.keyboard.press("d");
+  await page.keyboard.press("d");
+
+  const state = await page.evaluate(() => window.wimDemo.state());
+  expect(state.lines).toEqual(["line 1", "line 2", "line 3", "line 4"]);
+  expect(state.damage).toEqual({ start: 4, end: 5 });
+
+  // The row now past the end of the buffer carries the filler a full redraw draws there, rather
+  // than the text it held before the deletion.
+  const damaged = await canvas.evaluate((element) => element.toDataURL());
+  expect(
+    await canvas.evaluate((element) => {
+      window.wimDemo.redraw();
+      return element.toDataURL();
+    }),
+  ).toBe(damaged);
+});
+
+test("Ctrl combinations the core has no command for stay with the browser", async ({ page }) => {
+  // Redo is the one Ctrl key the grammar reads, so the demo takes it.
+  expect(await dispatchKey(page, { key: "r", ctrlKey: true })).toBe(true);
+  for (const key of ["f", "p", "s"]) {
+    expect(await dispatchKey(page, { key, ctrlKey: true })).toBe(false);
+  }
+
+  // None of them reached the editor, so the buffer is the one the page loaded with.
+  const state = await page.evaluate(() => window.wimDemo.state());
+  expect(state.lines[0]).toBe(FIRST_LINE);
+  expect(state.mode).toBe("NORMAL");
+});
+
+test("AltGr and Option type their character rather than a shortcut", async ({ page }) => {
+  await page.keyboard.press("i");
+
+  // A German layout reports AltGr+Q as `@`, with both Alt and Ctrl held.
+  expect(
+    await dispatchKey(page, { key: "@", altKey: true, ctrlKey: true, modifierAltGraph: true }),
+  ).toBe(true);
+  // macOS reports Option+2 as `€`, with Alt alone.
+  expect(await dispatchKey(page, { key: "€", altKey: true })).toBe(true);
+  // Ctrl and Alt without AltGr remains a shortcut.
+  expect(await dispatchKey(page, { key: "f", altKey: true, ctrlKey: true })).toBe(false);
+
+  expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe(`@€${FIRST_LINE}`);
 });
 
 test("an Ex command hands its effect back to the host", async ({ page }) => {
