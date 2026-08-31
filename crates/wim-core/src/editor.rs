@@ -511,10 +511,13 @@ impl Editor {
         }
         // The column `j` and `k` aim for follows the cursor to where the edit left it: after
         // `dw` the text the motion reached is gone, so aiming for its column would drop onto
-        // the next line further right than the cursor stands. An edit that left the cursor
+        // the next line further right than the cursor stands. A yank that left the cursor
         // where it was, such as `yy`, moved nothing for the column to follow and so keeps the
-        // one the vertical motions were already aiming for.
-        if self.cursor != before {
+        // one the vertical motions were already aiming for. A delete or change rewrote the
+        // text under the cursor even when its coordinates come out the same — `$dd` on a
+        // one-column first line lands back on (0, 0) — so their old aim is about text that
+        // is gone.
+        if operator != Operator::Yank || self.cursor != before {
             self.motion_context.desired_col = self.cursor.col;
         }
     }

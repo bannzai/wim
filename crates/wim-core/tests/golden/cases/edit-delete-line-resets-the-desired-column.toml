@@ -1,0 +1,10 @@
+name = "dd rewrites the text under the cursor, so j aims for the column dd left it on even when its coordinates did not change"
+input = '''
+x
+abcdef
+abcdef'''
+keys = "$ddj"
+expected = '''
+abcdef
+abcdef'''
+expected_cursor = [1, 0]
