@@ -112,14 +112,19 @@ async fn run(serve: Serve) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    println!("listening on {addr}");
-    println!("token: {}", daemon.token());
-    println!("root: {}", daemon.root().display());
     // A client reads these lines while the daemon runs on, so they go out before it starts
-    // serving rather than whenever the buffer happens to fill.
-    if let Err(error) = io::stdout().flush() {
+    // serving rather than whenever the buffer happens to fill. A reader that went away in the
+    // middle of them is no reason to die: the report is a courtesy and the daemon is the
+    // service, while `println!` would panic on the broken pipe and take the daemon with it.
+    let report = {
+        let mut stdout = io::stdout().lock();
+        writeln!(stdout, "listening on {addr}")
+            .and_then(|()| writeln!(stdout, "token: {}", daemon.token()))
+            .and_then(|()| writeln!(stdout, "root: {}", daemon.root().display()))
+            .and_then(|()| stdout.flush())
+    };
+    if let Err(error) = report {
         eprintln!("{PROGRAM}: cannot report how to reach the daemon: {error}");
-        return ExitCode::FAILURE;
     }
     if let Err(error) = daemon.serve().await {
         eprintln!("{PROGRAM}: {addr}: {error}");
