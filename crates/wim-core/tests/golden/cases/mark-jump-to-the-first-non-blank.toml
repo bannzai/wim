@@ -1,0 +1,11 @@
+name = "' moves to the first non-blank of the marked line rather than to the marked column"
+input = '''
+alpha
+    bravo
+charlie'''
+keys = "j6lmagg'ax"
+expected = '''
+alpha
+    ravo
+charlie'''
+expected_cursor = [1, 4]

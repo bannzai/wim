@@ -1,0 +1,12 @@
+name = "a mark moves down with its line when a change adds lines above it"
+input = '''
+alpha
+bravo
+charlie'''
+keys = "jjmaggOnew<Esc>'ax"
+expected = '''
+new
+alpha
+bravo
+harlie'''
+expected_cursor = [3, 0]

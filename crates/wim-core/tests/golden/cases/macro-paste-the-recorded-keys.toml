@@ -1,0 +1,5 @@
+name = "a macro is kept in its register as text, so a paste puts its keys into the buffer"
+input = "abc"
+keys = 'qaxq"ap'
+expected = "bxc"
+expected_cursor = [0, 1]
