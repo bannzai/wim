@@ -3,6 +3,58 @@ import { expect, test } from "@playwright/test";
 /** The line the demo starts with, which the tests edit. */
 const FIRST_LINE = "wim is a Vim-grammar editor, not a Vim clone.";
 
+/** The colours `main.js` draws in, which is what lets a test tell them apart in the pixels. */
+const BACKGROUND = [18, 20, 26];
+const CURSOR = [92, 156, 245];
+
+/** A buffer of `count` numbered lines, taller than the viewport when `count` is large. */
+function numberedLines(count) {
+  return Array.from({ length: count }, (_, line) => `line ${line + 1}`).join("\n");
+}
+
+/**
+ * The pixels of a CSS-pixel rectangle of the canvas, as `{ x, y, red, green, blue }` rows in
+ * CSS pixels, so that a test can compare where something was drawn against the layout the demo
+ * reports.
+ */
+function pixelsIn(page, rectangle) {
+  return page.evaluate((area) => {
+    const canvas = document.querySelector("#screen");
+    const scale = window.devicePixelRatio || 1;
+    const left = Math.round(area.x * scale);
+    const top = Math.round(area.y * scale);
+    const width = Math.max(1, Math.round(area.width * scale));
+    const height = Math.max(1, Math.round(area.height * scale));
+    const { data } = canvas.getContext("2d").getImageData(left, top, width, height);
+    const pixels = [];
+    for (let pixel = 0; pixel < data.length; pixel += 4) {
+      const index = pixel / 4;
+      pixels.push({
+        x: (left + (index % width)) / scale,
+        y: (top + Math.floor(index / width)) / scale,
+        red: data[pixel],
+        green: data[pixel + 1],
+        blue: data[pixel + 2],
+      });
+    }
+    return pixels;
+  }, rectangle);
+}
+
+/** The rectangle of the row `line` sits on, in CSS pixels. */
+function rowArea(state, line, x, width) {
+  return {
+    x,
+    y: state.layout.padding + (line - state.viewport.top) * state.layout.lineHeight,
+    width,
+    height: state.layout.lineHeight,
+  };
+}
+
+function isColour(pixel, [red, green, blue]) {
+  return pixel.red === red && pixel.green === green && pixel.blue === blue;
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/index.html");
   await page.waitForFunction(() => window.wimDemo !== undefined);
@@ -77,4 +129,97 @@ test("the canvas is drawn and redrawn as keys come in", async ({ page }) => {
   await page.keyboard.press("i");
   await page.keyboard.type("hello");
   expect(await canvas.evaluate((element) => element.toDataURL())).not.toBe(before);
+});
+
+test("a buffer taller than the viewport scrolls to follow the cursor", async ({ page }) => {
+  await page.evaluate((text) => window.wimDemo.load(text), numberedLines(200));
+
+  const start = await page.evaluate(() => window.wimDemo.state());
+  expect(start.viewport.top).toBe(0);
+  expect(start.viewport.rows).toBeGreaterThan(0);
+  expect(start.viewport.rows).toBeLessThan(200);
+
+  await page.keyboard.press("Shift+G");
+  const bottom = await page.evaluate(() => window.wimDemo.state());
+  expect(bottom.cursor.line).toBe(199);
+  // The last line sits on the last row of the viewport, which is where it lands as the cursor
+  // walks off the bottom of the previous one.
+  expect(bottom.viewport.top).toBe(200 - bottom.viewport.rows);
+
+  await page.keyboard.press("g");
+  await page.keyboard.press("g");
+  const top = await page.evaluate(() => window.wimDemo.state());
+  expect(top.cursor.line).toBe(0);
+  expect(top.viewport.top).toBe(0);
+});
+
+test("the gutter carries the number of the line scrolled to the top", async ({ page }) => {
+  await page.evaluate((text) => window.wimDemo.load(text), numberedLines(200));
+  await page.keyboard.press("Shift+G");
+
+  const state = await page.evaluate(() => window.wimDemo.state());
+  const gutter = await pixelsIn(page, rowArea(state, state.viewport.top, 0, state.layout.textLeft));
+  expect(gutter.filter((pixel) => !isColour(pixel, BACKGROUND)).length).toBeGreaterThan(0);
+});
+
+test("a full-width grapheme is drawn two cells wide", async ({ page }) => {
+  await page.evaluate(() => window.wimDemo.load("あい 漢字 😀\nplain ascii"));
+
+  // `l` steps one column, which is one grapheme, so the cursor lands past two cells of `あ`.
+  await page.keyboard.press("l");
+  const state = await page.evaluate(() => window.wimDemo.state());
+  expect(state.cursor).toEqual({ line: 0, col: 1 });
+
+  const width = state.layout.textLeft + 20 * state.layout.cellWidth;
+  const row = await pixelsIn(page, rowArea(state, 0, 0, width));
+  const cursor = row.filter((pixel) => isColour(pixel, CURSOR));
+  expect(cursor.length).toBeGreaterThan(0);
+  const left = Math.min(...cursor.map((pixel) => pixel.x));
+  const right = Math.max(...cursor.map((pixel) => pixel.x));
+  // Within a pixel, because the cell width is fractional and the edge of the block is blended.
+  expect(Math.abs(left - (state.layout.textLeft + 2 * state.layout.cellWidth))).toBeLessThan(1.5);
+  expect(Math.abs(right - left - 2 * state.layout.cellWidth)).toBeLessThan(1.5);
+
+  // The glyphs themselves reach the canvas rather than the row being cursor and background.
+  const text = row.filter(
+    (pixel) =>
+      pixel.x > state.layout.textLeft &&
+      !isColour(pixel, BACKGROUND) &&
+      !isColour(pixel, CURSOR),
+  );
+  expect(text.length).toBeGreaterThan(0);
+});
+
+test("redrawing only the damaged rows leaves the pixels a full redraw would", async ({ page }) => {
+  await page.evaluate((text) => window.wimDemo.load(text), numberedLines(80));
+  const canvas = page.locator("#screen");
+
+  // An insert damages one line, `o` and `dd` damage every line under the cursor, and `G` moves
+  // the viewport out from under all of them.
+  await page.keyboard.press("j");
+  await page.keyboard.press("i");
+  await page.keyboard.type("あ edited ");
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("o");
+  await page.keyboard.type("opened");
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("d");
+  await page.keyboard.press("d");
+
+  const damaged = await canvas.evaluate((element) => element.toDataURL());
+  const complete = await canvas.evaluate((element) => {
+    window.wimDemo.redraw();
+    return element.toDataURL();
+  });
+  expect(damaged).toBe(complete);
+
+  await page.keyboard.press("Shift+G");
+  await page.keyboard.press("x");
+  const scrolled = await canvas.evaluate((element) => element.toDataURL());
+  expect(
+    await canvas.evaluate((element) => {
+      window.wimDemo.redraw();
+      return element.toDataURL();
+    }),
+  ).toBe(scrolled);
 });
