@@ -1,0 +1,5 @@
+name = "f lands on the character it searched for"
+input = "abcabc"
+keys = "fb"
+expected = "abcabc"
+expected_cursor = [0, 1]

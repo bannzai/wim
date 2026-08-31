@@ -1,0 +1,7 @@
+name = "Enter splits the line and Tab types a tab"
+input = "abcd"
+keys = "lli<CR><Tab><Esc>"
+expected = '''
+ab
+	cd'''
+expected_cursor = [1, 0]

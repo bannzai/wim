@@ -1,0 +1,5 @@
+name = "a motion picks the place the insert starts at"
+input = "foo baz"
+keys = "wibar <Esc>"
+expected = "foo bar baz"
+expected_cursor = [0, 7]

@@ -1,0 +1,5 @@
+name = "t stops next to the character instead of on it"
+input = "foo bar"
+keys = "tb"
+expected = "foo bar"
+expected_cursor = [0, 3]

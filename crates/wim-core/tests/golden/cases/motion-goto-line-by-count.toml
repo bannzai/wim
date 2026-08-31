@@ -1,0 +1,11 @@
+name = "a count on gg is the line to go to"
+input = '''
+alpha
+bravo
+charlie'''
+keys = "3gg"
+expected = '''
+alpha
+bravo
+charlie'''
+expected_cursor = [2, 0]

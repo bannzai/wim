@@ -1,0 +1,5 @@
+name = "w crosses a blank between Japanese words"
+input = "日本語 です"
+keys = "w"
+expected = "日本語 です"
+expected_cursor = [0, 4]

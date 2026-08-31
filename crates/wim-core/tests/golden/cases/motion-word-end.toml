@@ -1,0 +1,5 @@
+name = "e lands on the last character of the word"
+input = "foo bar"
+keys = "e"
+expected = "foo bar"
+expected_cursor = [0, 2]

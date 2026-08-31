@@ -1,0 +1,5 @@
+name = "b walks back to the start of the previous word"
+input = "foo bar"
+keys = "$b"
+expected = "foo bar"
+expected_cursor = [0, 4]

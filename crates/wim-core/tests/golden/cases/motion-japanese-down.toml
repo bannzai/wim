@@ -1,0 +1,11 @@
+name = "j walks down lines of Japanese text"
+input = '''
+あいう
+かきく
+さしす'''
+keys = "2j"
+expected = '''
+あいう
+かきく
+さしす'''
+expected_cursor = [2, 0]

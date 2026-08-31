@@ -1,0 +1,5 @@
+name = "l counts Japanese characters one column each"
+input = "あいうえお"
+keys = "3l"
+expected = "あいうえお"
+expected_cursor = [0, 3]

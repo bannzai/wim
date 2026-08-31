@@ -1,0 +1,11 @@
+name = "gg comes back to the first line"
+input = '''
+alpha
+bravo
+charlie'''
+keys = "Ggg"
+expected = '''
+alpha
+bravo
+charlie'''
+expected_cursor = [0, 0]

@@ -1,0 +1,11 @@
+name = "$ sticks to the end of every line j walks onto"
+input = '''
+one long line
+ab
+another long line'''
+keys = "$jj"
+expected = '''
+one long line
+ab
+another long line'''
+expected_cursor = [2, 16]

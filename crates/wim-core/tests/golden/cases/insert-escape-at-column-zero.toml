@@ -1,0 +1,5 @@
+name = "Esc steps back a column, but not past the start of the line"
+input = "bar"
+keys = "i<Esc>"
+expected = "bar"
+expected_cursor = [0, 0]

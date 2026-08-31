@@ -1,0 +1,10 @@
+name = "o opens a line below and types on it"
+input = '''
+alpha
+bravo'''
+keys = "ofoo<Esc>"
+expected = '''
+alpha
+foo
+bravo'''
+expected_cursor = [1, 2]

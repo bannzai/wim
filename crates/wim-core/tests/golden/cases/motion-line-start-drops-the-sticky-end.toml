@@ -1,0 +1,9 @@
+name = "0 after $ gives up the sticky end of the line"
+input = '''
+one long line
+ab'''
+keys = "$0j"
+expected = '''
+one long line
+ab'''
+expected_cursor = [1, 0]

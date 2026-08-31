@@ -1,0 +1,5 @@
+name = "; repeats the last f search"
+input = "abcabc"
+keys = "fb;"
+expected = "abcabc"
+expected_cursor = [0, 4]

@@ -1,0 +1,5 @@
+name = "a count on w repeats the jump"
+input = "foo bar baz"
+keys = "2w"
+expected = "foo bar baz"
+expected_cursor = [0, 8]

@@ -1,0 +1,5 @@
+name = "$ lands on the last Japanese character of the line"
+input = "あいうえお"
+keys = "$"
+expected = "あいうえお"
+expected_cursor = [0, 4]

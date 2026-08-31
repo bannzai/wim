@@ -1,0 +1,5 @@
+name = "I types at the first non blank of an indented line"
+input = "    let x = 1"
+keys = "I// <Esc>"
+expected = "    // let x = 1"
+expected_cursor = [0, 6]
