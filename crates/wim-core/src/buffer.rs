@@ -176,10 +176,17 @@ impl Buffer {
         let mut removed = self.rope.slice(content_start..content_end).to_string();
         removed.push('\n');
 
+        // Separators are removed by rope line boundaries rather than by one char, so a CRLF
+        // break goes as a whole instead of leaving its `\r` (or `\n`) behind.
         let (start, end) = if last + 1 < self.line_count() || self.has_trailing_newline() {
-            (content_start, (content_end + 1).min(self.rope.len_chars()))
+            let line_end = self.rope.line_to_char(last) + self.rope.line(last).len_chars();
+            (content_start, line_end)
         } else {
-            (content_start.saturating_sub(1), content_end)
+            let start = first
+                .checked_sub(1)
+                .map(|previous| self.char_index(Position::new(previous, self.line_len(previous))))
+                .unwrap_or(content_start);
+            (start, content_end)
         };
         self.rope.remove(start..end);
         removed
@@ -335,6 +342,25 @@ mod tests {
         let mut buffer = Buffer::new("ab\ncd\nef");
         assert_eq!(buffer.delete_lines(0, 9), "ab\ncd\nef\n", "the last clamps");
         assert_eq!(buffer.to_string(), "");
+    }
+
+    #[test]
+    fn deleting_lines_takes_a_crlf_break_as_a_whole() {
+        let mut buffer = Buffer::new("ab\r\ncd\r\nef");
+        buffer.delete_lines(0, 0);
+        assert_eq!(buffer.to_string(), "cd\r\nef");
+
+        let mut buffer = Buffer::new("ab\r\ncd\r\nef");
+        buffer.delete_lines(2, 2);
+        assert_eq!(
+            buffer.to_string(),
+            "ab\r\ncd",
+            "the whole CRLF in front goes with the final line"
+        );
+
+        let mut buffer = Buffer::new("ab\r\ncd\r\n");
+        buffer.delete_lines(1, 1);
+        assert_eq!(buffer.to_string(), "ab\r\n");
     }
 
     #[test]
