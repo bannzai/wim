@@ -1,0 +1,11 @@
+name = "yy leaves the cursor alone, so j still aims for the column it was aiming for"
+input = '''
+abcdef
+xy
+abcdef'''
+keys = "4ljyyj"
+expected = '''
+abcdef
+xy
+abcdef'''
+expected_cursor = [2, 4]

@@ -1,5 +1,6 @@
 //! What a finished sequence of Normal mode keys means.
 
+use crate::buffer::Buffer;
 use crate::key::KeyEvent;
 use crate::motion::Motion;
 use crate::position::Position;
@@ -66,14 +67,25 @@ impl SelectionShape {
         }
     }
 
-    /// The span this shape covers when it is applied again from `cursor`.
-    pub fn range_at(&self, cursor: Position) -> TextRange {
+    /// The span this shape covers when it is applied again from `cursor` in `buffer`.
+    ///
+    /// A shape whose last line falls past the end of the buffer stops at the end of the text
+    /// instead: the line it names does not exist, and a column on it would be read on the
+    /// final line, which can leave the end of the span in front of the cursor and turn the
+    /// repeat into a delete of the text before it.
+    pub fn range_at(&self, buffer: &Buffer, cursor: Position) -> TextRange {
         let end = if self.lines == 0 {
             Position::new(cursor.line, cursor.col.saturating_add(self.end_col))
         } else {
-            Position::new(cursor.line.saturating_add(self.lines), self.end_col)
+            let line = cursor.line.saturating_add(self.lines);
+            if line < buffer.line_count() {
+                Position::new(line, self.end_col)
+            } else {
+                let last = buffer.line_count() - 1;
+                Position::new(last, buffer.line_len(last))
+            }
         };
-        TextRange::charwise(cursor, end)
+        TextRange::charwise(cursor, cursor.max(end))
     }
 }
 
@@ -277,6 +289,7 @@ mod tests {
 
     #[test]
     fn a_selection_shape_is_the_span_it_covers_from_a_new_cursor() {
+        let buffer = Buffer::new("abcdef\nabcdef\nabcdef");
         let one_line = SelectionShape::of(TextRange::charwise(
             Position::new(0, 3),
             Position::new(0, 5),
@@ -290,7 +303,7 @@ mod tests {
             "a selection inside one line keeps its width"
         );
         assert_eq!(
-            one_line.range_at(Position::new(2, 1)),
+            one_line.range_at(&buffer, Position::new(2, 1)),
             TextRange::charwise(Position::new(2, 1), Position::new(2, 3))
         );
 
@@ -307,8 +320,18 @@ mod tests {
             "a selection over more than one line keeps the column it ended on"
         );
         assert_eq!(
-            two_lines.range_at(Position::new(0, 0)),
+            two_lines.range_at(&buffer, Position::new(0, 0)),
             TextRange::charwise(Position::new(0, 0), Position::new(1, 4))
+        );
+        assert_eq!(
+            two_lines.range_at(&buffer, Position::new(2, 5)),
+            TextRange::charwise(Position::new(2, 5), Position::new(2, 6)),
+            "a shape whose last line is past the end of the buffer stops at the end of the \
+             text rather than at a column in front of the cursor"
+        );
+        assert_eq!(
+            two_lines.range_at(&Buffer::new("abcdef"), Position::new(0, 5)),
+            TextRange::charwise(Position::new(0, 5), Position::new(0, 6))
         );
     }
 
