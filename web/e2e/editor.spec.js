@@ -159,6 +159,13 @@ test("AltGr and Option type their character rather than a shortcut", async ({ pa
   expect(await dispatchKey(page, { key: "€", altKey: true })).toBe(true);
   // Ctrl and Alt without AltGr remains a shortcut.
   expect(await dispatchKey(page, { key: "f", altKey: true, ctrlKey: true })).toBe(false);
+  // Firefox on Windows raises the AltGraph state for plain Ctrl+Alt, but the plain letter
+  // says it is a shortcut all the same.
+  expect(
+    await dispatchKey(page, { key: "f", altKey: true, ctrlKey: true, modifierAltGraph: true }),
+  ).toBe(false);
+  // Alt with a plain letter is the browser's menu shortcut, not typing.
+  expect(await dispatchKey(page, { key: "f", altKey: true })).toBe(false);
 
   expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe(`@€${FIRST_LINE}`);
 });

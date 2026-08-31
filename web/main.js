@@ -114,17 +114,14 @@ function keyNotation(event) {
   }
   // `<` is the one character the notation spells for itself, so it goes in as its escape.
   const literal = event.key === "<" ? "<lt>" : event.key;
-  // A layout that uses AltGr reports its printable characters with `altKey` set, and on
-  // Windows `ctrlKey` too — AltGr+Q is `@` on a German layout — so those modifiers on their
-  // own do not make a key a shortcut. macOS Option is let through the same way: it is how a
-  // character such as `€` is typed there, the demo binds nothing to it, and the browser's own
-  // Option shortcuts live on the menu bar rather than on the page.
-  if (event.getModifierState("AltGraph") || (event.altKey && !event.ctrlKey)) {
-    return literal;
-  }
-  if (event.altKey) {
-    // Ctrl and Alt together without AltGr is a shortcut, not a way of typing a character.
-    return null;
+  // A key typed with Alt involved is either composed text or a shortcut, and the modifier
+  // flags alone cannot tell the two apart: Firefox on Windows raises the AltGraph state for
+  // plain Ctrl+Alt, and Alt+F is the browser's own menu shortcut. What does tell them apart
+  // is the character itself — AltGr and macOS Option exist to type what a bare key cannot
+  // (`@` on a German layout, `€` on Option), so a composed key never reads as a plain ASCII
+  // letter or digit, while a shortcut's key is exactly that.
+  if (event.altKey || event.getModifierState("AltGraph")) {
+    return /^[a-zA-Z0-9]$/.test(event.key) ? null : literal;
   }
   if (event.ctrlKey) {
     return CORE_CTRL_KEYS.has(event.key.toLowerCase())
