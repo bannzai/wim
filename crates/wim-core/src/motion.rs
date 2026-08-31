@@ -216,13 +216,13 @@ fn repeat(
 /// The class boundaries `w`, `b` and `e` break words at. `big` collapses keywords and
 /// punctuation into one class, which is what `W`, `B` and `E` do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Class {
+pub(crate) enum Class {
     Blank,
     Keyword,
     Punct,
 }
 
-fn class_of(grapheme: &str, big: bool) -> Class {
+pub(crate) fn class_of(grapheme: &str, big: bool) -> Class {
     match grapheme.chars().next() {
         None => Class::Blank,
         Some(c) if c.is_whitespace() => Class::Blank,
@@ -232,7 +232,7 @@ fn class_of(grapheme: &str, big: bool) -> Class {
     }
 }
 
-fn class_at(buffer: &Buffer, pos: Position, big: bool) -> Class {
+pub(crate) fn class_at(buffer: &Buffer, pos: Position, big: bool) -> Class {
     buffer
         .grapheme_at(pos)
         .map_or(Class::Blank, |grapheme| class_of(&grapheme, big))
@@ -242,7 +242,9 @@ fn is_empty_line(buffer: &Buffer, line: usize) -> bool {
     buffer.line_len(line) == 0
 }
 
-fn next_pos(buffer: &Buffer, pos: Position) -> Option<Position> {
+/// The next grapheme position, stepping over line ends. The column past the last grapheme of
+/// a line is not a position of its own.
+pub(crate) fn next_pos(buffer: &Buffer, pos: Position) -> Option<Position> {
     if pos.col + 1 < buffer.line_len(pos.line) {
         Some(Position::new(pos.line, pos.col + 1))
     } else if pos.line + 1 < buffer.line_count() {
@@ -252,7 +254,8 @@ fn next_pos(buffer: &Buffer, pos: Position) -> Option<Position> {
     }
 }
 
-fn prev_pos(buffer: &Buffer, pos: Position) -> Option<Position> {
+/// The previous grapheme position, stepping over line ends.
+pub(crate) fn prev_pos(buffer: &Buffer, pos: Position) -> Option<Position> {
     if pos.col > 0 {
         Some(Position::new(pos.line, pos.col - 1))
     } else if pos.line > 0 {
