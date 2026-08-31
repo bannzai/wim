@@ -353,7 +353,12 @@ async fn a_write_that_cannot_be_finished_leaves_what_was_there_and_stages_nothin
             content: "planted\n".to_owned(),
         }))
         .await;
-    assert_eq!(error.code, ErrorCode::Io);
+    // Renaming over a directory is an `Io` matter on Unix and a permission one on Windows;
+    // either way the write failed at the replacing step.
+    assert!(
+        matches!(error.code, ErrorCode::Io | ErrorCode::PermissionDenied),
+        "{error:?}"
+    );
     assert_eq!(fixture.read("src/main.rs"), "fn main() {}\n");
     assert_eq!(
         fixture.names(&fixture.root),
@@ -596,7 +601,7 @@ async fn a_watch_reports_a_write_the_client_made_through_the_daemon() {
         }))
         .await;
 
-    let change = client
+    let mut change = client
         .change_to("notes.txt", async |client: &mut Client| {
             let _: Ack = client
                 .ok(Method::FsWrite(FsWriteParams {
@@ -606,6 +611,14 @@ async fn a_watch_reports_a_write_the_client_made_through_the_daemon() {
                 .await;
         })
         .await;
+    if change.kind == FsChangeKind::Removed {
+        // The rename that replaces the file reaches some backends as its two halves, the
+        // replaced file going first; the half that says the file is there again follows it.
+        change = client
+            .change_within(CHANGE_RETRY, "notes.txt")
+            .await
+            .expect("the arriving half of the replacing rename should follow");
+    }
 
     assert_eq!(change.watch_id, watch.watch_id);
     // A write over a file that was made moments ago reaches the backends as one event or two, and
