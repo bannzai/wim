@@ -1,0 +1,10 @@
+name = "one Ex command is one undo unit, however many lines it changed"
+input = '''
+foo
+foo
+foo'''
+keys = ":%s/foo/bar/g<CR>u"
+expected = '''
+foo
+foo
+foo'''

@@ -1,0 +1,10 @@
+name = ":g/pattern/norm types the keys at the start of every line that matches"
+input = '''
+import a
+let b
+import c'''
+keys = ":g/^import/norm A;<lt>Esc><CR>"
+expected = '''
+import a;
+let b
+import c;'''

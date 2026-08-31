@@ -134,6 +134,23 @@ pub enum Command {
     },
     /// `v`: start a selection, or drop the one that is already up.
     ToggleVisual,
+    /// `:`, `/` and `?`: start typing a command line, the key that opened it being the
+    /// prefix that says what running it will mean.
+    EnterCommandLine(char),
+    /// `n` and `N`: the last search again.
+    RepeatSearch {
+        /// `N` rather than `n`: the other way round.
+        reverse: bool,
+        /// How many matches to walk.
+        count: Option<usize>,
+    },
+    /// `*` and `#`: search for the word under the cursor.
+    SearchWord {
+        /// `#` rather than `*`: towards the start of the buffer.
+        backward: bool,
+        /// How many matches to walk.
+        count: Option<usize>,
+    },
     /// The keys so far are a prefix of a command; more are needed.
     Pending,
     /// `<Esc>`: drop the keys typed so far and leave the mode they were typed in.

@@ -1,0 +1,11 @@
+name = "a : line that is only a line number moves the cursor there"
+input = '''
+aa
+bb
+cc'''
+keys = ":3<CR>x"
+expected = '''
+aa
+bb
+c'''
+expected_cursor = [2, 0]

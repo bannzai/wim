@@ -1,0 +1,11 @@
+name = "/ lands on the next match and n walks on, wrapping around the end"
+input = '''
+foo one
+bar
+foo two'''
+keys = "/foo<CR>nx"
+expected = '''
+oo one
+bar
+foo two'''
+expected_cursor = [0, 0]

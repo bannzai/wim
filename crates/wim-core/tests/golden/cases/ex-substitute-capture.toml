@@ -1,0 +1,9 @@
+name = ":s puts a capture back with the regex crate's $1"
+input = '''
+a=1
+b=2'''
+keys = ':%s/(\w+)=(\w+)/$2=$1/<CR>'
+expected = '''
+1=a
+2=b'''
+expected_cursor = [1, 0]

@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 ropey.workspace = true
 unicode-segmentation.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 serde.workspace = true

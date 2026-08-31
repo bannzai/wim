@@ -1,0 +1,10 @@
+name = ":g/pattern/s substitutes only on the lines that match"
+input = '''
+ax
+bx
+cy'''
+keys = ":g/^a/s/x/z/<CR>"
+expected = '''
+az
+bx
+cy'''

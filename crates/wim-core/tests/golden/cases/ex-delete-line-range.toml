@@ -1,0 +1,11 @@
+name = ":2,3d takes the lines the range names"
+input = '''
+a
+b
+c
+d'''
+keys = ":2,3d<CR>"
+expected = '''
+a
+d'''
+expected_cursor = [1, 0]

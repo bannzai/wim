@@ -1,0 +1,11 @@
+name = "# searches for the word under the cursor towards the start of the buffer"
+input = '''
+foo
+bar
+foo'''
+keys = "G#x"
+expected = '''
+oo
+bar
+foo'''
+expected_cursor = [0, 0]

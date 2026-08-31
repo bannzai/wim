@@ -1,0 +1,10 @@
+name = "the lines a :g/pattern/norm changed come back on one u"
+input = '''
+import a
+let b
+import c'''
+keys = ":g/^import/norm A;<lt>Esc><CR>u"
+expected = '''
+import a
+let b
+import c'''

@@ -4,12 +4,14 @@ use crate::buffer::Buffer;
 use crate::command::{Command, InsertAnchor, Operator, OperatorTarget};
 use crate::edit;
 use crate::effect::Effect;
+use crate::ex;
 use crate::grammar::Grammar;
 use crate::key::{KeyCode, KeyEvent, KeyParseError, parse_keys};
 use crate::mode::Mode;
 use crate::motion::{self, Motion, MotionContext, MotionKind};
 use crate::position::Position;
-use crate::register::Registers;
+use crate::register::{RegisterContent, Registers};
+use crate::search::{self, Search};
 use crate::textobject::{self, TextObject, TextObjectKind, TextRange};
 use crate::undo::History;
 
@@ -41,6 +43,13 @@ pub struct Editor {
     /// The change that runs until `<Esc>` closes it, and the keys typed into it so far.
     open_edit: Option<Command>,
     open_edit_keys: Vec<KeyEvent>,
+    /// The `:`, `/` or `?` line being typed, its prefix included.
+    command_line: Option<String>,
+    /// The search `n` and `N` repeat.
+    last_search: Option<Search>,
+    /// Whether an Ex command is running. The whole of one is a single undo unit, so the
+    /// commands it drives open none of their own.
+    running_ex: bool,
 }
 
 impl Editor {
@@ -80,14 +89,28 @@ impl Editor {
         Some((anchor.min(self.cursor), anchor.max(self.cursor)))
     }
 
+    /// The command line being typed, its `:`, `/` or `?` prefix included, for a host to show.
+    /// `None` outside Command-line mode.
+    pub fn command_line(&self) -> Option<&str> {
+        self.command_line.as_deref()
+    }
+
+    /// The search `n` repeats, which a host may show as the pattern in force.
+    pub fn last_search(&self) -> Option<&Search> {
+        self.last_search.as_ref()
+    }
+
     /// Reads one key in the current mode.
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        if self.mode == Mode::Insert {
-            return self.handle_insert_key(key);
+        match self.mode {
+            Mode::Insert => return self.handle_insert_key(key),
+            // A command line is text being typed, so the Normal mode grammar never sees it.
+            Mode::CommandLine => return self.handle_command_line_key(key),
+            _ => {}
         }
         let command = self.grammar.feed(key, self.mode);
         let effects = self.apply(command);
-        if self.mode != Mode::Insert {
+        if !matches!(self.mode, Mode::Insert | Mode::CommandLine) {
             self.mode = if self.grammar.is_operator_pending() {
                 Mode::OperatorPending
             } else if self.visual_anchor.is_some() {
@@ -263,6 +286,13 @@ impl Editor {
                     None => Some(self.cursor),
                 };
             }
+            Command::EnterCommandLine(prefix) => {
+                self.visual_anchor = None;
+                self.command_line = Some(prefix.to_string());
+                self.mode = Mode::CommandLine;
+            }
+            Command::RepeatSearch { reverse, count } => return self.repeat_search(count, reverse),
+            Command::SearchWord { backward, count } => return self.search_word(count, backward),
             Command::Cancel => self.visual_anchor = None,
             Command::Pending => {}
             Command::Rejected(key) => {
@@ -402,9 +432,150 @@ impl Editor {
         effects
     }
 
+    /// Reads one key of a `:`, `/` or `?` line: `<CR>` runs it, `<Esc>` drops it, `<BS>` takes
+    /// the last key back and drops the line when it takes the prefix itself back, and every
+    /// other key is text.
+    fn handle_command_line_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Esc => self.close_command_line(),
+            KeyCode::Enter => return self.run_command_line(),
+            KeyCode::Backspace => {
+                let line = self.command_line.get_or_insert_default();
+                line.pop();
+                if line.is_empty() {
+                    self.close_command_line();
+                }
+            }
+            KeyCode::Tab => self.command_line.get_or_insert_default().push('\t'),
+            KeyCode::Char(character) if !key.ctrl => {
+                self.command_line.get_or_insert_default().push(character);
+            }
+            KeyCode::Char(_) => {
+                return vec![Effect::Error(format!(
+                    "{key} does nothing in {} mode",
+                    Mode::CommandLine.label()
+                ))];
+            }
+        }
+        Vec::new()
+    }
+
+    fn close_command_line(&mut self) {
+        self.command_line = None;
+        self.mode = Mode::Normal;
+    }
+
+    /// Runs the line that was typed, which its prefix reads as an Ex command or as a search.
+    fn run_command_line(&mut self) -> Vec<Effect> {
+        let line = self.command_line.take().unwrap_or_default();
+        self.mode = Mode::Normal;
+        let mut characters = line.chars();
+        let body: String = characters.by_ref().skip(1).collect();
+        match line.chars().next() {
+            Some(':') => self.run_ex(&body),
+            Some(prefix) => self.run_search(&body, prefix == '?'),
+            None => Vec::new(),
+        }
+    }
+
+    /// Runs one Ex command as a single undo unit, however many edits it makes. A `:norm` that
+    /// types another `:` command runs inside that unit rather than opening one of its own.
+    fn run_ex(&mut self, body: &str) -> Vec<Effect> {
+        if body.trim().is_empty() {
+            return Vec::new();
+        }
+        let command = match ex::parse(body) {
+            Ok(command) => command,
+            Err(error) => return vec![Effect::Error(error.to_string())],
+        };
+        let outermost = !self.running_ex;
+        if outermost {
+            self.history.begin(&self.buffer);
+            self.running_ex = true;
+        }
+        let effects = ex::execute(self, &command);
+        if outermost {
+            self.running_ex = false;
+            self.history.commit(&self.buffer);
+        }
+        effects
+    }
+
+    /// Searches for what `/` or `?` was given, an empty pattern meaning the last one again.
+    fn run_search(&mut self, pattern: &str, backward: bool) -> Vec<Effect> {
+        let pattern = match (pattern.is_empty(), &self.last_search) {
+            (false, _) => pattern.to_owned(),
+            (true, Some(search)) => search.pattern.clone(),
+            (true, None) => return vec![Effect::Error("there is no search to repeat".to_owned())],
+        };
+        self.last_search = Some(Search { pattern, backward });
+        self.repeat_search(None, false)
+    }
+
+    /// `n` and `N`: walks `count` matches of the last search, `N` the other way round.
+    fn repeat_search(&mut self, count: Option<usize>, reverse: bool) -> Vec<Effect> {
+        let Some(search) = self.last_search.clone() else {
+            return vec![Effect::Error("there is no search to repeat".to_owned())];
+        };
+        let backward = search.backward != reverse;
+        for _ in 0..at_least_one(count) {
+            match search::find(&self.buffer, self.cursor, &search.pattern, backward) {
+                Ok(found) => self.cursor = found,
+                Err(error) => return vec![Effect::Error(error.to_string())],
+            }
+        }
+        self.motion_context.desired_col = self.cursor.col;
+        Vec::new()
+    }
+
+    /// `*` and `#`: searches for the word under the cursor, which becomes the search `n`
+    /// repeats.
+    fn search_word(&mut self, count: Option<usize>, backward: bool) -> Vec<Effect> {
+        let Some(pattern) = search::word_pattern(&self.buffer, self.cursor) else {
+            return vec![Effect::Error(
+                "there is no word under the cursor".to_owned(),
+            )];
+        };
+        self.last_search = Some(Search { pattern, backward });
+        self.repeat_search(count, false)
+    }
+
+    /// Moves the cursor onto a position it can occupy, which is how an Ex command running over
+    /// a range walks from line to line.
+    pub(crate) fn set_cursor(&mut self, pos: Position) {
+        self.cursor = self.buffer.clamp(pos);
+        self.motion_context.desired_col = self.cursor.col;
+    }
+
+    /// The buffer an Ex command edits.
+    pub(crate) fn buffer_mut(&mut self) -> &mut Buffer {
+        &mut self.buffer
+    }
+
+    /// Fills the unnamed register with what `:d` took, as `dd` does.
+    pub(crate) fn store_deleted(&mut self, content: RegisterContent) {
+        self.registers.store(None, content);
+    }
+
+    /// Closes whatever the keys of a `:norm` left open, the way Vim closes an unfinished
+    /// command at the end of a `:normal`. Two `<Esc>`s are enough: one leaves Insert or
+    /// Visual mode, and a second drops the keys a half-typed command left pending.
+    pub(crate) fn leave_pending_modes(&mut self) {
+        for _ in 0..2 {
+            if self.mode == Mode::Normal && !self.grammar.is_pending() {
+                break;
+            }
+            self.handle_key(KeyEvent::key(KeyCode::Esc));
+        }
+    }
+
     /// Opens the undo unit the command about to run belongs to. The Insert session an `i`,
-    /// a `c` or an `o` starts is one unit, so its later keys open nothing of their own.
+    /// a `c` or an `o` starts is one unit, so its later keys open nothing of their own, and
+    /// so does every command an Ex command drives.
     fn open_change(&mut self) {
+        if self.running_ex {
+            return;
+        }
         self.history.begin(&self.buffer);
     }
 
@@ -412,6 +583,9 @@ impl Editor {
     /// entered Insert mode: that unit runs until `<Esc>`, and the keys typed until then
     /// belong to it. A command that altered nothing is neither kept nor repeatable.
     fn close_change(&mut self, command: Command) {
+        if self.running_ex {
+            return;
+        }
         if self.mode == Mode::Insert {
             self.open_edit = Some(command);
             self.open_edit_keys.clear();
@@ -430,6 +604,9 @@ impl Editor {
     fn close_insert_session(&mut self) {
         let command = self.open_edit.take();
         let insert_keys = std::mem::take(&mut self.open_edit_keys);
+        if self.running_ex {
+            return;
+        }
         if self.history.commit(&self.buffer)
             && let Some(command) = command
         {
@@ -1066,6 +1243,266 @@ mod tests {
             matches!(effects.as_slice(), [Effect::Error(_)]),
             "{effects:?}"
         );
+    }
+
+    /// The effects `keys` asked the host for.
+    fn effects(text: &str, keys: &str) -> Vec<Effect> {
+        let mut editor = Editor::new(text);
+        editor.handle_keys(keys).expect("key string should parse")
+    }
+
+    /// The one error `keys` reported, which fails the test when they reported anything else.
+    fn error(text: &str, keys: &str) -> String {
+        match effects(text, keys).as_slice() {
+            [Effect::Error(complaint)] => complaint.clone(),
+            other => panic!("expected one error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_command_line_holds_the_keys_typed_into_it() {
+        let editor = run("ab", ":wq");
+        assert_eq!(editor.mode(), Mode::CommandLine);
+        assert_eq!(editor.command_line(), Some(":wq"));
+
+        assert_eq!(run("ab", ":wq<BS>").command_line(), Some(":w"));
+        assert_eq!(run("ab", "/foo").command_line(), Some("/foo"));
+
+        let editor = run("ab", ":wq<Esc>");
+        assert_eq!(editor.mode(), Mode::Normal);
+        assert_eq!(editor.command_line(), None);
+
+        let editor = run("ab", ":w<BS><BS>");
+        assert_eq!(
+            editor.mode(),
+            Mode::Normal,
+            "backspacing over the : drops it"
+        );
+        assert_eq!(editor.command_line(), None);
+    }
+
+    #[test]
+    fn search_moves_to_the_next_match_and_n_walks_on() {
+        assert_eq!(
+            run("foo bar foo", "/foo<CR>").cursor(),
+            Position::new(0, 8),
+            "the match the cursor is already on is stepped over"
+        );
+        assert_eq!(
+            run("foo\nbar\nfoo", "/foo<CR>n").cursor(),
+            Position::new(0, 0)
+        );
+        assert_eq!(
+            run("a\nfoo\nb\nfoo", "/foo<CR>N").cursor(),
+            Position::new(3, 0)
+        );
+        assert_eq!(
+            run("a\nfoo\nb\nfoo", "?foo<CR>").cursor(),
+            Position::new(3, 0)
+        );
+        assert_eq!(
+            run("a\nfoo\nb\nfoo", "?foo<CR>n").cursor(),
+            Position::new(1, 0),
+            "n keeps the direction the search ran in"
+        );
+        assert_eq!(
+            run("a\nfoo\nb\nfoo\nc\nfoo", "/foo<CR>2n").cursor(),
+            Position::new(5, 0)
+        );
+        assert_eq!(
+            run("a\nfoo\nb\nfoo", "/foo<CR>/<CR>").cursor(),
+            Position::new(3, 0),
+            "an empty pattern is the last one again"
+        );
+    }
+
+    #[test]
+    fn star_searches_for_the_word_under_the_cursor() {
+        assert_eq!(
+            run("foo bar\nfoobar\nfoo", "*").cursor(),
+            Position::new(2, 0),
+            "the word boundaries keep foobar out"
+        );
+        assert_eq!(run("foo bar\nfoo", "j0#").cursor(), Position::new(0, 0));
+        assert_eq!(
+            run("foo bar\nfoo", "*n").cursor(),
+            Position::new(0, 0),
+            "the word becomes the search n repeats"
+        );
+    }
+
+    #[test]
+    fn a_search_reports_what_it_could_not_do() {
+        assert_eq!(error("abc", "/zz<CR>"), "pattern not found: zz");
+        assert!(error("abc", "/a(<CR>").starts_with("a( is not a valid pattern"));
+        assert_eq!(error("abc", "n"), "there is no search to repeat");
+        assert_eq!(error(" abc", "*"), "there is no word under the cursor");
+    }
+
+    #[test]
+    fn write_and_quit_are_handed_to_the_host() {
+        assert_eq!(
+            effects("ab", ":w<CR>"),
+            vec![Effect::SaveRequested { path: None }]
+        );
+        assert_eq!(
+            effects("ab", ":w out.txt<CR>"),
+            vec![Effect::SaveRequested {
+                path: Some("out.txt".to_owned())
+            }]
+        );
+        assert_eq!(
+            effects("ab", ":q<CR>"),
+            vec![Effect::QuitRequested { force: false }]
+        );
+        assert_eq!(
+            effects("ab", ":q!<CR>"),
+            vec![Effect::QuitRequested { force: true }]
+        );
+        for keys in [":wq<CR>", ":x<CR>"] {
+            assert_eq!(
+                effects("ab", keys),
+                vec![
+                    Effect::SaveRequested { path: None },
+                    Effect::QuitRequested { force: false }
+                ],
+                "{keys}"
+            );
+        }
+        assert_eq!(
+            effects("ab", ":<CR>"),
+            Vec::new(),
+            "an empty line does nothing"
+        );
+        assert_eq!(error("ab", ":nope<CR>"), "not an editor command: nope");
+    }
+
+    #[test]
+    fn substitute_replaces_over_the_lines_the_range_names() {
+        assert_eq!(
+            run("foo foo\nfoo", ":s/foo/bar/<CR>").text(),
+            "bar foo\nfoo"
+        );
+        assert_eq!(
+            run("foo foo\nfoo", ":s/foo/bar/g<CR>").text(),
+            "bar bar\nfoo"
+        );
+        assert_eq!(
+            run("foo\nfoo\nfoo", ":%s/foo/bar/<CR>").text(),
+            "bar\nbar\nbar"
+        );
+        assert_eq!(
+            run("a\nfoo\nfoo\nfoo", ":2,3s/foo/bar/<CR>").text(),
+            "a\nbar\nbar\nfoo"
+        );
+        assert_eq!(run("FOO\nfoo", ":%s/foo/x/i<CR>").text(), "x\nx");
+        assert_eq!(
+            run("a=1\nb=2", r":%s/(\w+)=(\w+)/$2=$1/<CR>").text(),
+            "1=a\n2=b",
+            "a capture is put back with $1"
+        );
+        assert_eq!(
+            run("one\ntwo\nthree", ":/two/,/three/s/^/- /<CR>").text(),
+            "one\n- two\n- three",
+            "a pattern names a line of the range"
+        );
+        assert_eq!(
+            run("a/b", r":s/a\/b/c/<CR>").text(),
+            "c",
+            "a delimiter inside a pattern is escaped"
+        );
+        assert_eq!(
+            run("foo\nbar", ":s/foo/bar/<CR>").cursor(),
+            Position::new(0, 0)
+        );
+        assert_eq!(error("abc", ":%s/zz/y/<CR>"), "pattern not found: zz");
+    }
+
+    #[test]
+    fn delete_takes_the_lines_the_range_names() {
+        assert_eq!(run("a\nb\nc\nd", ":2,3d<CR>").text(), "a\nd");
+        assert_eq!(run("a\nb\nc", ":d<CR>").text(), "b\nc");
+        assert_eq!(run("a\nb\nc", ":%d<CR>").text(), "");
+        assert_eq!(run("a\nb\nc", ":2,$d<CR>").text(), "a");
+        assert_eq!(
+            run("a\nb\nc", ":2,3d<CR>").registers().get(None),
+            Some(&RegisterContent::linewise("b\nc".to_owned())),
+            ":d fills the unnamed register the way dd does"
+        );
+        assert_eq!(
+            error("a\nb\nc", ":3,2d<CR>"),
+            "the range ends before it starts"
+        );
+    }
+
+    #[test]
+    fn global_runs_its_command_on_every_line_that_matches() {
+        assert_eq!(run("a1\nb\na2\nc", ":g/^a/d<CR>").text(), "b\nc");
+        assert_eq!(run("a1\nb\na2\nc", ":v/^a/d<CR>").text(), "a1\na2");
+        assert_eq!(
+            run(
+                "import a\nlet b\nimport c",
+                ":g/^import/norm A;<lt>Esc><CR>"
+            )
+            .text(),
+            "import a;\nlet b\nimport c;",
+            "the keys reach every marked line even though earlier ones grew"
+        );
+        assert_eq!(run("ax\nb\ncx", ":g/x/s/x/y/<CR>").text(), "ay\nb\ncy");
+        assert_eq!(
+            run("a\nb\na\nb\na", ":g/a/norm dd<CR>").text(),
+            "b\nb",
+            "the marks hold while the lines under them move up"
+        );
+        assert_eq!(error("a\nb", ":g/zz/d<CR>"), "pattern not found: zz");
+        assert_eq!(error("a\nb", ":g/a/w<CR>"), ":g runs d, s or norm, not :w");
+    }
+
+    #[test]
+    fn normal_types_its_keys_at_the_start_of_each_line_in_the_range() {
+        assert_eq!(
+            run("ab\ncd\nef", ":%norm A!<lt>Esc><CR>").text(),
+            "ab!\ncd!\nef!"
+        );
+        assert_eq!(
+            run("ab\ncd\nef", ":2,3norm x<CR>").text(),
+            "ab\nd\nf",
+            "keys that leave no mode open need no <Esc> of their own"
+        );
+        assert_eq!(
+            run("foo bar", ":norm ciwX<lt>Esc><CR>").text(),
+            "X bar",
+            "an unfinished Insert session is closed at the end of the keys"
+        );
+        assert_eq!(
+            run("ab\ncd", ":%norm xzx<CR>").text(),
+            "b\nd",
+            "the key that failed ends that line's run, and the next line still runs"
+        );
+        assert!(
+            error("ab", ":norm i<lt>Nope><CR>")
+                .starts_with(":norm was given keys that do not parse"),
+        );
+    }
+
+    #[test]
+    fn an_ex_command_is_one_undo_unit() {
+        assert_eq!(
+            run("foo\nfoo\nfoo", ":%s/foo/bar/<CR>u").text(),
+            "foo\nfoo\nfoo"
+        );
+        assert_eq!(
+            run("import a\nimport b", ":g/^import/norm A;<lt>Esc><CR>u").text(),
+            "import a\nimport b"
+        );
+        assert_eq!(run("a\nb\nc", ":%d<CR>u").text(), "a\nb\nc");
+        assert_eq!(run("foo\nfoo", ":%s/foo/bar/<CR>u<C-r>").text(), "bar\nbar");
+    }
+
+    #[test]
+    fn a_line_that_is_only_a_number_moves_the_cursor_to_it() {
+        assert_eq!(run("a\n  b\nc", ":2<CR>").cursor(), Position::new(1, 2));
+        assert_eq!(run("a\nb\nc", ":$<CR>").cursor(), Position::new(2, 0));
     }
 
     #[test]

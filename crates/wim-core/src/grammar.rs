@@ -227,6 +227,23 @@ impl Grammar {
                 self.stage = Stage::AwaitReplacement;
                 Command::Pending
             }
+            ':' | '/' | '?' => self.emit(Command::EnterCommandLine(character)),
+            'n' => self.emit(Command::RepeatSearch {
+                reverse: false,
+                count,
+            }),
+            'N' => self.emit(Command::RepeatSearch {
+                reverse: true,
+                count,
+            }),
+            '*' => self.emit(Command::SearchWord {
+                backward: false,
+                count,
+            }),
+            '#' => self.emit(Command::SearchWord {
+                backward: true,
+                count,
+            }),
             'J' => self.emit(Command::JoinLines { count }),
             '~' => self.emit(Command::ToggleCase { count }),
             'u' => self.emit(Command::Undo { count }),

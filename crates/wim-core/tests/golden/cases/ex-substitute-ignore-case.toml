@@ -1,0 +1,9 @@
+name = "the i flag on :s ignores case"
+input = '''
+Foo
+foo'''
+keys = ":%s/foo/bar/i<CR>"
+expected = '''
+bar
+bar'''
+expected_cursor = [1, 0]
