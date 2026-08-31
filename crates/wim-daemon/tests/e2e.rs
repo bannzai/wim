@@ -4,22 +4,46 @@
 //! WebSocket, edit it with `wim-core` on this side of the wire — where the buffer lives
 //! (`documents/adr/0001-daemon-fs-provider.md`) — write it back, and find the result on disk.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use tempfile::TempDir;
 use tokio::net::TcpStream;
+use tokio::time::{Instant, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use wim_core::Editor;
 use wim_daemon::Daemon;
 use wim_protocol::{
-    Ack, AuthParams, AuthResult, DirEntry, EntryKind, ErrorCode, FsListParams, FsListResult,
-    FsReadParams, FsReadResult, FsUnwatchParams, FsWatchParams, FsWriteParams, Method,
-    PROTOCOL_VERSION, Request, Response, ResponseError,
+    Ack, AuthParams, AuthResult, DirEntry, EntryKind, ErrorCode, Event, FsChangeKind,
+    FsChangedParams, FsListParams, FsListResult, FsReadParams, FsReadResult, FsUnwatchParams,
+    FsWatchParams, FsWatchResult, FsWriteParams, Method, PROTOCOL_VERSION, Request, Response,
+    ResponseError, ServerPush,
 };
+
+/// How long a test keeps making a change before it calls the watch broken.
+///
+/// The backends report asynchronously and none of them promises when, so the wait has to hold for
+/// a loaded CI runner; a run where the watch works spends a fraction of it.
+const CHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a test waits for one change before making it again.
+///
+/// A backend is watching only some time after it says it is: on macOS the changes made in the
+/// window right after an FSEvents stream starts are reported by neither this run nor a later one,
+/// which measured as a third of the runs of this file. One change going unreported is therefore
+/// not yet a watch that does not work, and making the change again is what tells the two apart.
+const CHANGE_RETRY: Duration = Duration::from_millis(500);
+
+/// How long a test watches for a change that should not come.
+///
+/// Absence cannot be waited out, so this is a window wide enough that a watch which is still live
+/// would have reported the change made in front of it.
+const NO_CHANGE_WINDOW: Duration = Duration::from_secs(2);
 
 /// A daemon serving a directory, with a file outside that directory to reach for.
 struct Fixture {
@@ -71,6 +95,11 @@ impl Fixture {
     fn read(&self, name: &str) -> String {
         std::fs::read_to_string(self.root.join(name)).expect("the file should be readable")
     }
+
+    /// Writes a file in the root straight to disk, the way a program other than the daemon would.
+    fn write(&self, name: &str, content: &str) {
+        std::fs::write(self.root.join(name), content).expect("the file should be written");
+    }
 }
 
 /// Loopback and a port the operating system picks, so that tests can run side by side.
@@ -80,10 +109,19 @@ fn loopback() -> SocketAddr {
         .expect("the address should be an address")
 }
 
+/// A message the daemon sent, which is a response to a request or a push nothing asked for.
+#[derive(Debug)]
+enum Incoming {
+    Response(Response),
+    Push(ServerPush),
+}
+
 /// A client of the daemon, playing the part a wim front end plays.
 struct Client {
     websocket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
+    /// Pushes that arrived while a response was being waited on.
+    pushes: VecDeque<ServerPush>,
 }
 
 impl Client {
@@ -95,6 +133,7 @@ impl Client {
         Self {
             websocket,
             next_id: 0,
+            pushes: VecDeque::new(),
         }
     }
 
@@ -122,11 +161,24 @@ impl Client {
     }
 
     /// Sends a message the typed API cannot build, and reads the response to it.
+    ///
+    /// A watch pushes on the same connection the requests travel on, so anything that arrives
+    /// before the response is set aside rather than mistaken for one.
     async fn send(&mut self, text: &str) -> Response {
         self.websocket
             .send(Message::text(text.to_owned()))
             .await
             .expect("the daemon should take the message");
+        loop {
+            match self.receive().await {
+                Incoming::Response(response) => return response,
+                Incoming::Push(push) => self.pushes.push_back(push),
+            }
+        }
+    }
+
+    /// The next message the daemon sends, whichever of the two kinds it is.
+    async fn receive(&mut self) -> Incoming {
         let message = self
             .websocket
             .next()
@@ -136,7 +188,63 @@ impl Client {
         let Message::Text(text) = message else {
             panic!("the daemon answers in text frames, and sent {message:?}");
         };
-        serde_json::from_str(text.as_str()).expect("the answer should be a response")
+        // A push carries `event` and no `id`, so it is the one of the two that parses.
+        match serde_json::from_str(text.as_str()) {
+            Ok(push) => Incoming::Push(push),
+            Err(_) => Incoming::Response(
+                serde_json::from_str(text.as_str())
+                    .expect("the answer should be a response or a push"),
+            ),
+        }
+    }
+
+    /// The change a watch reports about `name`, with `apply` making that change until one comes.
+    async fn change_to(
+        &mut self,
+        name: &str,
+        mut apply: impl AsyncFnMut(&mut Self),
+    ) -> FsChangedParams {
+        let deadline = Instant::now() + CHANGE_TIMEOUT;
+        loop {
+            apply(self).await;
+            if let Some(change) = self.change_within(CHANGE_RETRY, name).await {
+                return change;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no change to {name} was reported within {CHANGE_TIMEOUT:?}"
+            );
+        }
+    }
+
+    /// The next change a watch reports about `name`, and `None` when the window runs out first.
+    ///
+    /// Changes about other paths are passed over: a directory watch also sees the directory
+    /// itself, and what a backend reports around a write is its own to decide.
+    async fn change_within(&mut self, window: Duration, name: &str) -> Option<FsChangedParams> {
+        let deadline = Instant::now() + window;
+        loop {
+            let push = match self.pushes.pop_front() {
+                Some(push) => push,
+                None => match timeout_at(deadline, self.receive()).await {
+                    Ok(Incoming::Push(push)) => push,
+                    Ok(Incoming::Response(response)) => {
+                        panic!("nothing asked for this response: {response:?}")
+                    }
+                    Err(_) => return None,
+                },
+            };
+            let Event::FsChanged(change) = push.event;
+            if change.path.ends_with(name) {
+                return Some(change);
+            }
+        }
+    }
+
+    /// Panics if a change about `name` arrives while the window lasts.
+    async fn expect_no_change(&mut self, name: &str) {
+        let change = self.change_within(NO_CHANGE_WINDOW, name).await;
+        assert!(change.is_none(), "a change was reported: {change:?}");
     }
 
     /// The result of a call that is expected to go through, read as the method's result type.
@@ -330,20 +438,173 @@ async fn a_path_that_is_not_there_is_reported_as_missing() {
 }
 
 #[tokio::test]
-async fn watching_is_refused_as_a_method_this_daemon_does_not_serve_yet() {
+async fn a_watch_reports_a_write_the_client_made_through_the_daemon() {
     let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
     let mut client = Client::authenticated(&fixture).await;
 
-    for method in [
-        Method::FsWatch(FsWatchParams {
+    let watch: FsWatchResult = client
+        .ok(Method::FsWatch(FsWatchParams {
+            path: "notes.txt".to_owned(),
+            recursive: false,
+        }))
+        .await;
+
+    let change = client
+        .change_to("notes.txt", async |client: &mut Client| {
+            let _: Ack = client
+                .ok(Method::FsWrite(FsWriteParams {
+                    path: "notes.txt".to_owned(),
+                    content: "written\n".to_owned(),
+                }))
+                .await;
+        })
+        .await;
+
+    assert_eq!(change.watch_id, watch.watch_id);
+    // A write over a file that was made moments ago reaches the backends as one event or two, and
+    // whether they call it a creation or a change of contents is theirs to decide.
+    assert!(
+        matches!(change.kind, FsChangeKind::Created | FsChangeKind::Modified),
+        "{change:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_watch_reports_a_change_made_outside_the_daemon() {
+    let fixture = Fixture::start(&[]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let watch: FsWatchResult = client
+        .ok(Method::FsWatch(FsWatchParams {
             path: ".".to_owned(),
             recursive: true,
-        }),
-        Method::FsUnwatch(FsUnwatchParams { watch_id: 1 }),
-    ] {
-        let error = client.err(method).await;
-        assert_eq!(error.code, ErrorCode::Other("not_implemented".to_owned()));
+        }))
+        .await;
+
+    let change = client
+        .change_to("planted.txt", async |_: &mut Client| {
+            fixture.write("planted.txt", "planted\n")
+        })
+        .await;
+
+    assert_eq!(change.watch_id, watch.watch_id);
+    assert!(
+        change.path.ends_with("planted.txt"),
+        "the change names the path that changed: {change:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_watch_that_was_dropped_reports_nothing_more() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let watch: FsWatchResult = client
+        .ok(Method::FsWatch(FsWatchParams {
+            path: ".".to_owned(),
+            recursive: false,
+        }))
+        .await;
+    // The watch is live before it is dropped, so that what follows says something.
+    let change = client
+        .change_to("notes.txt", async |_: &mut Client| {
+            fixture.write("notes.txt", "watched\n")
+        })
+        .await;
+    assert_eq!(change.watch_id, watch.watch_id);
+
+    let _: Ack = client
+        .ok(Method::FsUnwatch(FsUnwatchParams {
+            watch_id: watch.watch_id,
+        }))
+        .await;
+
+    // A file of its own, so that a change the watch saw before it was dropped is not mistaken for
+    // one it saw after.
+    fixture.write("after-unwatch.txt", "unwatched\n");
+    client.expect_no_change("after-unwatch.txt").await;
+}
+
+#[tokio::test]
+async fn dropping_a_watch_that_is_not_there_is_the_state_it_asks_for() {
+    let fixture = Fixture::start(&[]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let watch: FsWatchResult = client
+        .ok(Method::FsWatch(FsWatchParams {
+            path: ".".to_owned(),
+            recursive: false,
+        }))
+        .await;
+    for _ in 0..2 {
+        let _: Ack = client
+            .ok(Method::FsUnwatch(FsUnwatchParams {
+                watch_id: watch.watch_id,
+            }))
+            .await;
     }
+    let _: Ack = client
+        .ok(Method::FsUnwatch(FsUnwatchParams { watch_id: 404 }))
+        .await;
+}
+
+#[tokio::test]
+async fn a_change_is_reported_only_to_the_connection_that_asked_to_see_it() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    let mut watcher = Client::authenticated(&fixture).await;
+    let mut writer = Client::authenticated(&fixture).await;
+
+    let watch: FsWatchResult = watcher
+        .ok(Method::FsWatch(FsWatchParams {
+            path: ".".to_owned(),
+            recursive: false,
+        }))
+        .await;
+
+    let change = watcher
+        .change_to("notes.txt", async |_: &mut Client| {
+            let _: Ack = writer
+                .ok(Method::FsWrite(FsWriteParams {
+                    path: "notes.txt".to_owned(),
+                    content: "written by the other one\n".to_owned(),
+                }))
+                .await;
+        })
+        .await;
+
+    assert_eq!(change.watch_id, watch.watch_id);
+    writer.expect_no_change("notes.txt").await;
+}
+
+#[tokio::test]
+async fn a_watch_on_a_path_outside_the_root_is_refused() {
+    let fixture = Fixture::start(&[]).await;
+    let outside = fixture.outside("secret.md").display().to_string();
+    let mut client = Client::authenticated(&fixture).await;
+
+    for path in ["..".to_owned(), "../secret.md".to_owned(), outside] {
+        let error = client
+            .err(Method::FsWatch(FsWatchParams {
+                path: path.clone(),
+                recursive: true,
+            }))
+            .await;
+        assert_eq!(error.code, ErrorCode::PermissionDenied, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn a_watch_on_a_path_that_is_not_there_is_reported_as_missing() {
+    let fixture = Fixture::start(&[]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let error = client
+        .err(Method::FsWatch(FsWatchParams {
+            path: "nowhere.txt".to_owned(),
+            recursive: false,
+        }))
+        .await;
+    assert_eq!(error.code, ErrorCode::NotFound);
 }
 
 #[tokio::test]
