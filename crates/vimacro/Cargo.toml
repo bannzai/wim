@@ -1,0 +1,10 @@
+[package]
+name = "vimacro"
+version = "0.0.0"
+description = "Headless CLI that applies Vim macros to files, powered by wim-core."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wim-core.workspace = true
