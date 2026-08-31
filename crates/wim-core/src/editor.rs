@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::buffer::Buffer;
-use crate::command::{Command, InsertAnchor, Operator, OperatorTarget};
+use crate::command::{Command, InsertAnchor, Operator, OperatorTarget, SelectionShape};
 use crate::edit;
 use crate::effect::Effect;
 use crate::ex;
@@ -217,8 +217,14 @@ impl Editor {
     ) -> Option<TextRange> {
         match target {
             OperatorTarget::Lines => {
-                let last =
-                    (self.cursor.line + at_least_one(count) - 1).min(self.buffer.line_count() - 1);
+                // A count saturates rather than wraps when it is typed with more digits than
+                // a number can hold, so the last line is reached without counting past a
+                // `usize`.
+                let last = self
+                    .cursor
+                    .line
+                    .saturating_add(at_least_one(count) - 1)
+                    .min(self.buffer.line_count() - 1);
                 Some(TextRange::lines(&self.buffer, self.cursor.line, last))
             }
             OperatorTarget::TextObject(object) => {
@@ -232,6 +238,7 @@ impl Editor {
                     Position::new(end.line, end.col + 1),
                 ))
             }
+            OperatorTarget::SelectionShape(shape) => Some(shape.range_at(self.cursor)),
         }
     }
 
@@ -302,9 +309,37 @@ impl Editor {
     }
 
     fn apply(&mut self, command: Command) -> Vec<Effect> {
+        let repeatable = self.repeatable_form(command);
         let effects = self.run(command);
-        self.close_change(command);
+        self.close_change(repeatable);
         effects
+    }
+
+    /// The form of `command` that `.` can run again.
+    ///
+    /// An operator typed over a Visual selection keeps the shape that selection resolved to,
+    /// because by the time the repeat runs there is no selection to take. Every other
+    /// command repeats as it was typed.
+    fn repeatable_form(&self, command: Command) -> Command {
+        let Command::Operate {
+            operator,
+            count,
+            register,
+            target: OperatorTarget::Selection,
+        } = command
+        else {
+            return command;
+        };
+        let Some(range) = self.resolve_operator_target(operator, count, OperatorTarget::Selection)
+        else {
+            return command;
+        };
+        Command::Operate {
+            operator,
+            count,
+            register,
+            target: OperatorTarget::SelectionShape(SelectionShape::of(range)),
+        }
     }
 
     fn run(&mut self, command: Command) -> Vec<Effect> {
@@ -414,19 +449,31 @@ impl Editor {
         target: OperatorTarget,
     ) {
         if let OperatorTarget::Motion(motion) = target {
-            // A search the operator consumed is still what `;` repeats afterwards.
-            self.motion_context = motion::resolve(
+            // A search the operator consumed is still what `;` repeats afterwards. The
+            // column that motion reached is not kept: the edit below decides where the
+            // cursor ends up, and that is the column `j` and `k` then aim for.
+            self.motion_context.last_find = motion::resolve(
                 &self.buffer,
                 self.cursor,
                 motion,
                 count,
                 &self.motion_context,
             )
-            .context;
+            .context
+            .last_find;
         }
         let Some(range) = self.resolve_operator_target(operator, count, target) else {
             return;
         };
+        // A span that holds no text — `d0` in column 0, `D` on an empty line — is a command
+        // that cannot run: the buffer and the registers are left alone rather than the last
+        // yank being overwritten with the empty string. A change still opens Insert mode
+        // where the span is, which is what `ci"` between two quotes with nothing in them
+        // does.
+        let holds_nothing = self.holds_nothing(range);
+        if holds_nothing && operator != Operator::Change {
+            return;
+        }
         self.visual_anchor = None;
         match operator {
             Operator::Yank => {
@@ -450,11 +497,24 @@ impl Editor {
             Operator::Change => {
                 self.open_change();
                 let (content, cursor) = edit::change(&mut self.buffer, range);
-                self.registers.store(register, content);
+                if !holds_nothing {
+                    self.registers.store(register, content);
+                }
                 self.cursor = cursor;
                 self.mode = Mode::Insert;
             }
         }
+        // The column `j` and `k` aim for follows the cursor to where the edit left it: after
+        // `dw` the text the motion reached is gone, so aiming for its column would drop onto
+        // the next line further right than the cursor stands.
+        self.motion_context.desired_col = self.cursor.col;
+    }
+
+    /// Whether `range` covers no text at all, which its two ends alone do not tell: a
+    /// charwise span may end one column past the last grapheme of a line, so a span over an
+    /// empty line reads as a column wide while holding nothing.
+    fn holds_nothing(&self, range: TextRange) -> bool {
+        !range.linewise && self.buffer.text_between(range.start, range.end).is_empty()
     }
 
     fn paste(&mut self, before: bool, count: Option<usize>, register: Option<char>) -> Vec<Effect> {
@@ -465,14 +525,16 @@ impl Editor {
             );
             return vec![Effect::Error(format!("{name} is empty"))];
         };
+        let count = at_least_one(count);
         self.open_change();
-        self.cursor = edit::paste(
-            &mut self.buffer,
-            self.cursor,
-            &content,
-            before,
-            at_least_one(count),
-        );
+        let Some(cursor) = edit::paste(&mut self.buffer, self.cursor, &content, before, count)
+        else {
+            return vec![Effect::Error(format!(
+                "{count} copies are more than the {} bytes a paste may put in",
+                edit::MAX_PASTE_BYTES
+            ))];
+        };
+        self.cursor = cursor;
         Vec::new()
     }
 
@@ -481,15 +543,17 @@ impl Editor {
         let mut moved = false;
         for _ in 0..at_least_one(count) {
             let restored = if backwards {
-                self.history.undo(&self.buffer)
+                self.history.undo()
             } else {
-                self.history.redo(&self.buffer)
+                self.history.redo()
             };
-            let Some(restored) = restored else {
+            // Undo goes back to where the change started and redo forward to where it left
+            // the cursor, both of which the change itself holds.
+            let Some((buffer, cursor)) = restored else {
                 break;
             };
-            self.cursor = restored.first_difference(&self.buffer);
-            self.buffer = restored;
+            self.buffer = buffer;
+            self.cursor = self.buffer.clamp(cursor);
             moved = true;
         }
         if moved {
@@ -577,13 +641,13 @@ impl Editor {
         };
         let outermost = !self.running_ex;
         if outermost {
-            self.history.begin(&self.buffer);
+            self.history.begin(&self.buffer, self.cursor);
             self.running_ex = true;
         }
         let effects = ex::execute(self, &command);
         if outermost {
             self.running_ex = false;
-            self.history.commit(&self.buffer);
+            self.history.commit(&self.buffer, self.cursor);
         }
         effects
     }
@@ -600,15 +664,33 @@ impl Editor {
     }
 
     /// `n` and `N`: walks `count` matches of the last search, `N` the other way round.
+    ///
+    /// A search wraps around the end of the buffer, so the matches make a ring that a walk
+    /// goes round and round: coming back to the match it started on says how long the ring
+    /// is, and from there only the count left over modulo that length changes where the walk
+    /// ends. Folding the count that way is what keeps `99999999999999999999n` — a count the
+    /// grammar saturates rather than wraps — from searching for as many times as it says.
     fn repeat_search(&mut self, count: Option<usize>, reverse: bool) -> Vec<Effect> {
         let Some(search) = self.last_search.clone() else {
             return vec![Effect::Error("there is no search to repeat".to_owned())];
         };
         let backward = search.backward != reverse;
-        for _ in 0..at_least_one(count) {
+        let mut left = at_least_one(count);
+        let mut ring_start = None;
+        let mut walked = 0;
+        while left > 0 {
             match search::find(&self.buffer, self.cursor, &search.pattern, backward) {
                 Ok(found) => self.cursor = found,
                 Err(error) => return vec![Effect::Error(error.to_string())],
+            }
+            left -= 1;
+            walked += 1;
+            match ring_start {
+                None => ring_start = Some(self.cursor),
+                // The walk is back on the match it started from, so it has just gone round
+                // the whole ring: `walked` steps less the one that reached the ring.
+                Some(start) if start == self.cursor => left %= walked - 1,
+                Some(_) => {}
             }
         }
         self.motion_context.desired_col = self.cursor.col;
@@ -792,7 +874,7 @@ impl Editor {
         if self.running_ex {
             return;
         }
-        self.history.begin(&self.buffer);
+        self.history.begin(&self.buffer, self.cursor);
     }
 
     /// Closes the undo unit `command` opened and makes it the change `.` repeats, unless it
@@ -810,7 +892,7 @@ impl Editor {
             self.open_edit_keys.clear();
             return;
         }
-        if self.history.commit(&self.buffer) {
+        if self.history.commit(&self.buffer, self.cursor) {
             self.last_edit = Some(LastEdit {
                 command,
                 insert_keys: Vec::new(),
@@ -826,7 +908,7 @@ impl Editor {
         if self.running_ex {
             return;
         }
-        if self.history.commit(&self.buffer)
+        if self.history.commit(&self.buffer, self.cursor)
             && let Some(command) = command
         {
             self.last_edit = Some(LastEdit {
@@ -1399,6 +1481,137 @@ mod tests {
     }
 
     #[test]
+    fn undo_goes_back_to_where_the_change_started_and_redo_to_where_it_ended() {
+        let editor = run("a\na\n", "ddu");
+        assert_eq!(editor.text(), "a\na\n");
+        assert_eq!(
+            editor.cursor(),
+            Position::new(0, 0),
+            "the line taken away is the one the cursor was on, even though the line below \
+             held the same text"
+        );
+
+        let editor = run("ab\ncd", "jddu");
+        assert_eq!(editor.cursor(), Position::new(1, 0));
+        let editor = run("ab\ncd", "jddu<C-r>");
+        assert_eq!(
+            editor.cursor(),
+            Position::new(0, 0),
+            "the redo lands where the delete had left the cursor"
+        );
+
+        assert_eq!(
+            run("ab", "lixyz<Esc>u").cursor(),
+            Position::new(0, 1),
+            "an Insert session goes back to the column it was opened in"
+        );
+    }
+
+    #[test]
+    fn repeat_applies_the_shape_a_selection_had_from_the_cursor() {
+        assert_eq!(
+            run("abcdef", "vldl.").text(),
+            "cf",
+            "the repeat took two more graphemes, from where the cursor then was"
+        );
+        assert_eq!(
+            run("abc\ndef\nghi", "vjd.").text(),
+            "hi",
+            "a selection over two lines repeats over two lines"
+        );
+        assert_eq!(
+            run("abcdef", "vlcX<Esc>l.").text(),
+            "XXef",
+            "a change over a selection repeats the typing too"
+        );
+    }
+
+    #[test]
+    fn an_operator_over_a_span_of_no_text_leaves_the_registers_alone() {
+        assert_eq!(
+            run("abc", "yld0p").text(),
+            "aabc",
+            "the d0 in column 0 took nothing, so the yank is still what p puts back"
+        );
+        assert_eq!(
+            run("abc\n\ndef", "yljDp").text(),
+            "abc\na\ndef",
+            "D on an empty line takes nothing"
+        );
+        assert_eq!(
+            run("abc", "yly0p").text(),
+            "aabc",
+            "and neither does a yank of nothing"
+        );
+
+        let editor = run("say \"\" now", "ci\"");
+        assert_eq!(
+            editor.mode(),
+            Mode::Insert,
+            "a change still opens Insert mode where the empty span is"
+        );
+        assert_eq!(editor.cursor(), Position::new(0, 5));
+    }
+
+    #[test]
+    fn an_operator_leaves_the_column_the_next_line_is_reached_at_where_the_edit_did() {
+        assert_eq!(
+            run("foo bar\nbaz qux", "dwj").cursor(),
+            Position::new(1, 0),
+            "the column w reached is gone with the text it reached"
+        );
+        assert_eq!(run("foo bar\nbaz qux", "d$j").cursor(), Position::new(1, 0));
+        assert_eq!(
+            run("foo bar\nbaz qux", "wdbj").cursor(),
+            Position::new(1, 0)
+        );
+    }
+
+    #[test]
+    fn a_count_no_command_could_carry_out_is_reported_rather_than_run() {
+        // A count typed with more digits than a number can hold saturates, which is what
+        // every one of these commands has to survive.
+        let huge = "99999999999999999999";
+
+        let mut editor = Editor::new("abc");
+        let effects = editor
+            .handle_keys(&format!("yl{huge}p"))
+            .expect("key string should parse");
+        assert!(
+            matches!(effects.as_slice(), [Effect::Error(_)]),
+            "{effects:?}"
+        );
+        assert_eq!(editor.text(), "abc", "the paste put nothing in");
+
+        assert_eq!(
+            run("abc", &format!("{huge}rx")).text(),
+            "abc",
+            "a replace past the line end writes nothing"
+        );
+        assert_eq!(run("ab\ncd", &format!("{huge}dd")).text(), "");
+        assert_eq!(
+            run("ab\ncd", &format!("d{huge}j")).text(),
+            "ab\ncd",
+            "a j that far down cannot move, so the operator takes nothing"
+        );
+        assert_eq!(
+            run("ab\ncd", &format!("{huge}j")).cursor(),
+            Position::new(0, 0)
+        );
+        assert_eq!(
+            run("ab\ncd", &format!("{huge}l")).cursor(),
+            Position::new(0, 1)
+        );
+        assert_eq!(
+            run("ab\ncd", &format!("{huge}$")).cursor(),
+            Position::new(1, 1)
+        );
+        assert_eq!(run("foo bar", &format!("d{huge}iw")).text(), "");
+        assert_eq!(run("abc", &format!("{huge}~")).text(), "ABC");
+        assert_eq!(run("a\nb", &format!("{huge}J")).text(), "a b");
+    }
+
+    #[test]
     fn an_insert_session_is_one_undo_unit() {
         assert_eq!(run("ab", "ixyz<Esc>u").text(), "ab");
         assert_eq!(
@@ -1532,6 +1745,37 @@ mod tests {
             run("a\nfoo\nb\nfoo", "/foo<CR>/<CR>").cursor(),
             Position::new(3, 0),
             "an empty pattern is the last one again"
+        );
+    }
+
+    #[test]
+    fn a_count_past_the_matches_walks_only_what_is_left_of_the_ring() {
+        let text = "foo\nfoo\nfoo";
+        assert_eq!(run(text, "/foo<CR>2n").cursor(), Position::new(0, 0));
+        assert_eq!(
+            run(text, "/foo<CR>100000001n").cursor(),
+            Position::new(0, 0),
+            "100000001 walks of a ring of three matches end where two do"
+        );
+        assert_eq!(
+            run(text, "/foo<CR>99999999999999999999n").cursor(),
+            Position::new(1, 0),
+            "a count the grammar saturated is a whole number of times round the ring"
+        );
+        assert_eq!(
+            run(text, "/foo<CR>100000001N").cursor(),
+            Position::new(2, 0),
+            "N walks the ring the other way round"
+        );
+        assert_eq!(
+            run("foo bar\nfoo", "99999999999999999999*").cursor(),
+            Position::new(1, 0),
+            "the word under the cursor is searched for on the same walk"
+        );
+        assert_eq!(
+            run("foo", "/foo<CR>99999999999999999999n").cursor(),
+            Position::new(0, 0),
+            "a ring of one match stands still"
         );
     }
 

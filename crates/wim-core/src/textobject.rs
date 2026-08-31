@@ -189,7 +189,9 @@ fn word(
         };
         (start, end - 1)
     } else {
-        (first, (first + count - 1).min(runs.len() - 1))
+        // A count saturates rather than wraps when it is typed with more digits than a
+        // number can hold, so the last run is reached without counting past a `usize`.
+        (first, first.saturating_add(count - 1).min(runs.len() - 1))
     };
 
     Some(TextRange::charwise(

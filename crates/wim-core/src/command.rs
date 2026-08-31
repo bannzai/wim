@@ -2,7 +2,8 @@
 
 use crate::key::KeyEvent;
 use crate::motion::Motion;
-use crate::textobject::TextObject;
+use crate::position::Position;
+use crate::textobject::{TextObject, TextRange};
 
 /// An operator: a command that acts on a range of text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,45 @@ impl Operator {
     }
 }
 
+/// The shape a Visual mode selection had when an operator took it.
+///
+/// Visual mode in wim is charwise, so a shape is a number of lines and a column on the last
+/// of them rather than a whole-line span.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionShape {
+    /// How many lines below its first the selection ended on, `0` for a selection that
+    /// stayed on one line.
+    pub lines: usize,
+    /// Where the selection ended: how many columns wide it was when it stayed on one line,
+    /// and the column it ended on when it covered more than one.
+    pub end_col: usize,
+}
+
+impl SelectionShape {
+    /// The shape of `range`, the span a selection resolved to.
+    pub fn of(range: TextRange) -> Self {
+        let lines = range.end.line - range.start.line;
+        Self {
+            lines,
+            end_col: if lines == 0 {
+                range.end.col - range.start.col
+            } else {
+                range.end.col
+            },
+        }
+    }
+
+    /// The span this shape covers when it is applied again from `cursor`.
+    pub fn range_at(&self, cursor: Position) -> TextRange {
+        let end = if self.lines == 0 {
+            Position::new(cursor.line, cursor.col.saturating_add(self.end_col))
+        } else {
+            Position::new(cursor.line.saturating_add(self.lines), self.end_col)
+        };
+        TextRange::charwise(cursor, end)
+    }
+}
+
 /// What an operator was told to act on, before a buffer turns it into a range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatorTarget {
@@ -48,6 +88,10 @@ pub enum OperatorTarget {
     Lines,
     /// The Visual mode selection the operator was typed over.
     Selection,
+    /// The shape a selection had, which is what `.` repeats: by the time the repeat runs
+    /// there is no selection left, so Vim applies the same shape from wherever the cursor
+    /// then is.
+    SelectionShape(SelectionShape),
 }
 
 /// Where `i`, `I`, `a`, `A`, `o` and `O` leave the cursor when Insert mode starts.
@@ -229,6 +273,43 @@ mod tests {
             assert_eq!(Operator::from_key(operator.key()), Some(operator));
         }
         assert_eq!(Operator::from_key('x'), None);
+    }
+
+    #[test]
+    fn a_selection_shape_is_the_span_it_covers_from_a_new_cursor() {
+        let one_line = SelectionShape::of(TextRange::charwise(
+            Position::new(0, 3),
+            Position::new(0, 5),
+        ));
+        assert_eq!(
+            one_line,
+            SelectionShape {
+                lines: 0,
+                end_col: 2
+            },
+            "a selection inside one line keeps its width"
+        );
+        assert_eq!(
+            one_line.range_at(Position::new(2, 1)),
+            TextRange::charwise(Position::new(2, 1), Position::new(2, 3))
+        );
+
+        let two_lines = SelectionShape::of(TextRange::charwise(
+            Position::new(1, 2),
+            Position::new(2, 4),
+        ));
+        assert_eq!(
+            two_lines,
+            SelectionShape {
+                lines: 1,
+                end_col: 4
+            },
+            "a selection over more than one line keeps the column it ended on"
+        );
+        assert_eq!(
+            two_lines.range_at(Position::new(0, 0)),
+            TextRange::charwise(Position::new(0, 0), Position::new(1, 4))
+        );
     }
 
     #[test]

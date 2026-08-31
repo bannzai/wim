@@ -1,0 +1,9 @@
+name = "j after dw aims for the column the delete left the cursor in, not the one w reached"
+input = '''
+foo bar
+baz qux'''
+keys = "dwj"
+expected = '''
+bar
+baz qux'''
+expected_cursor = [1, 0]

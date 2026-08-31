@@ -1,0 +1,11 @@
+name = "a count past the number of matches walks only what is left of the ring, rather than searching that many times"
+input = '''
+foo
+foo
+foo'''
+keys = "/foo<CR>100000001n"
+expected = '''
+foo
+foo
+foo'''
+expected_cursor = [0, 0]
