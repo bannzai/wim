@@ -1,0 +1,22 @@
+[package]
+name = "wim"
+version = "0.0.0"
+description = "Command line front end of wim. Runs the daemon that serves a directory to wim clients."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wim-daemon.workspace = true
+clap.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# The end-to-end test talks to the binary it started, the way a client would.
+wim-protocol.workspace = true
+assert_cmd.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio-tungstenite.workspace = true
