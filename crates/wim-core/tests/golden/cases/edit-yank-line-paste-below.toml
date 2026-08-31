@@ -1,0 +1,10 @@
+name = "yyp puts a copy of the line below it"
+input = '''
+ab
+cd'''
+keys = "yyp"
+expected = '''
+ab
+ab
+cd'''
+expected_cursor = [1, 0]

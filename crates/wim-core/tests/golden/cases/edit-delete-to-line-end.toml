@@ -1,0 +1,5 @@
+name = "D takes the rest of the line"
+input = "foo bar"
+keys = "wD"
+expected = "foo "
+expected_cursor = [0, 3]

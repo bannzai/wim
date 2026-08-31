@@ -1,0 +1,5 @@
+name = "d over a selection takes it and leaves Visual mode"
+input = "foo bar"
+keys = "vwd"
+expected = "ar"
+expected_cursor = [0, 0]

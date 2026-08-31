@@ -1,0 +1,5 @@
+name = "dw takes the word and the blanks after it"
+input = "foo bar baz"
+keys = "dw"
+expected = "bar baz"
+expected_cursor = [0, 0]

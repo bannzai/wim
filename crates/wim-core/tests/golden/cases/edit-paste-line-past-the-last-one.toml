@@ -1,0 +1,10 @@
+name = "a line put below the last one leaves the buffer without a trailing newline"
+input = '''
+ab
+cd'''
+keys = "yyjp"
+expected = '''
+ab
+cd
+ab'''
+expected_cursor = [2, 0]

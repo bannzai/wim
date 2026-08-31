@@ -1,0 +1,5 @@
+name = "xp swaps the two characters at the cursor"
+input = "ab"
+keys = "xp"
+expected = "ba"
+expected_cursor = [0, 1]

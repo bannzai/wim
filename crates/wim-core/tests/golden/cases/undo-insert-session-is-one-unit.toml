@@ -1,0 +1,4 @@
+name = "everything typed between i and <Esc> is undone at once"
+input = "ab"
+keys = "ixyz<Esc>u"
+expected = "ab"

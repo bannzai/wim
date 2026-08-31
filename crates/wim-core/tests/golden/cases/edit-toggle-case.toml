@@ -1,0 +1,5 @@
+name = "~ flips the case of the graphemes it walks over"
+input = "aBc"
+keys = "3~"
+expected = "AbC"
+expected_cursor = [0, 2]

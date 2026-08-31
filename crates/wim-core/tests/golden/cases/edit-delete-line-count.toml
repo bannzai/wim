@@ -1,0 +1,8 @@
+name = "2dd takes the cursor line and the one below it"
+input = '''
+ab
+cd
+ef'''
+keys = "2dd"
+expected = "ef"
+expected_cursor = [0, 0]

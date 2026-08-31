@@ -1,0 +1,5 @@
+name = "x takes the graphemes under the cursor"
+input = "abcdef"
+keys = "3x"
+expected = "def"
+expected_cursor = [0, 0]

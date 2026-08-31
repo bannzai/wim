@@ -1,0 +1,5 @@
+name = "ciw replaces the word the cursor is in"
+input = "bar baz"
+keys = "ciwfoo<Esc>"
+expected = "foo baz"
+expected_cursor = [0, 2]

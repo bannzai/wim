@@ -1,0 +1,5 @@
+name = "d2aw takes two words with their trailing blanks"
+input = "foo bar baz"
+keys = "d2aw"
+expected = "baz"
+expected_cursor = [0, 0]
