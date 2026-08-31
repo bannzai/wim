@@ -1,0 +1,13 @@
+name = ":2,3s leaves the lines outside the range alone"
+input = '''
+foo
+foo
+foo
+foo'''
+keys = ":2,3s/foo/bar/<CR>"
+expected = '''
+foo
+bar
+bar
+foo'''
+expected_cursor = [2, 0]

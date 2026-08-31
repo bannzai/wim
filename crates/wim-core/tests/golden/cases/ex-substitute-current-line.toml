@@ -1,0 +1,9 @@
+name = ":s without a range takes the first match on the cursor's line"
+input = '''
+foo foo
+foo'''
+keys = ":s/foo/bar/<CR>"
+expected = '''
+bar foo
+foo'''
+expected_cursor = [0, 0]

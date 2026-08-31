@@ -1,0 +1,9 @@
+name = "* searches for the word under the cursor, which foobar does not hold"
+input = '''
+foo foobar
+foo'''
+keys = "*x"
+expected = '''
+foo foobar
+oo'''
+expected_cursor = [1, 0]

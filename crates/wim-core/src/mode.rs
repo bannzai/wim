@@ -13,6 +13,9 @@ pub enum Mode {
     /// A selection is being stretched by motions. Characterwise; linewise Visual comes with
     /// the operator issue.
     Visual,
+    /// A `:`, `/` or `?` line is being typed. Keys are text until `<CR>` runs the line or
+    /// `<Esc>` drops it.
+    CommandLine,
 }
 
 impl Mode {
@@ -23,6 +26,7 @@ impl Mode {
             Self::Insert => "INSERT",
             Self::OperatorPending => "OP-PENDING",
             Self::Visual => "VISUAL",
+            Self::CommandLine => "COMMAND",
         }
     }
 }

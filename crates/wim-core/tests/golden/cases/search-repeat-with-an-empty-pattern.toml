@@ -1,0 +1,13 @@
+name = "/ with no pattern searches for the last one again"
+input = '''
+a
+foo
+b
+foo'''
+keys = "/foo<CR>/<CR>x"
+expected = '''
+a
+foo
+b
+oo'''
+expected_cursor = [3, 0]

@@ -1,0 +1,11 @@
+name = "^ anchors a search to the start of a line rather than of the buffer"
+input = '''
+one
+two
+three'''
+keys = "/^t<CR>x"
+expected = '''
+one
+wo
+three'''
+expected_cursor = [1, 0]

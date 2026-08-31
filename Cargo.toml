@@ -11,5 +11,6 @@ repository = "https://github.com/bannzai/wim"
 wim-core = { path = "crates/wim-core" }
 ropey = "1.6"
 unicode-segmentation = "1.12"
+regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 toml = "1.1"

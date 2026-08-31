@@ -1,0 +1,10 @@
+name = ":g/pattern/d takes every line that matches, marks holding as the lines move up"
+input = '''
+keep
+drop me
+keep
+drop me'''
+keys = ":g/drop/d<CR>"
+expected = '''
+keep
+keep'''

@@ -1,0 +1,12 @@
+name = "a range written as two patterns names the lines they match"
+input = '''
+alpha
+bravo
+charlie
+delta
+echo'''
+keys = ":/bravo/,/delta/d<CR>"
+expected = '''
+alpha
+echo'''
+expected_cursor = [1, 0]

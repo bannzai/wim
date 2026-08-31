@@ -1,0 +1,10 @@
+name = ":norm over a range types the keys at the start of each of its lines"
+input = '''
+ab
+cd
+ef'''
+keys = ":2,3norm A!<lt>Esc><CR>"
+expected = '''
+ab
+cd!
+ef!'''

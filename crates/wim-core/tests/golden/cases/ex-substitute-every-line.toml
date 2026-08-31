@@ -1,0 +1,11 @@
+name = ":%s over the whole buffer, with g taking every match on a line"
+input = '''
+foo foo
+bar
+foo'''
+keys = ":%s/foo/bar/g<CR>"
+expected = '''
+bar bar
+bar
+bar'''
+expected_cursor = [2, 0]

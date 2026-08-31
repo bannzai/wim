@@ -1,0 +1,10 @@
+name = ":v/pattern/d takes every line that does not match"
+input = '''
+a1
+b
+a2
+c'''
+keys = ":v/^a/d<CR>"
+expected = '''
+a1
+a2'''

@@ -1,0 +1,11 @@
+name = "? searches towards the start of the buffer and wraps around it"
+input = '''
+foo
+bar
+foo'''
+keys = "?foo<CR>x"
+expected = '''
+foo
+bar
+oo'''
+expected_cursor = [2, 0]
