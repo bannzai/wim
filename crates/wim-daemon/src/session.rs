@@ -1,6 +1,10 @@
 //! One connection: the token it opens with, the requests that follow it, and the watches it holds.
 
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
@@ -9,6 +13,7 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::time::{Instant, timeout_at};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use wim_protocol::{
@@ -23,9 +28,25 @@ use crate::{Shared, io_error};
 /// The half of a connection the daemon reads, once the half it writes has been split off.
 type Incoming = SplitStream<WebSocketStream<TcpStream>>;
 
+/// How long a connection that has not presented the token has, handshake and `auth` together.
+///
+/// A client that means to work sends its `auth` as soon as the socket is up, so this is far more
+/// than one needs even on a machine under load; what it is short for is a peer that never presents
+/// the token at all. The accept loop spawns a task for every socket, so such a peer would
+/// otherwise hold a task and a file descriptor for as long as it liked and could take enough of
+/// them to keep clients that do have the token from connecting.
+const UNAUTHENTICATED_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Serves one client until it goes away, or until it fails to present the token.
 pub(crate) async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<(), WebSocketError> {
-    let (mut sink, mut incoming) = tokio_tungstenite::accept_async(stream).await?.split();
+    // The handshake and the `auth` that has to follow it share one deadline, so that what a peer
+    // which never authenticates can hold is bounded however it stalls. Once the token is in, the
+    // connection is a client's to keep for as long as it lives.
+    let deadline = Instant::now() + UNAUTHENTICATED_TIMEOUT;
+    let websocket = timeout_at(deadline, tokio_tungstenite::accept_async(stream))
+        .await
+        .map_err(|_| timed_out("the handshake did not finish in time"))??;
+    let (mut sink, mut incoming) = websocket.split();
     // Writing is a task of its own so that a watch can push a change while the reading half is
     // waiting on the client's next request. The outbox is unbounded because what fills it is the
     // watcher's callback, which the file system backend runs on a thread of its own that must not
@@ -46,7 +67,7 @@ pub(crate) async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<(), 
         outgoing,
         watches: Watches::default(),
     };
-    let outcome = session.receive(&mut incoming).await;
+    let outcome = session.receive(&mut incoming, deadline).await;
     // Dropping the session drops the watches it holds along with the sending half of the outbox,
     // which is what ends the writing task.
     drop(session);
@@ -67,8 +88,25 @@ struct Session {
 
 impl Session {
     /// Answers what the client sends until it stops sending.
-    async fn receive(&mut self, incoming: &mut Incoming) -> Result<(), WebSocketError> {
-        while let Some(message) = incoming.next().await {
+    ///
+    /// `deadline` is when a connection that has not authenticated yet is let go. It bounds every
+    /// read taken before the token is in rather than only the first one, because the frames this
+    /// daemon passes over — a binary frame, a ping the library answers — leave the connection
+    /// waiting for another message without having said anything.
+    async fn receive(
+        &mut self,
+        incoming: &mut Incoming,
+        deadline: Instant,
+    ) -> Result<(), WebSocketError> {
+        loop {
+            let message = if self.authenticated {
+                incoming.next().await
+            } else {
+                timeout_at(deadline, incoming.next())
+                    .await
+                    .map_err(|_| timed_out("the connection did not present the token in time"))?
+            };
+            let Some(message) = message else { break };
             let text = match message? {
                 Message::Text(text) => text,
                 Message::Close(_) => break,
@@ -231,13 +269,55 @@ async fn read(shared: &Shared, params: FsReadParams) -> Result<Value, ResponseEr
 /// Writes a whole file, creating it when it is not there.
 ///
 /// The write is last-write-wins and replaces everything, so writing the same content twice leaves
-/// the same file (`documents/adr/0001-daemon-fs-provider.md`).
+/// the same file (`documents/adr/0001-daemon-fs-provider.md`). What makes the last write the one
+/// that wins rather than the last few bytes of each is that the content is staged in a file of its
+/// own and renamed over the destination: a write that fails partway leaves what was there before,
+/// and two connections writing the same path at the same time leave one of the two whole instead
+/// of one's opening followed by the other's tail.
 async fn write(shared: &Shared, params: FsWriteParams) -> Result<Value, ResponseError> {
     let path = shared.root.resolve(&params.path).await?;
-    fs::write(&path, &params.content)
-        .await
-        .map_err(|error| io_error(&params.path, error))?;
+    if path == shared.root.path() {
+        // The root is a directory and no file to write, and staging beside it would put the
+        // staged file outside the directory this daemon serves.
+        return Err(ResponseError::new(
+            ErrorCode::Io,
+            format!("{}: is the directory this daemon serves", params.path),
+        ));
+    }
+    let staged = staging_path(&path);
+    let replaced = match fs::write(&staged, &params.content).await {
+        Ok(()) => fs::rename(&staged, &path).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = replaced {
+        // Whatever went wrong, the staged file is not something to leave behind; if it cannot be
+        // taken away either, the error worth reporting is still the first one.
+        let _ = fs::remove_file(&staged).await;
+        return Err(io_error(&params.path, error));
+    }
     serialized(&Ack {})
+}
+
+/// Where the content of a write is staged before it replaces `path`.
+///
+/// Beside the destination, so that the rename that follows stays on the file system the
+/// destination is on, and hidden, so that a listing taken mid-write reads as a directory nothing
+/// is being written in.
+///
+/// Not idempotent, and has to be: two writes of the same path — from two connections here, or from
+/// another daemon over the same directory — must not stage in one file, which is what the process
+/// id and the counter apart from it are for.
+fn staging_path(path: &Path) -> PathBuf {
+    static STAGED: AtomicU64 = AtomicU64::new(0);
+
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let staged = STAGED.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(".{name}.wim-{}-{staged}", std::process::id()))
+}
+
+/// A deadline that ran out, as the error the connection it was on ends with.
+fn timed_out(what: &str) -> WebSocketError {
+    WebSocketError::Io(io::Error::new(io::ErrorKind::TimedOut, what.to_owned()))
 }
 
 /// The result of a method, as the value a response carries.

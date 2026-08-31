@@ -51,15 +51,37 @@ client presents that token in the first message it sends. A connection that open
 else is dropped.
 
 A path a request names is read from --root, and one that reaches outside it — with '..', or
-through a symlink that points out of it — is refused.")]
+through a symlink that points out of it — is refused.
+
+--addr has to name a loopback address: the daemon speaks plain WebSocket, so reaching it from
+another machine goes through an SSH tunnel.")]
 struct Serve {
-    /// Address to listen on.
-    #[arg(long, value_name = "ADDR", default_value = DEFAULT_ADDR)]
+    /// Address to listen on. Loopback only.
+    #[arg(long, value_name = "ADDR", default_value = DEFAULT_ADDR, value_parser = loopback_addr)]
     addr: SocketAddr,
 
     /// Directory to serve.
     #[arg(long, value_name = "DIR", default_value = DEFAULT_ROOT)]
     root: PathBuf,
+}
+
+/// `text` as an address to listen on, which has to be one only this machine can reach.
+///
+/// The daemon carries the token in an `auth` message over a WebSocket it does not encrypt, so an
+/// address another machine can reach would put the token, and then the contents of every file
+/// under --root, on the network in the clear. Phase 2 is loopback and an SSH tunnel for anything
+/// beyond it (`documents/adr/0001-daemon-fs-provider.md`), and an address that is not loopback is
+/// refused here rather than served.
+fn loopback_addr(text: &str) -> Result<SocketAddr, String> {
+    let addr: SocketAddr = text.parse().map_err(|error| format!("{error}"))?;
+    if addr.ip().is_loopback() {
+        Ok(addr)
+    } else {
+        Err(format!(
+            "{addr} is not on loopback: wim serves over a WebSocket it does not encrypt, and is \
+             reached from another machine through an SSH tunnel"
+        ))
+    }
 }
 
 #[tokio::main]
@@ -139,5 +161,26 @@ mod tests {
     #[test]
     fn an_address_that_is_not_one_is_refused_before_anything_is_served() {
         assert!(Cli::try_parse_from([PROGRAM, "serve", "--addr", "127.0.0.1"]).is_err());
+    }
+
+    #[test]
+    fn an_address_other_machines_could_reach_is_refused_before_anything_is_served() {
+        for addr in ["0.0.0.0:7777", "192.168.1.2:7777", "[::]:7777"] {
+            assert!(
+                Cli::try_parse_from([PROGRAM, "serve", "--addr", addr]).is_err(),
+                "{addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn loopback_is_served_whichever_of_its_addresses_is_asked_for() {
+        for addr in ["127.0.0.1:7777", "127.0.0.2:7777", "[::1]:7777"] {
+            assert_eq!(
+                serve(&["--addr", addr]).addr,
+                addr.parse::<SocketAddr>().expect("the address is one"),
+                "{addr}"
+            );
+        }
     }
 }

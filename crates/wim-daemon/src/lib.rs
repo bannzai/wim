@@ -27,6 +27,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::net::TcpListener;
 use wim_protocol::{ErrorCode, ResponseError};
@@ -37,6 +38,15 @@ pub use root::Root;
 /// process that is already on the machine, which is what the token defends against
 /// (`documents/adr/0001-daemon-fs-provider.md`).
 const TOKEN_BYTES: usize = 16;
+
+/// How long the accept loop waits after a failure before it accepts again.
+///
+/// The reasons `accept` fails belong to the connection it would have returned and are gone by the
+/// next call, so this is not a retry the daemon needs; it is there for the failure that repeats —
+/// the process being out of file descriptors, say — where accepting again at once would spin the
+/// loop. A tenth of a second is long enough to keep such a loop from taking a core, and short
+/// enough that a client waiting to connect through it does not notice the wait.
+const ACCEPT_RETRY: Duration = Duration::from_millis(100);
 
 /// A daemon that has taken its port and is ready to serve.
 ///
@@ -88,13 +98,24 @@ impl Daemon {
         &self.shared.token
     }
 
-    /// Serves connections until accepting one fails.
+    /// Serves connections for as long as the caller holds the future.
     ///
     /// Each connection is served by a task of its own, and a connection that goes wrong — a
-    /// handshake that fails, a client that disappears mid-message — takes only itself down.
+    /// handshake that fails, a client that disappears mid-message — takes only itself down. So
+    /// does a connection that fails to arrive at all: what `accept` reports is the state of the
+    /// one connection it would have returned, such as a peer that went away while it sat in the
+    /// listen queue, and a listener that can still serve the clients behind it is not one to stop
+    /// the daemon over. There is nowhere to report it that a client could read, so it is passed
+    /// over the way a connection that goes wrong already is.
     pub async fn serve(self) -> io::Result<()> {
         loop {
-            let (stream, _) = self.listener.accept().await?;
+            let stream = match self.listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    tokio::time::sleep(ACCEPT_RETRY).await;
+                    continue;
+                }
+            };
             let shared = Arc::clone(&self.shared);
             tokio::spawn(async move {
                 let _ = session::serve(stream, shared).await;

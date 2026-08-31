@@ -6,14 +6,15 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use tempfile::TempDir;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
-use tokio::time::{Instant, timeout_at};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use wim_core::Editor;
@@ -44,6 +45,12 @@ const CHANGE_RETRY: Duration = Duration::from_millis(500);
 /// Absence cannot be waited out, so this is a window wide enough that a watch which is still live
 /// would have reported the change made in front of it.
 const NO_CHANGE_WINDOW: Duration = Duration::from_secs(2);
+
+/// How long a test waits for the daemon to let go of a connection that never presents the token.
+///
+/// Wider than the deadline the daemon holds such a connection to, so that a test which fails says
+/// the connection was never let go rather than that it was let go later than the test measured.
+const UNAUTHENTICATED_WINDOW: Duration = Duration::from_secs(30);
 
 /// A daemon serving a directory, with a file outside that directory to reach for.
 struct Fixture {
@@ -99,6 +106,25 @@ impl Fixture {
     /// Writes a file in the root straight to disk, the way a program other than the daemon would.
     fn write(&self, name: &str, content: &str) {
         std::fs::write(self.root.join(name), content).expect("the file should be written");
+    }
+
+    /// What is directly under `path`, named and in order, read straight off disk.
+    ///
+    /// A write stages its content in a file beside the destination, so what a test asks this is
+    /// whether the daemon took that file away again.
+    fn names(&self, path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(path)
+            .expect("the directory should be readable")
+            .map(|entry| {
+                entry
+                    .expect("the entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
     }
 }
 
@@ -315,6 +341,76 @@ async fn a_write_creates_a_file_that_was_not_there() {
 }
 
 #[tokio::test]
+async fn a_write_that_cannot_be_finished_leaves_what_was_there_and_stages_nothing() {
+    // A directory is a destination the content can be staged for and never renamed over, which is
+    // a write failing at the step that would have replaced the file it names.
+    let fixture = Fixture::start(&[("src/main.rs", "fn main() {}\n")]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let error = client
+        .err(Method::FsWrite(FsWriteParams {
+            path: "src".to_owned(),
+            content: "planted\n".to_owned(),
+        }))
+        .await;
+    assert_eq!(error.code, ErrorCode::Io);
+    assert_eq!(fixture.read("src/main.rs"), "fn main() {}\n");
+    assert_eq!(
+        fixture.names(&fixture.root),
+        ["src"],
+        "a write that failed leaves nothing staged behind"
+    );
+}
+
+#[tokio::test]
+async fn a_write_over_the_directory_the_daemon_serves_stages_nothing_outside_it() {
+    let fixture = Fixture::start(&[]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let error = client
+        .err(Method::FsWrite(FsWriteParams {
+            path: ".".to_owned(),
+            content: "planted\n".to_owned(),
+        }))
+        .await;
+    assert_eq!(error.code, ErrorCode::Io);
+    assert_eq!(
+        fixture.names(fixture.directory.path()),
+        ["root", "secret.md"],
+        "nothing is written next to the directory this daemon serves"
+    );
+}
+
+#[tokio::test]
+async fn two_writes_of_one_path_at_the_same_time_leave_one_of_them_whole() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    let mut one = Client::authenticated(&fixture).await;
+    let mut other = Client::authenticated(&fixture).await;
+    // Lengths far apart, so that a file made of one write's opening and the other's tail is a file
+    // that matches neither.
+    let short = "short\n".to_owned();
+    let long = "a line long enough to be told from the other one\n".repeat(256);
+
+    let (_, _): (Ack, Ack) = tokio::join!(
+        one.ok(Method::FsWrite(FsWriteParams {
+            path: "notes.txt".to_owned(),
+            content: short.clone(),
+        })),
+        other.ok(Method::FsWrite(FsWriteParams {
+            path: "notes.txt".to_owned(),
+            content: long.clone(),
+        })),
+    );
+
+    let written = fixture.read("notes.txt");
+    assert!(
+        written == short || written == long,
+        "one of the two writes is what is left, and {} bytes were",
+        written.len()
+    );
+}
+
+#[tokio::test]
 async fn a_listing_names_what_is_directly_under_the_directory() {
     let fixture =
         Fixture::start(&[("notes.txt", "hello\n"), ("src/main.rs", "fn main() {}\n")]).await;
@@ -370,6 +466,57 @@ async fn a_request_that_comes_before_auth_is_refused_and_the_connection_dropped(
         .await;
     assert_eq!(error.code, ErrorCode::Unauthorized);
     client.expect_closed().await;
+}
+
+#[tokio::test]
+async fn a_connection_that_never_finishes_the_handshake_is_let_go() {
+    let fixture = Fixture::start(&[]).await;
+    let mut socket = TcpStream::connect(fixture.addr)
+        .await
+        .expect("the daemon should take the connection");
+
+    let mut byte = [0u8; 1];
+    let read = timeout(UNAUTHENTICATED_WINDOW, socket.read(&mut byte))
+        .await
+        .expect("the daemon should not hold a connection that says nothing");
+    // The daemon drops the socket, which reaches this side as the end of the stream, or as the
+    // connection being reset when the two cross.
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "the connection should be over, and reading it gave {read:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_that_never_presents_the_token_is_let_go() {
+    let fixture = Fixture::start(&[]).await;
+    let mut client = Client::connect(&fixture).await;
+
+    timeout(UNAUTHENTICATED_WINDOW, client.expect_closed())
+        .await
+        .expect("the daemon should not hold a connection that never authenticates");
+}
+
+#[tokio::test]
+async fn a_connection_that_goes_away_before_it_is_served_leaves_the_daemon_serving() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    // A socket closed the moment it is connected is what leaves an aborted connection in the
+    // listen queue, which is one of the ways `accept` fails over a listener that is still good.
+    for _ in 0..8 {
+        drop(
+            TcpStream::connect(fixture.addr)
+                .await
+                .expect("the daemon should take the connection"),
+        );
+    }
+
+    let mut client = Client::authenticated(&fixture).await;
+    let read: FsReadResult = client
+        .ok(Method::FsRead(FsReadParams {
+            path: "notes.txt".to_owned(),
+        }))
+        .await;
+    assert_eq!(read.content, "hello\n");
 }
 
 #[tokio::test]
