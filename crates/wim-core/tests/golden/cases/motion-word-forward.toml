@@ -1,0 +1,5 @@
+name = "w jumps to the start of the next word"
+input = "foo bar baz"
+keys = "w"
+expected = "foo bar baz"
+expected_cursor = [0, 4]

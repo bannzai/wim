@@ -1,0 +1,5 @@
+name = "i types before the cursor"
+input = "bar"
+keys = "iabc<Esc>"
+expected = "abcbar"
+expected_cursor = [0, 2]

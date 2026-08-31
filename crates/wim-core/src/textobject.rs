@@ -209,8 +209,10 @@ fn quoted(buffer: &Buffer, cursor: Position, quote: char, around: bool) -> Optio
         .map(|(col, _)| col)
         .collect();
     let (open, close) = columns
-        .chunks_exact(2)
-        .map(|pair| (pair[0], pair[1]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[open, close]| (open, close))
         .find(|(_, close)| *close >= cursor.col)?;
 
     let (start, mut end) = if around {

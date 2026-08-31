@@ -1,0 +1,11 @@
+name = "G goes to the last line"
+input = '''
+alpha
+bravo
+charlie'''
+keys = "G"
+expected = '''
+alpha
+bravo
+charlie'''
+expected_cursor = [2, 0]

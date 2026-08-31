@@ -1,0 +1,5 @@
+name = "w stops at the run of symbols between two words"
+input = "let x = 1"
+keys = "2w"
+expected = "let x = 1"
+expected_cursor = [0, 6]

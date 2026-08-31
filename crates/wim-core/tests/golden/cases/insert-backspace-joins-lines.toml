@@ -1,0 +1,7 @@
+name = "Backspace at the start of a line joins it onto the one above"
+input = '''
+ab
+cd'''
+keys = "ji<BS>X<Esc>"
+expected = "abXcd"
+expected_cursor = [0, 2]

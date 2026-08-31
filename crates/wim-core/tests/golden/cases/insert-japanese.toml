@@ -1,0 +1,5 @@
+name = "Japanese text is typed one grapheme per column"
+input = "です"
+keys = "iこんにちは<Esc>"
+expected = "こんにちはです"
+expected_cursor = [0, 4]

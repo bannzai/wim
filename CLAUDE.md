@@ -15,4 +15,4 @@ wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown
 ## 設計原則
 
 - `crates/wim-core` は pure crate。ファイル IO・描画・プラットフォーム依存を入れない。wasm32-unknown-unknown でビルドできる状態を維持する
-- 機能を追加したら golden test (`tests/golden/`) を必ず足す
+- 機能を追加したら golden test (`crates/wim-core/tests/golden/`) を必ず足す。ケースの書き方は `crates/wim-core/tests/golden/README.md` を参照
