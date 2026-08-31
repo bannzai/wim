@@ -1,0 +1,10 @@
+name = "repeating a two-line selection from the last line stops at the end of the buffer"
+input = '''
+abc
+def
+ghijkl'''
+keys = "vjdj$."
+expected = '''
+ef
+ghijk'''
+expected_cursor = [1, 4]

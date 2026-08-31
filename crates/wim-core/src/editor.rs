@@ -238,7 +238,9 @@ impl Editor {
                     Position::new(end.line, end.col + 1),
                 ))
             }
-            OperatorTarget::SelectionShape(shape) => Some(shape.range_at(self.cursor)),
+            OperatorTarget::SelectionShape(shape) => {
+                Some(shape.range_at(&self.buffer, self.cursor))
+            }
         }
     }
 
@@ -448,6 +450,7 @@ impl Editor {
         register: Option<char>,
         target: OperatorTarget,
     ) {
+        let before = self.cursor;
         if let OperatorTarget::Motion(motion) = target {
             // A search the operator consumed is still what `;` repeats afterwards. The
             // column that motion reached is not kept: the edit below decides where the
@@ -471,10 +474,12 @@ impl Editor {
         // where the span is, which is what `ci"` between two quotes with nothing in them
         // does.
         let holds_nothing = self.holds_nothing(range);
+        // The selection goes either way: the operator was typed and is over, so the keys
+        // after it are not aimed at a selection that is no longer up.
+        self.visual_anchor = None;
         if holds_nothing && operator != Operator::Change {
             return;
         }
-        self.visual_anchor = None;
         match operator {
             Operator::Yank => {
                 self.registers
@@ -506,15 +511,19 @@ impl Editor {
         }
         // The column `j` and `k` aim for follows the cursor to where the edit left it: after
         // `dw` the text the motion reached is gone, so aiming for its column would drop onto
-        // the next line further right than the cursor stands.
-        self.motion_context.desired_col = self.cursor.col;
+        // the next line further right than the cursor stands. An edit that left the cursor
+        // where it was, such as `yy`, moved nothing for the column to follow and so keeps the
+        // one the vertical motions were already aiming for.
+        if self.cursor != before {
+            self.motion_context.desired_col = self.cursor.col;
+        }
     }
 
     /// Whether `range` covers no text at all, which its two ends alone do not tell: a
     /// charwise span may end one column past the last grapheme of a line, so a span over an
     /// empty line reads as a column wide while holding nothing.
     fn holds_nothing(&self, range: TextRange) -> bool {
-        !range.linewise && self.buffer.text_between(range.start, range.end).is_empty()
+        !range.linewise && self.buffer.char_index(range.start) == self.buffer.char_index(range.end)
     }
 
     fn paste(&mut self, before: bool, count: Option<usize>, register: Option<char>) -> Vec<Effect> {
@@ -1471,6 +1480,21 @@ mod tests {
     }
 
     #[test]
+    fn an_operator_over_a_selection_that_holds_nothing_still_leaves_visual_mode() {
+        for keys in ["vd", "vy"] {
+            let editor = run("\nabc", keys);
+            assert_eq!(editor.text(), "\nabc");
+            assert_eq!(editor.mode(), Mode::Normal, "{keys} is over");
+            assert_eq!(editor.selection(), None, "{keys} took the selection down");
+            assert_eq!(
+                editor.registers().get(None),
+                None,
+                "{keys} over an empty line leaves the registers alone"
+            );
+        }
+    }
+
+    #[test]
     fn undo_walks_back_one_command_at_a_time_and_redo_walks_forward() {
         let editor = run("foo bar", "dwu");
         assert_eq!(editor.text(), "foo bar");
@@ -1524,6 +1548,15 @@ mod tests {
             "XXef",
             "a change over a selection repeats the typing too"
         );
+
+        let editor = run("abc\ndef\nghijkl", "vjdj$.");
+        assert_eq!(
+            editor.text(),
+            "ef\nghijk",
+            "a shape whose second line is past the end of the buffer takes the text from the \
+             cursor to the end of it, not the text in front of the cursor"
+        );
+        assert_eq!(editor.cursor(), Position::new(1, 4));
     }
 
     #[test]
