@@ -6,6 +6,7 @@
 //! this crate either; it only translates the core's types into ones JS can hold.
 
 use serde_json::json;
+use unicode_segmentation::UnicodeSegmentation;
 use wasm_bindgen::prelude::*;
 use wim_core::{Editor, Effect};
 
@@ -146,6 +147,72 @@ fn damaged_lines(before: &[String], after: &[String]) -> (usize, usize) {
     (start.min(end), end)
 }
 
+/// The cells `text` occupies when it is drawn, as a JSON array.
+///
+/// One object per grapheme — `{"text":"あ","width":2}` — in the order the core counts columns
+/// in, so that a host can turn a cursor column into an x position by adding up the widths in
+/// front of it. A host cannot work that out on its own: a column in the core is one grapheme,
+/// which is one cell for `a` and two for `あ`.
+#[wasm_bindgen]
+pub fn display_cells(text: &str) -> String {
+    let cells: Vec<serde_json::Value> = text
+        .graphemes(true)
+        .map(|grapheme| json!({ "text": grapheme, "width": display_width(grapheme) }))
+        .collect();
+    serde_json::Value::Array(cells).to_string()
+}
+
+/// The wide (W) and fullwidth (F) ranges of Unicode's East Asian Width, plus the emoji blocks.
+///
+/// They are listed here rather than pulled from a crate because two columns or one is the
+/// whole of what the renderer asks, and a character outside the ranges falls back to the one
+/// column an unknown character would get anyway.
+const WIDE: [(char, char); 19] = [
+    ('\u{1100}', '\u{115f}'),   // Hangul Jamo initial consonants
+    ('\u{2e80}', '\u{303e}'),   // CJK radicals through CJK symbols and punctuation
+    ('\u{3041}', '\u{33ff}'),   // Kana through enclosed CJK letters and months
+    ('\u{3400}', '\u{4dbf}'),   // CJK unified ideographs extension A
+    ('\u{4e00}', '\u{9fff}'),   // CJK unified ideographs
+    ('\u{a000}', '\u{a4cf}'),   // Yi syllables and radicals
+    ('\u{a960}', '\u{a97f}'),   // Hangul Jamo extended A
+    ('\u{ac00}', '\u{d7a3}'),   // Hangul syllables
+    ('\u{f900}', '\u{faff}'),   // CJK compatibility ideographs
+    ('\u{fe10}', '\u{fe19}'),   // Vertical forms
+    ('\u{fe30}', '\u{fe6f}'),   // CJK compatibility forms and small form variants
+    ('\u{ff00}', '\u{ff60}'),   // Fullwidth ASCII forms
+    ('\u{ffe0}', '\u{ffe6}'),   // Fullwidth signs
+    ('\u{1f1e6}', '\u{1f1ff}'), // Regional indicators, which pair up into flags
+    ('\u{1f300}', '\u{1f64f}'), // Pictographs and emoticons
+    ('\u{1f680}', '\u{1f6ff}'), // Transport and map symbols
+    ('\u{1f900}', '\u{1f9ff}'), // Supplemental symbols and pictographs
+    ('\u{20000}', '\u{2fffd}'), // CJK unified ideographs extensions B onwards
+    ('\u{30000}', '\u{3fffd}'), // CJK unified ideographs extension G onwards
+];
+
+/// Columns `grapheme` takes up on screen, which is 2 for East Asian wide and fullwidth
+/// characters and for emoji, and 1 for everything else.
+///
+/// Only the first character decides: what follows it in a grapheme is a combining mark, a
+/// joiner or a variation selector, none of which take a cell of their own.
+fn display_width(grapheme: &str) -> usize {
+    // A variation selector asking for emoji presentation widens its base character, which is
+    // otherwise a one-column symbol such as `⚠`.
+    if grapheme.contains('\u{fe0f}') {
+        return 2;
+    }
+    let Some(first) = grapheme.chars().next() else {
+        return 1;
+    };
+    if WIDE
+        .iter()
+        .any(|(start, end)| (*start..=*end).contains(&first))
+    {
+        2
+    } else {
+        1
+    }
+}
+
 fn effects_json(effects: &[Effect]) -> String {
     let effects: Vec<serde_json::Value> = effects
         .iter()
@@ -216,6 +283,49 @@ mod tests {
         assert_eq!(editor.line_count(), 3);
         assert_eq!(editor.line(1), "bravo");
         assert_eq!((outcome.damage_start(), outcome.damage_end()), (1, 3));
+    }
+
+    #[test]
+    fn every_ascii_character_is_one_cell() {
+        assert_eq!(
+            display_cells("hi!"),
+            r#"[{"text":"h","width":1},{"text":"i","width":1},{"text":"!","width":1}]"#
+        );
+    }
+
+    #[test]
+    fn cjk_and_emoji_take_two_columns() {
+        assert_eq!(display_width("あ"), 2);
+        assert_eq!(display_width("漢"), 2);
+        assert_eq!(display_width("한"), 2);
+        assert_eq!(display_width("Ａ"), 2);
+        assert_eq!(display_width("　"), 2);
+        assert_eq!(display_width("😀"), 2);
+        // A flag and a family are one grapheme each, however many characters they are made of.
+        assert_eq!(display_width("🇯🇵"), 2);
+        assert_eq!(display_width("👨‍👩‍👦"), 2);
+        // The base character is narrow on its own and wide once asked for emoji presentation.
+        assert_eq!(display_width("⚠"), 1);
+        assert_eq!(display_width("⚠\u{fe0f}"), 2);
+    }
+
+    #[test]
+    fn a_combining_mark_stays_in_the_cell_of_the_character_it_sits_on() {
+        assert_eq!(
+            display_cells("e\u{301}f"),
+            "[{\"text\":\"e\u{301}\",\"width\":1},{\"text\":\"f\",\"width\":1}]"
+        );
+    }
+
+    #[test]
+    fn cells_line_up_with_the_columns_the_core_counts() {
+        let editor = WimEditor::new("あiう");
+        let cells: serde_json::Value =
+            serde_json::from_str(&display_cells(&editor.line(0))).expect("cells should be JSON");
+        // One cell per column, so the cursor column indexes straight into them.
+        assert_eq!(cells.as_array().expect("an array").len(), 3);
+        assert_eq!(cells[1]["text"], "i");
+        assert_eq!(cells[2]["width"], 2);
     }
 
     #[test]
