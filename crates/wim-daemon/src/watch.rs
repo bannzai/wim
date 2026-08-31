@@ -1,7 +1,7 @@
 //! The watches one connection holds, and the changes they push back to it.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc::UnboundedSender;
@@ -59,10 +59,7 @@ impl Watches {
                 let Ok(event) = event else {
                     return;
                 };
-                let Some(kind) = change_kind(&event.kind) else {
-                    return;
-                };
-                for path in event.paths {
+                for (path, kind) in changes(event) {
                     if only.as_ref().is_some_and(|only| only != &path) {
                         continue;
                     }
@@ -99,10 +96,37 @@ impl Watches {
     }
 }
 
+/// What one event reports, path by path, and nothing at all for an event the protocol does not
+/// name.
+///
+/// A rename reaches the backends either as the two halves the protocol has or as one event
+/// carrying the path it left and the path it arrived at, and the pair is split back into those two
+/// halves here: a client told only that both paths were modified would keep the entry that is gone
+/// and never learn of the one that is there.
+fn changes(event: notify::Event) -> Vec<(PathBuf, FsChangeKind)> {
+    use notify::event::{ModifyKind, RenameMode};
+
+    if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = event.kind
+        && let [from, to] = event.paths.as_slice()
+    {
+        return vec![
+            (from.clone(), FsChangeKind::Removed),
+            (to.clone(), FsChangeKind::Created),
+        ];
+    }
+    // A paired rename that does not carry both of its paths says which of them is which no better
+    // than any other event does, so it stays what every `Modify` the protocol has no name for is:
+    // the paths it does carry changed.
+    let Some(kind) = change_kind(&event.kind) else {
+        return Vec::new();
+    };
+    event.paths.into_iter().map(|path| (path, kind)).collect()
+}
+
 /// What the protocol calls the change an event reports, and `None` for an event it does not name.
 ///
-/// A rename is reported as the two halves the protocol has: the path it left is gone, and the path
-/// it arrived at appeared.
+/// The halves of a rename are the two the protocol has: the path it left is gone, and the path it
+/// arrived at appeared.
 fn change_kind(kind: &EventKind) -> Option<FsChangeKind> {
     use notify::event::{ModifyKind, RenameMode};
 
@@ -171,6 +195,37 @@ mod tests {
         ] {
             assert_eq!(change_kind(&kind), None, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn a_rename_that_arrives_as_one_event_is_reported_as_the_two_halves_it_is_made_of() {
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(PathBuf::from("/root/before.txt"))
+            .add_path(PathBuf::from("/root/after.txt"));
+        assert_eq!(
+            changes(event),
+            [
+                (PathBuf::from("/root/before.txt"), FsChangeKind::Removed),
+                (PathBuf::from("/root/after.txt"), FsChangeKind::Created),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_rename_that_does_not_carry_both_of_its_paths_is_reported_as_a_change_to_what_it_names() {
+        let event = notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+            .add_path(PathBuf::from("/root/only.txt"));
+        assert_eq!(
+            changes(event),
+            [(PathBuf::from("/root/only.txt"), FsChangeKind::Modified)]
+        );
+    }
+
+    #[test]
+    fn an_event_the_protocol_does_not_name_reports_nothing_about_the_paths_it_carries() {
+        let event = notify::Event::new(EventKind::Access(AccessKind::Read))
+            .add_path(PathBuf::from("/root/notes.txt"));
+        assert!(changes(event).is_empty());
     }
 
     #[test]
