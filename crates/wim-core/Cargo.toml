@@ -7,3 +7,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ropey.workspace = true
+unicode-segmentation.workspace = true

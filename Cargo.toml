@@ -9,3 +9,5 @@ repository = "https://github.com/bannzai/wim"
 
 [workspace.dependencies]
 wim-core = { path = "crates/wim-core" }
+ropey = "1.6"
+unicode-segmentation = "1.12"
