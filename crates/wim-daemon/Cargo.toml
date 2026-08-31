@@ -1,0 +1,22 @@
+[package]
+name = "wim-daemon"
+version = "0.0.0"
+description = "File system provider the wim daemon serves over WebSocket, speaking wim-protocol messages."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wim-protocol.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+# The editing core is a client's, not the daemon's: the end-to-end tests play the client with it
+# and the daemon itself never links it (documents/adr/0001-daemon-fs-provider.md).
+wim-core.workspace = true
+tempfile.workspace = true
