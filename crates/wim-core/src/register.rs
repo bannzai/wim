@@ -50,16 +50,22 @@ pub struct Registers {
 
 impl Registers {
     /// Fills the unnamed register, and `name` too when the command named one.
+    ///
+    /// `name` must be `a` to `z`: the grammar only produces those, and this debug assertion
+    /// keeps a host from quietly inventing registers the documented model does not have.
     pub fn store(&mut self, name: Option<char>, content: RegisterContent) {
         if let Some(name) = name {
+            debug_assert!(name.is_ascii_lowercase(), "register name must be a-z");
             self.named.insert(name, content.clone());
         }
         self.unnamed = Some(content);
     }
 
     /// Fills `name` and leaves the unnamed register as it was, which is how a recorded macro
-    /// lands in a register without changing what a paste would put back.
+    /// lands in a register without changing what a paste would put back. `name` must be `a`
+    /// to `z`, as it must be for [`Registers::store`].
     pub fn store_named(&mut self, name: char, content: RegisterContent) {
+        debug_assert!(name.is_ascii_lowercase(), "register name must be a-z");
         self.named.insert(name, content);
     }
 
