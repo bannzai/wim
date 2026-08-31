@@ -1,6 +1,8 @@
 //! The wim daemon: a file system provider that clients reach over WebSocket.
 //!
-//! It lists, reads and writes files under one root directory and does nothing else. The editing
+//! It lists, reads, writes and watches files under one root directory and does nothing else. A
+//! watch reports what changed to the connection that asked for it, and lives as long as that
+//! connection does. The editing
 //! buffer lives in the client, which is why this crate does not depend on `wim-core`
 //! (`documents/adr/0001-daemon-fs-provider.md`). The messages it speaks are `wim-protocol`'s,
 //! carried as JSON in text frames.
@@ -19,6 +21,7 @@
 
 mod root;
 mod session;
+mod watch;
 
 use std::io;
 use std::net::SocketAddr;
