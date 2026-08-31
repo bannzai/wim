@@ -119,9 +119,10 @@ function keyNotation(event) {
   // plain Ctrl+Alt, and Alt+F is the browser's own menu shortcut. What does tell them apart
   // is the character itself — AltGr and macOS Option exist to type what a bare key cannot
   // (`@` on a German layout, `€` on Option), so a composed key never reads as a plain ASCII
-  // letter or digit, while a shortcut's key is exactly that.
+  // letter, digit or space, while a shortcut's key is exactly that: Alt+F is a menu, Alt+Space
+  // the window's system menu, and an AltGr space arrives as a distinct character (U+00A0).
   if (event.altKey || event.getModifierState("AltGraph")) {
-    return /^[a-zA-Z0-9]$/.test(event.key) ? null : literal;
+    return /^[a-zA-Z0-9 ]$/.test(event.key) ? null : literal;
   }
   if (event.ctrlKey) {
     return CORE_CTRL_KEYS.has(event.key.toLowerCase())
