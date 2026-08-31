@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/wim-core", "crates/vimacro"]
+members = ["crates/wim-core", "crates/wim-protocol", "crates/vimacro"]
 
 [workspace.package]
 edition = "2024"
@@ -10,11 +10,13 @@ repository = "https://github.com/bannzai/wim"
 [workspace.dependencies]
 # version は crates.io へ publish する時に path 参照の代わりに使われる (cargo package が要求する)
 wim-core = { path = "crates/wim-core", version = "0.0.0" }
+wim-protocol = { path = "crates/wim-protocol", version = "0.0.0" }
 ropey = "1.6"
 unicode-segmentation = "1.12"
 regex = "1.11"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "1.1"
 assert_cmd = "2.0"
 predicates = "3.1"
