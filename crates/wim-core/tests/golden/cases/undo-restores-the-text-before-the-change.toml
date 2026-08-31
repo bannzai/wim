@@ -1,0 +1,5 @@
+name = "u puts back what the last command took"
+input = "foo bar"
+keys = "dwu"
+expected = "foo bar"
+expected_cursor = [0, 0]

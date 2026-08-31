@@ -1,0 +1,7 @@
+name = "J joins the next line on with one space, dropping its indent"
+input = '''
+ab
+   cd'''
+keys = "J"
+expected = "ab cd"
+expected_cursor = [0, 2]

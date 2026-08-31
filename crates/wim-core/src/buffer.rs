@@ -96,9 +96,62 @@ impl Buffer {
         Position::new(line, col)
     }
 
+    /// The text between two positions, `end` exclusive.
+    pub fn text_between(&self, start: Position, end: Position) -> String {
+        let (start, end) = (self.char_index(start), self.char_index(end));
+        self.rope.slice(start.min(end)..start.max(end)).to_string()
+    }
+
+    /// The first position at which this buffer and `other` no longer hold the same text,
+    /// which is where a change between them happened. Buffers that match all the way give
+    /// the end of this one.
+    pub fn first_difference(&self, other: &Buffer) -> Position {
+        let (mine, theirs) = (self.to_string(), other.to_string());
+        let shared = mine
+            .chars()
+            .zip(theirs.chars())
+            .take_while(|(mine, theirs)| mine == theirs)
+            .count();
+        self.clamp(self.position_at_char(shared))
+    }
+
     pub fn insert(&mut self, pos: Position, text: &str) {
         let index = self.char_index(pos);
         self.rope.insert(index, text);
+    }
+
+    /// Inserts a line break at `at`, plus the newline that terminates the buffer when the
+    /// break lands at its very end.
+    ///
+    /// A trailing newline terminates the last line rather than starting an empty one, so an
+    /// empty last line exists only in text that ends with a newline. Opening a line at the
+    /// end of a buffer that had none therefore gives it one.
+    pub fn insert_line_break(&mut self, at: Position) {
+        let at_buffer_end = at.line + 1 == self.line_count()
+            && at.col >= self.line_len(at.line)
+            && !self.has_trailing_newline();
+        self.insert(at, if at_buffer_end { "\n\n" } else { "\n" });
+    }
+
+    /// Inserts whole lines so that the first of them becomes line `line`, which may be one
+    /// past the last line to append them.
+    ///
+    /// `text` is the shape a linewise register holds: every line terminated by a break. A
+    /// buffer that does not end in a break keeps not ending in one, so that appending lines
+    /// to it does not grow a trailing newline it never had.
+    pub fn insert_lines(&mut self, line: usize, text: &str) {
+        if line < self.line_count() {
+            self.insert(Position::new(line, 0), text);
+            return;
+        }
+        let end = self.rope.len_chars();
+        if self.has_trailing_newline() {
+            self.rope.insert(end, text);
+        } else {
+            self.rope.insert(end, "\n");
+            self.rope
+                .insert(end + 1, text.strip_suffix('\n').unwrap_or(text));
+        }
     }
 
     /// Removes the text between the two positions, `end` exclusive, and returns it.
@@ -106,6 +159,28 @@ impl Buffer {
         let (start, end) = (self.char_index(start), self.char_index(end));
         let (start, end) = (start.min(end), start.max(end));
         let removed = self.rope.slice(start..end).to_string();
+        self.rope.remove(start..end);
+        removed
+    }
+
+    /// Removes lines `first` through `last` together with the break that joined them to the
+    /// rest of the buffer, and returns them with a terminating newline.
+    ///
+    /// Taking the last lines out of a buffer that does not end in a break removes the break
+    /// in front of them instead of the one behind, so that the buffer still does not end in
+    /// one.
+    pub fn delete_lines(&mut self, first: usize, last: usize) -> String {
+        let last = last.min(self.line_count() - 1);
+        let content_start = self.rope.line_to_char(first);
+        let content_end = self.char_index(Position::new(last, self.line_len(last)));
+        let mut removed = self.rope.slice(content_start..content_end).to_string();
+        removed.push('\n');
+
+        let (start, end) = if last + 1 < self.line_count() || self.has_trailing_newline() {
+            (content_start, (content_end + 1).min(self.rope.len_chars()))
+        } else {
+            (content_start.saturating_sub(1), content_end)
+        };
         self.rope.remove(start..end);
         removed
     }
@@ -237,5 +312,61 @@ mod tests {
         let mut buffer = Buffer::new("あい\ncd");
         buffer.insert(Position::new(0, 2), "!");
         assert_eq!(buffer.to_string(), "あい!\ncd");
+    }
+
+    #[test]
+    fn deleting_lines_takes_one_of_the_breaks_around_them() {
+        let mut buffer = Buffer::new("ab\ncd\nef");
+        assert_eq!(buffer.delete_lines(0, 0), "ab\n");
+        assert_eq!(buffer.to_string(), "cd\nef");
+
+        let mut buffer = Buffer::new("ab\ncd\nef");
+        assert_eq!(buffer.delete_lines(2, 2), "ef\n");
+        assert_eq!(
+            buffer.to_string(),
+            "ab\ncd",
+            "the break in front goes instead, so the buffer still has no trailing newline"
+        );
+
+        let mut buffer = Buffer::new("ab\ncd\n");
+        assert_eq!(buffer.delete_lines(1, 1), "cd\n");
+        assert_eq!(buffer.to_string(), "ab\n");
+
+        let mut buffer = Buffer::new("ab\ncd\nef");
+        assert_eq!(buffer.delete_lines(0, 9), "ab\ncd\nef\n", "the last clamps");
+        assert_eq!(buffer.to_string(), "");
+    }
+
+    #[test]
+    fn inserting_lines_past_the_last_one_appends_them() {
+        let mut buffer = Buffer::new("ab");
+        buffer.insert_lines(1, "cd\n");
+        assert_eq!(buffer.to_string(), "ab\ncd");
+
+        let mut buffer = Buffer::new("ab\n");
+        buffer.insert_lines(1, "cd\n");
+        assert_eq!(buffer.to_string(), "ab\ncd\n");
+
+        let mut buffer = Buffer::new("ab\ncd");
+        buffer.insert_lines(1, "xy\n");
+        assert_eq!(buffer.to_string(), "ab\nxy\ncd");
+    }
+
+    #[test]
+    fn the_first_difference_is_where_two_buffers_stop_matching() {
+        assert_eq!(
+            Buffer::new("ab\ncd").first_difference(&Buffer::new("ab\nxd")),
+            Position::new(1, 0)
+        );
+        assert_eq!(
+            Buffer::new("ab\ncd").first_difference(&Buffer::new("ab\ncd")),
+            Position::new(1, 1),
+            "buffers that match run out at their end"
+        );
+        assert_eq!(
+            Buffer::new("ab").first_difference(&Buffer::new("ab\ncd")),
+            Position::new(0, 1),
+            "the shorter buffer clamps onto its last grapheme"
+        );
     }
 }

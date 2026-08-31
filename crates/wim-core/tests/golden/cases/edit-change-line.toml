@@ -1,0 +1,11 @@
+name = "cc empties the line and types on it"
+input = '''
+ab
+cd
+ef'''
+keys = "jccxy<Esc>"
+expected = '''
+ab
+xy
+ef'''
+expected_cursor = [1, 1]

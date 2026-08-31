@@ -1,0 +1,5 @@
+name = "r writes one character over the graphemes at the cursor"
+input = "abcdef"
+keys = "3rx"
+expected = "xxxdef"
+expected_cursor = [0, 2]

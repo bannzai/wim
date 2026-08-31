@@ -1,0 +1,5 @@
+name = "x at the line end leaves the cursor on the new last grapheme"
+input = "abc"
+keys = "$x"
+expected = "ab"
+expected_cursor = [0, 1]

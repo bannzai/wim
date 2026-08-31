@@ -1,0 +1,8 @@
+name = "a count on J is how many lines take part"
+input = '''
+a
+b
+c'''
+keys = "3J"
+expected = "a b c"
+expected_cursor = [0, 3]

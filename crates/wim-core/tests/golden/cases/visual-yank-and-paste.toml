@@ -1,0 +1,5 @@
+name = "a selection can be yanked and put back somewhere else"
+input = "foo bar"
+keys = "vey$p"
+expected = "foo barfoo"
+expected_cursor = [0, 9]

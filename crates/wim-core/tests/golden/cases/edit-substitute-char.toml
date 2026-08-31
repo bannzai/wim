@@ -1,0 +1,5 @@
+name = "s replaces the grapheme at the cursor"
+input = "abc"
+keys = "sX<Esc>"
+expected = "Xbc"
+expected_cursor = [0, 0]

@@ -1,0 +1,5 @@
+name = "a count on . replaces the one the change was typed with"
+input = "a b c d e"
+keys = "dw2."
+expected = "d e"
+expected_cursor = [0, 0]

@@ -1,0 +1,9 @@
+name = "ddP puts back what dd took"
+input = '''
+ab
+cd'''
+keys = "ddP"
+expected = '''
+ab
+cd'''
+expected_cursor = [0, 0]

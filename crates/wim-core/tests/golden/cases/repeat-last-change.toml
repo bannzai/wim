@@ -1,0 +1,5 @@
+name = ". does the last change again"
+input = "foo bar baz"
+keys = "dw."
+expected = "baz"
+expected_cursor = [0, 0]

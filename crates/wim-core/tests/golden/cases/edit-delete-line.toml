@@ -1,0 +1,10 @@
+name = "dd takes the whole line and leaves the cursor on the first non-blank below"
+input = '''
+ab
+  cd
+ef'''
+keys = "jdd"
+expected = '''
+ab
+ef'''
+expected_cursor = [1, 0]

@@ -1,0 +1,5 @@
+name = ". types the insert session of the last change again"
+input = "foo bar"
+keys = "ciwX<Esc>w."
+expected = "X X"
+expected_cursor = [0, 2]

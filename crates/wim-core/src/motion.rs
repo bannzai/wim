@@ -188,7 +188,9 @@ fn desired(buffer: &Buffer, line: usize, desired_col: usize) -> Position {
     Position::new(line, desired_col.min(buffer.last_col(line)))
 }
 
-fn first_non_blank(buffer: &Buffer, line: usize) -> Position {
+/// The column `^` reaches on `line`: its first grapheme that is not a blank, or its last
+/// column when the whole line is blank.
+pub(crate) fn first_non_blank(buffer: &Buffer, line: usize) -> Position {
     let text = buffer.line_text(line);
     let col = text
         .graphemes(true)

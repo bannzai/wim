@@ -1,0 +1,9 @@
+name = "S replaces the whole line"
+input = '''
+ab
+cd'''
+keys = "SX<Esc>"
+expected = '''
+X
+cd'''
+expected_cursor = [0, 0]

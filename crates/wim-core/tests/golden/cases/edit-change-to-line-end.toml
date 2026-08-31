@@ -1,0 +1,5 @@
+name = "C replaces the rest of the line"
+input = "foo bar"
+keys = "wCxy<Esc>"
+expected = "foo xy"
+expected_cursor = [0, 5]

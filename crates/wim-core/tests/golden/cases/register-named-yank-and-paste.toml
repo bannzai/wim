@@ -1,0 +1,9 @@
+name = "a named register keeps its text while a delete fills the unnamed one"
+input = '''
+ab
+cd'''
+keys = '"ayyjdd"ap'
+expected = '''
+ab
+ab'''
+expected_cursor = [1, 0]

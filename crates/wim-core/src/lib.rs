@@ -8,6 +8,7 @@
 
 pub mod buffer;
 pub mod command;
+pub mod edit;
 pub mod editor;
 pub mod effect;
 pub mod grammar;
@@ -15,18 +16,22 @@ pub mod key;
 pub mod mode;
 pub mod motion;
 pub mod position;
+pub mod register;
 pub mod textobject;
+pub mod undo;
 
 pub use buffer::Buffer;
 pub use command::{Command, InsertAnchor, Operator, OperatorTarget};
-pub use editor::{Editor, ResolvedOperation};
+pub use editor::Editor;
 pub use effect::Effect;
 pub use grammar::Grammar;
 pub use key::{KeyCode, KeyEvent, KeyParseError, format_keys, parse_keys};
 pub use mode::Mode;
 pub use motion::{Find, Motion, MotionContext, MotionKind, MotionOutcome, MotionTarget};
 pub use position::Position;
+pub use register::{RegisterContent, Registers};
 pub use textobject::{TextObject, TextObjectKind, TextRange};
+pub use undo::History;
 
 /// Version of this crate, exposed so that frontends can report the core they were built against.
 pub fn version() -> &'static str {

@@ -9,7 +9,7 @@ use crate::textobject::TextObject;
 /// Keys that are typed but not resolved yet.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Stage {
-    /// Nothing beyond counts and an operator.
+    /// Nothing beyond counts, a register and an operator.
     #[default]
     Start,
     /// `f`, `F`, `t` or `T` is waiting for the character to search for.
@@ -18,16 +18,21 @@ enum Stage {
     AwaitGoto,
     /// `i` or `a` is waiting for the key that names the object.
     AwaitTextObject { around: bool },
+    /// `r` is waiting for the character to write.
+    AwaitReplacement,
+    /// `"` is waiting for the letter that names the register.
+    AwaitRegisterName,
 }
 
 /// Collects keys until they spell out a [`Command`].
 ///
-/// A command is `[count] operator [count] (motion | text object)`, with the two counts
-/// multiplied together the way Vim multiplies them, so `2d3w` reaches as far as `d6w`. Keys
-/// that cannot continue what has been typed are rejected and drop the pending keys with
-/// them, and `<Esc>` drops them on request.
+/// A command is `["register] [count] operator [count] (motion | text object)`, with the two
+/// counts multiplied together the way Vim multiplies them, so `2d3w` reaches as far as
+/// `d6w`. Keys that cannot continue what has been typed are rejected and drop the pending
+/// keys with them, and `<Esc>` drops them on request.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Grammar {
+    register: Option<char>,
     count_before_operator: Option<usize>,
     operator: Option<Operator>,
     count_after_operator: Option<usize>,
@@ -39,17 +44,36 @@ impl Grammar {
     /// command is still being typed.
     ///
     /// `mode` only tells Visual apart from Normal: a selection takes counts and motions, and
-    /// leaves operators and text objects to the operator issue.
+    /// reads an operator as acting on the selection itself rather than waiting for a range.
     pub fn feed(&mut self, key: KeyEvent, mode: Mode) -> Command {
         if key.code == KeyCode::Esc {
             self.reset();
             return Command::Cancel;
+        }
+        if self.stage == Stage::Start && self.operator.is_none() && key == KeyEvent::ctrl('r') {
+            let count = self.count();
+            return self.emit(Command::Redo { count });
         }
         let Some(character) = key.as_char() else {
             self.reset();
             return Command::Rejected(key);
         };
         match self.stage {
+            Stage::AwaitReplacement => {
+                let count = self.count();
+                return self.emit(Command::ReplaceChar {
+                    replacement: character,
+                    count,
+                });
+            }
+            Stage::AwaitRegisterName => {
+                self.stage = Stage::Start;
+                if !character.is_ascii_lowercase() {
+                    return self.reject(key);
+                }
+                self.register = Some(character);
+                return Command::Pending;
+            }
             Stage::AwaitFindTarget { backward, till } => {
                 self.stage = Stage::Start;
                 return self.finish_motion(Motion::Find(Find {
@@ -104,6 +128,10 @@ impl Grammar {
                 self.stage = Stage::AwaitGoto;
                 return Command::Pending;
             }
+            '"' => {
+                self.stage = Stage::AwaitRegisterName;
+                return Command::Pending;
+            }
             _ => {}
         }
 
@@ -113,7 +141,23 @@ impl Grammar {
             return self.emit(Command::ToggleVisual);
         }
         if mode == Mode::Visual {
-            return self.reject(key);
+            // Over a selection an operator has its range already, so it resolves at once.
+            // `x` is `d` and `s` is `c`, as they are in Normal mode.
+            let operator = match character {
+                'x' => Some(Operator::Delete),
+                's' => Some(Operator::Change),
+                _ => Operator::from_key(character),
+            };
+            let Some(operator) = operator else {
+                return self.reject(key);
+            };
+            let register = self.register;
+            return self.emit(Command::Operate {
+                operator,
+                count: None,
+                register,
+                target: OperatorTarget::Selection,
+            });
         }
 
         if let Some(operator) = Operator::from_key(character) {
@@ -143,6 +187,25 @@ impl Grammar {
         }
 
         let count = self.count();
+        let register = self.register;
+        // The keys that stand for an operator over a range their own key implies.
+        let shorthand = match character {
+            'x' => Some((Operator::Delete, OperatorTarget::Motion(Motion::Right))),
+            'X' => Some((Operator::Delete, OperatorTarget::Motion(Motion::Left))),
+            'D' => Some((Operator::Delete, OperatorTarget::Motion(Motion::LineEnd))),
+            'C' => Some((Operator::Change, OperatorTarget::Motion(Motion::LineEnd))),
+            's' => Some((Operator::Change, OperatorTarget::Motion(Motion::Right))),
+            'S' => Some((Operator::Change, OperatorTarget::Lines)),
+            _ => None,
+        };
+        if let Some((operator, target)) = shorthand {
+            return self.emit(Command::Operate {
+                operator,
+                count,
+                register,
+                target,
+            });
+        }
         match character {
             'i' => self.emit(Command::EnterInsert(InsertAnchor::BeforeCursor)),
             'I' => self.emit(Command::EnterInsert(InsertAnchor::FirstNonBlank)),
@@ -150,14 +213,24 @@ impl Grammar {
             'A' => self.emit(Command::EnterInsert(InsertAnchor::LineEnd)),
             'o' => self.emit(Command::EnterInsert(InsertAnchor::LineBelow)),
             'O' => self.emit(Command::EnterInsert(InsertAnchor::LineAbove)),
-            'x' => self.emit(Command::DeleteChar {
+            'p' => self.emit(Command::Paste {
                 before: false,
                 count,
+                register,
             }),
-            'X' => self.emit(Command::DeleteChar {
+            'P' => self.emit(Command::Paste {
                 before: true,
                 count,
+                register,
             }),
+            'r' => {
+                self.stage = Stage::AwaitReplacement;
+                Command::Pending
+            }
+            'J' => self.emit(Command::JoinLines { count }),
+            '~' => self.emit(Command::ToggleCase { count }),
+            'u' => self.emit(Command::Undo { count }),
+            '.' => self.emit(Command::RepeatEdit { count }),
             _ => self.reject(key),
         }
     }
@@ -169,7 +242,8 @@ impl Grammar {
 
     /// Whether any key has been typed that has not resolved into a command yet.
     pub fn is_pending(&self) -> bool {
-        self.count_before_operator.is_some()
+        self.register.is_some()
+            || self.count_before_operator.is_some()
             || self.operator.is_some()
             || self.stage != Stage::Start
     }
@@ -219,6 +293,7 @@ impl Grammar {
         let command = Command::Operate {
             operator: self.operator.expect("an operator is waiting for a target"),
             count: self.count(),
+            register: self.register,
             target,
         };
         self.emit(command)
@@ -293,6 +368,16 @@ mod tests {
         }
     }
 
+    /// An operator command with no register named, which most cases are.
+    fn operate(operator: Operator, count: Option<usize>, target: OperatorTarget) -> Command {
+        Command::Operate {
+            operator,
+            count,
+            register: None,
+            target,
+        }
+    }
+
     const WORD: Motion = Motion::WordForward { big: false };
 
     #[test]
@@ -336,19 +421,19 @@ mod tests {
         );
         assert_eq!(
             resolve("d0"),
-            Command::Operate {
-                operator: Operator::Delete,
-                count: None,
-                target: OperatorTarget::Motion(Motion::LineStart),
-            }
+            operate(
+                Operator::Delete,
+                None,
+                OperatorTarget::Motion(Motion::LineStart)
+            )
         );
         assert_eq!(
             resolve("d10l"),
-            Command::Operate {
-                operator: Operator::Delete,
-                count: Some(10),
-                target: OperatorTarget::Motion(Motion::Right),
-            }
+            operate(
+                Operator::Delete,
+                Some(10),
+                OperatorTarget::Motion(Motion::Right)
+            )
         );
     }
 
@@ -362,11 +447,7 @@ mod tests {
         assert!(grammar.is_operator_pending());
         assert_eq!(
             grammar.feed(KeyEvent::char('w'), Mode::Normal),
-            Command::Operate {
-                operator: Operator::Delete,
-                count: None,
-                target: OperatorTarget::Motion(WORD),
-            }
+            operate(Operator::Delete, None, OperatorTarget::Motion(WORD))
         );
         assert!(!grammar.is_operator_pending());
     }
@@ -376,11 +457,7 @@ mod tests {
         assert_pending_until_last("2d3w");
         assert_eq!(
             resolve("2d3w"),
-            Command::Operate {
-                operator: Operator::Delete,
-                count: Some(6),
-                target: OperatorTarget::Motion(WORD),
-            }
+            operate(Operator::Delete, Some(6), OperatorTarget::Motion(WORD))
         );
     }
 
@@ -395,11 +472,7 @@ mod tests {
         ] {
             assert_eq!(
                 resolve(keys),
-                Command::Operate {
-                    operator,
-                    count,
-                    target: OperatorTarget::Lines,
-                },
+                operate(operator, count, OperatorTarget::Lines),
                 "{keys}"
             );
         }
@@ -410,39 +483,39 @@ mod tests {
         assert_pending_until_last("d2aw");
         assert_eq!(
             resolve("d2aw"),
-            Command::Operate {
-                operator: Operator::Delete,
-                count: Some(2),
-                target: OperatorTarget::TextObject(TextObject {
+            operate(
+                Operator::Delete,
+                Some(2),
+                OperatorTarget::TextObject(TextObject {
                     kind: TextObjectKind::Word { big: false },
                     around: true,
-                }),
-            }
+                })
+            )
         );
         assert_eq!(
             resolve("ci\""),
-            Command::Operate {
-                operator: Operator::Change,
-                count: None,
-                target: OperatorTarget::TextObject(TextObject {
+            operate(
+                Operator::Change,
+                None,
+                OperatorTarget::TextObject(TextObject {
                     kind: TextObjectKind::Quote('"'),
                     around: false,
-                }),
-            }
+                })
+            )
         );
         assert_eq!(
             resolve("yiB"),
-            Command::Operate {
-                operator: Operator::Yank,
-                count: None,
-                target: OperatorTarget::TextObject(TextObject {
+            operate(
+                Operator::Yank,
+                None,
+                OperatorTarget::TextObject(TextObject {
                     kind: TextObjectKind::Block {
                         open: '{',
                         close: '}'
                     },
                     around: false,
-                }),
-            }
+                })
+            )
         );
     }
 
@@ -462,15 +535,15 @@ mod tests {
         );
         assert_eq!(
             resolve("d2Tあ"),
-            Command::Operate {
-                operator: Operator::Delete,
-                count: Some(2),
-                target: OperatorTarget::Motion(Motion::Find(Find {
+            operate(
+                Operator::Delete,
+                Some(2),
+                OperatorTarget::Motion(Motion::Find(Find {
                     target: 'あ',
                     backward: true,
                     till: true
-                })),
-            }
+                }))
+            )
         );
     }
 
@@ -486,11 +559,11 @@ mod tests {
         );
         assert_eq!(
             resolve("d2gg"),
-            Command::Operate {
-                operator: Operator::Delete,
-                count: Some(2),
-                target: OperatorTarget::Motion(Motion::FirstLine),
-            }
+            operate(
+                Operator::Delete,
+                Some(2),
+                OperatorTarget::Motion(Motion::FirstLine)
+            )
         );
         assert_eq!(resolve("gx"), Command::Rejected(KeyEvent::char('x')));
     }
@@ -505,25 +578,115 @@ mod tests {
         assert_eq!(resolve("o"), Command::EnterInsert(InsertAnchor::LineBelow));
         assert_eq!(resolve("v"), Command::ToggleVisual);
         assert_eq!(
-            resolve("3x"),
-            Command::DeleteChar {
+            resolve("3p"),
+            Command::Paste {
                 before: false,
-                count: Some(3)
+                count: Some(3),
+                register: None
+            }
+        );
+        assert_eq!(resolve("2J"), Command::JoinLines { count: Some(2) });
+        assert_eq!(resolve("~"), Command::ToggleCase { count: None });
+        assert_eq!(resolve("2u"), Command::Undo { count: Some(2) });
+        assert_eq!(resolve("<C-r>"), Command::Redo { count: None });
+        assert_eq!(resolve("3."), Command::RepeatEdit { count: Some(3) });
+    }
+
+    #[test]
+    fn the_shorthand_keys_are_an_operator_over_a_range_of_their_own() {
+        for (keys, operator, count, target) in [
+            (
+                "3x",
+                Operator::Delete,
+                Some(3),
+                OperatorTarget::Motion(Motion::Right),
+            ),
+            (
+                "X",
+                Operator::Delete,
+                None,
+                OperatorTarget::Motion(Motion::Left),
+            ),
+            (
+                "D",
+                Operator::Delete,
+                None,
+                OperatorTarget::Motion(Motion::LineEnd),
+            ),
+            (
+                "2C",
+                Operator::Change,
+                Some(2),
+                OperatorTarget::Motion(Motion::LineEnd),
+            ),
+            (
+                "s",
+                Operator::Change,
+                None,
+                OperatorTarget::Motion(Motion::Right),
+            ),
+            ("S", Operator::Change, None, OperatorTarget::Lines),
+        ] {
+            assert_eq!(resolve(keys), operate(operator, count, target), "{keys}");
+        }
+    }
+
+    #[test]
+    fn replace_waits_for_the_character_to_write() {
+        assert_pending_until_last("2rx");
+        assert_eq!(
+            resolve("2rx"),
+            Command::ReplaceChar {
+                replacement: 'x',
+                count: Some(2)
             }
         );
         assert_eq!(
-            resolve("X"),
-            Command::DeleteChar {
-                before: true,
-                count: None
+            resolve("r<C-a>"),
+            Command::Rejected(KeyEvent::ctrl('a')),
+            "a key that carries no character writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_register_name_rides_along_to_the_command_that_uses_it() {
+        assert_pending_until_last("\"ayy");
+        assert_eq!(
+            resolve("\"ayy"),
+            Command::Operate {
+                operator: Operator::Yank,
+                count: None,
+                register: Some('a'),
+                target: OperatorTarget::Lines,
             }
+        );
+        assert_eq!(
+            resolve("\"b2p"),
+            Command::Paste {
+                before: false,
+                count: Some(2),
+                register: Some('b')
+            }
+        );
+        assert_eq!(
+            resolve("\"aw"),
+            Command::Move {
+                motion: WORD,
+                count: None
+            },
+            "a motion ignores the register it was given"
+        );
+        assert_eq!(
+            resolve("\"A"),
+            Command::Rejected(KeyEvent::char('A')),
+            "the appending form of a register name is not part of the model"
         );
     }
 
     #[test]
     fn escape_drops_the_keys_typed_so_far() {
         let mut grammar = Grammar::default();
-        for key in parse_keys("2d3").expect("key string should parse") {
+        for key in parse_keys("\"a2d3").expect("key string should parse") {
             grammar.feed(key, Mode::Normal);
         }
         assert!(grammar.is_pending());
@@ -555,14 +718,14 @@ mod tests {
         assert_eq!(resolve("dy"), Command::Rejected(KeyEvent::char('y')));
         assert_eq!(resolve("dix"), Command::Rejected(KeyEvent::char('x')));
         assert_eq!(
-            resolve("<C-r>"),
+            resolve("d<C-r>"),
             Command::Rejected(KeyEvent::ctrl('r')),
-            "control keys are not part of the grammar yet"
+            "an operator is waiting for a range, which no control key names"
         );
     }
 
     #[test]
-    fn a_selection_takes_motions_but_leaves_operators_to_the_operator_issue() {
+    fn a_selection_reads_an_operator_as_acting_on_itself() {
         assert_eq!(
             resolve_in("2w", Mode::Visual),
             Command::Move {
@@ -571,9 +734,22 @@ mod tests {
             }
         );
         assert_eq!(resolve_in("v", Mode::Visual), Command::ToggleVisual);
+        for (keys, operator) in [
+            ("d", Operator::Delete),
+            ("x", Operator::Delete),
+            ("c", Operator::Change),
+            ("s", Operator::Change),
+            ("y", Operator::Yank),
+        ] {
+            assert_eq!(
+                resolve_in(keys, Mode::Visual),
+                operate(operator, None, OperatorTarget::Selection),
+                "{keys}"
+            );
+        }
         assert_eq!(
-            resolve_in("d", Mode::Visual),
-            Command::Rejected(KeyEvent::char('d'))
+            resolve_in("z", Mode::Visual),
+            Command::Rejected(KeyEvent::char('z'))
         );
     }
 }
