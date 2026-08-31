@@ -1,0 +1,11 @@
+[workspace]
+resolver = "3"
+members = ["crates/wim-core", "crates/vimacro"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/bannzai/wim"
+
+[workspace.dependencies]
+wim-core = { path = "crates/wim-core" }

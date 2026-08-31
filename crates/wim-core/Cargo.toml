@@ -1,0 +1,9 @@
+[package]
+name = "wim-core"
+version = "0.0.0"
+description = "Modal editing core of wim. Pure crate with no IO, buildable for native and wasm32."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
