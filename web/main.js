@@ -371,6 +371,10 @@ function handleKeys(keys) {
   // carried out before the next one is typed, the way `wim edit` types the same keys natively
   // (`crates/wim/src/edit.rs`).
   let typing = keys;
+  // One batch is one report, however many pieces the core hands it back in: the effects and the
+  // damage a test or the status line reads belong to everything that was submitted, not to the
+  // piece that happened to come last.
+  const batch = { damageStart: 0, damageEnd: 0, effects: [] };
   while (typing !== "") {
     const outcome = editor.handle_keys(typing);
     typing = outcome.pending_keys;
@@ -383,12 +387,25 @@ function handleKeys(keys) {
     draw();
     // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
     syncImeFocus();
-    if (carryOut(lastOutcome.effects)) {
-      // A line nothing has a command for ends the batch where it stands, the way a refused `:`
-      // line ends a native run rather than letting the keys behind it edit the buffer.
+    const refused = carryOut(lastOutcome.effects);
+    if (lastOutcome.damageEnd > lastOutcome.damageStart) {
+      // An empty range says nothing about where the piece's damage was, so it merges as nothing.
+      if (batch.damageEnd > batch.damageStart) {
+        batch.damageStart = Math.min(batch.damageStart, lastOutcome.damageStart);
+        batch.damageEnd = Math.max(batch.damageEnd, lastOutcome.damageEnd);
+      } else {
+        batch.damageStart = lastOutcome.damageStart;
+        batch.damageEnd = lastOutcome.damageEnd;
+      }
+    }
+    batch.effects.push(...lastOutcome.effects);
+    if (refused) {
+      // A line nothing ran ends the batch where it stands, the way a refused `:` line ends a
+      // native run rather than letting the keys behind it edit the buffer.
       break;
     }
   }
+  lastOutcome = batch;
   return lastOutcome;
 }
 
@@ -429,12 +446,17 @@ function carryOut(effects) {
   let refusal = null;
   for (const effect of effects) {
     if (effect.kind === "unknown-ex-command") {
+      // A name nothing has a command for is refused from here; a command that refused the line
+      // has said so on the plugin's status line already. Either way the line did not do what it
+      // asked, and that is what ends the batch it came from, the way it ends a native run.
+      let failure = null;
       try {
-        // A line typed at the demo answers for itself: what the command it named refused is on
-        // the plugin's status line, and only a name no plugin published is refused from here.
-        runUnknownEx(effect);
+        failure = runUnknownEx(effect);
       } catch (error) {
-        refusal = { kind: "error", message: error.message };
+        failure = error.message;
+      }
+      if (failure !== null) {
+        refusal = { kind: "error", message: failure };
         continue;
       }
       // A plugin may rewrite the whole buffer, and what it did is not in the core's damage. Nor
@@ -463,7 +485,8 @@ function carryOut(effects) {
   lastOutcome = outcome;
   if (refusal !== null) {
     // The status line is drawn from what the batch of keys left behind, and this is the rest of
-    // what the line the core handed over came to: it named a command, and nothing here has one.
+    // what the line the core handed over came to: a name nothing has a command for, or a command
+    // that refused the line.
     lastOutcome.effects.push(refusal);
     draw();
   }
