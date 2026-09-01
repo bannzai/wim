@@ -40,6 +40,11 @@ describes. A handler of kind 'plugin' names a plugin, and --plugin says which .w
 was loaded from; a plugin is only given the events it subscribes to, so one that subscribes to
 none of what it is bound to is refused before a key is typed.
 
+The commands a loaded plugin publishes are Ex commands of the run: ':upcase' runs the command of
+that name over the buffer and applies what it answers with, and what follows the name reaches it
+as arguments split on blanks. A name no loaded plugin published is refused the way any other
+command wim does not have is.
+
 The plugins run with nothing of this machine reachable from inside them: no files, no network, no
 clock.")]
 pub struct Edit {
@@ -135,17 +140,53 @@ fn run(edit: Edit) -> Result<Ran, String> {
     })
 }
 
-/// The plugins named on the command line, loaded and keyed by the name a handler names them by.
-fn load_plugins(declared: &[String]) -> Result<BTreeMap<String, Host>, String> {
-    let mut plugins = BTreeMap::new();
+/// The loaded plugins, and which of them publishes each command name.
+struct Plugins {
+    /// The plugins, keyed by the name a handler names them by.
+    hosts: BTreeMap<String, Host>,
+    /// The plugin that publishes each command name, read once when the plugins were loaded.
+    commands: BTreeMap<String, String>,
+}
+
+impl Plugins {
+    /// The loaded plugin that publishes `name`, `None` when none does.
+    fn command_host(&mut self, name: &str) -> Option<&mut Host> {
+        let plugin = self.commands.get(name)?;
+        self.hosts.get_mut(plugin)
+    }
+}
+
+/// The plugins named on the command line, loaded and asked for the commands they publish.
+///
+/// `list-commands` is the ABI's registration step, so it is called once here rather than on every
+/// `:` line the core hands over (`wit/plugin.wit`): a plugin that publishes its commands only
+/// while it is starting up keeps them for the whole run, and one that traps later takes none of
+/// the other plugins' commands down with it. The plugins are asked in the order they are keyed,
+/// and a name two of them publish stays with the first that published it, which is a collision
+/// this host does not arbitrate.
+fn load_plugins(declared: &[String]) -> Result<Plugins, String> {
+    let mut hosts = BTreeMap::new();
     for declaration in declared {
         let (name, path) = declaration.split_once('=').ok_or_else(|| {
             format!("--plugin is written as NAME=WASM, and {declaration} names no wasm")
         })?;
         let host = Host::from_file(path).map_err(|error| format!("cannot load {path}: {error}"))?;
-        plugins.insert(name.to_owned(), host);
+        hosts.insert(name.to_owned(), host);
     }
-    Ok(plugins)
+    let mut commands = BTreeMap::new();
+    for (plugin, host) in &mut hosts {
+        // A plugin that cannot say what it publishes is one that did not load: the run would
+        // otherwise get as far as the `:` line naming a command of its before finding out.
+        let published = host
+            .list_commands()
+            .map_err(|error| format!("{plugin} cannot be asked for its commands: {error}"))?;
+        for command in published {
+            commands
+                .entry(command.name)
+                .or_insert_with(|| plugin.clone());
+        }
+    }
+    Ok(Plugins { hosts, commands })
 }
 
 /// One run: the buffer, the file it came from, and everything the autocmds may reach.
@@ -156,7 +197,7 @@ struct Session {
     /// back when it is written.
     crlf: bool,
     config: Config,
-    plugins: BTreeMap<String, Host>,
+    plugins: Plugins,
     /// What the autocmds that ran did, in the order they ran.
     reports: Vec<String>,
     /// What ended the run, for the caller to report.
@@ -171,7 +212,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(path: &Path, text: &str, config: Config, plugins: BTreeMap<String, Host>) -> Self {
+    fn new(path: &Path, text: &str, config: Config, plugins: Plugins) -> Self {
         Self {
             editor: Editor::new(&text.replace("\r\n", "\n")),
             path: path.to_owned(),
@@ -195,6 +236,7 @@ impl Session {
             };
             let host = self
                 .plugins
+                .hosts
                 .get_mut(plugin)
                 .ok_or_else(|| format!("no plugin was loaded as {plugin}: pass --plugin"))?;
             let subscriptions = host.subscriptions().map_err(|error| {
@@ -239,9 +281,62 @@ impl Session {
                     self.dispatch(&Event::BufferWritePost);
                 }
                 Effect::QuitRequested { .. } => return Ok(Stop::Quit),
+                // A `:` line the core has no command for is one of the loaded plugins' to run.
+                // It ends the run the way a key the core refuses does when no plugin published
+                // the name or the one that did refuses the arguments: the line asked for
+                // something that did not happen.
+                Effect::UnknownExCommand { name, args } => match self.run_command(&name, &args) {
+                    Ok(done) => self.reports.push(format!(":{name} {done}")),
+                    Err(complaint) => {
+                        self.complaint = Some(complaint);
+                        return Ok(Stop::Failed);
+                    }
+                },
             }
         }
         Ok(Stop::Ran)
+    }
+
+    /// Runs the command a `:` line named at the plugin that published it, and applies the edit it
+    /// answers with.
+    ///
+    /// This is what makes the commands of a `--plugin` Ex commands of the run: the core hands
+    /// over the name and what was typed after it, and the arguments are split on blanks here
+    /// because that is what the ABI passes (`wit/plugin.wit`). A name no plugin published is
+    /// refused in the words the core refuses a command of its own with, so a typo reads the same
+    /// whether or not any plugin was loaded.
+    fn run_command(&mut self, name: &str, args: &str) -> Result<String, String> {
+        let buffer = self.snapshot();
+        let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
+        let Some(host) = self.plugins.command_host(name) else {
+            return Err(format!("not an editor command: {name}"));
+        };
+        let edit = host
+            .run(name, &args, &buffer)
+            .map_err(|error| format!(":{name} failed: {error}"))?;
+        let (text, message) = plugin::apply(&buffer.text, edit)?;
+        if text != buffer.text {
+            // One change of the editor the run is holding, the way a handler's edit is applied,
+            // so that `u` walks back over what the command wrote.
+            self.editor.replace_text(&text);
+            return Ok("rewrote the buffer".to_owned());
+        }
+        Ok(message.unwrap_or_else(|| "left the buffer alone".to_owned()))
+    }
+
+    /// The buffer as a plugin is given it (`wit/plugin.wit`).
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            name: self.path.display().to_string(),
+            text: self.editor.text(),
+            cursor: Position {
+                line: self.editor.cursor().line as u32,
+                // The ABI counts a column in Unicode scalars while the core counts it in
+                // graphemes, and a cluster made of several scalars is where the two part
+                // company.
+                column: self.editor.buffer().scalar_col(self.editor.cursor()) as u32,
+            },
+        }
     }
 
     /// Runs every handler bound to `event`.
@@ -323,19 +418,10 @@ impl Session {
     /// The buffer crosses by value and the answer comes back by value, which is the whole of
     /// what the ABI lets a plugin touch: the edit is applied here, by the host.
     fn call(&mut self, event: &Event, plugin: &str) -> Result<String, String> {
-        let buffer = Snapshot {
-            name: self.path.display().to_string(),
-            text: self.editor.text(),
-            cursor: Position {
-                line: self.editor.cursor().line as u32,
-                // The ABI counts a column in Unicode scalars while the core counts it in
-                // graphemes, and a cluster made of several scalars is where the two part
-                // company (`wit/plugin.wit`).
-                column: self.editor.buffer().scalar_col(self.editor.cursor()) as u32,
-            },
-        };
+        let buffer = self.snapshot();
         let host = self
             .plugins
+            .hosts
             .get_mut(plugin)
             .ok_or_else(|| format!("no plugin was loaded as {plugin}"))?;
         let edit = host
@@ -399,7 +485,15 @@ mod tests {
     use super::*;
 
     fn session(text: &str, config: Config) -> Session {
-        Session::new(Path::new("notes.txt"), text, config, BTreeMap::new())
+        Session::new(
+            Path::new("notes.txt"),
+            text,
+            config,
+            Plugins {
+                hosts: BTreeMap::new(),
+                commands: BTreeMap::new(),
+            },
+        )
     }
 
     fn config(autocmds: &str) -> Config {
@@ -497,6 +591,22 @@ mod tests {
         assert!(session.failed);
         assert_eq!(session.reports.len(), 1, "{:?}", session.reports);
         assert!(session.reports[0].starts_with("text-changed keys failed:"));
+    }
+
+    #[test]
+    fn an_ex_line_no_plugin_published_a_command_for_is_refused_in_the_cores_words() {
+        // The core hands the name over instead of refusing it now that a plugin may have a
+        // command under it, so the wording a typo gets is this host's to keep.
+        let mut session = session("ab\n", Config::default());
+        let keys = parse_keys(":nope<CR>").expect("keys should parse");
+        assert_eq!(
+            session.feed(&keys).expect("the run should go through"),
+            Stop::Failed
+        );
+        assert_eq!(
+            session.complaint.as_deref(),
+            Some("not an editor command: nope")
+        );
     }
 
     #[test]

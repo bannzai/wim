@@ -55,13 +55,18 @@ function native(command, args) {
       { error: run.stderr.trim().replace(`wim: :${command} failed: `, "") };
 }
 
-/** Types `:command args` into the demo and answers with the state it left behind. */
-async function browser(page, command, args) {
+/** Opens the demo over `BUFFER`, with the plugins loaded and their commands registered. */
+async function open(page) {
   await page.goto("/index.html");
   await page.waitForFunction(() => window.wimDemo !== undefined);
   await page.evaluate(() => window.wimDemo.plugins());
   // No name, so the plugin is given the same snapshot the subcommand hands it.
   await page.evaluate((text) => window.wimDemo.load(text), BUFFER);
+}
+
+/** Types `:command args` into the demo and answers with the state it left behind. */
+async function browser(page, command, args) {
+  await open(page);
   await page.evaluate((typed) => window.wimDemo.sendKeys(typed), [command, ...args].join(" "));
   await page.evaluate(() => window.wimDemo.sendKeys("<CR>"));
   return page.evaluate(() => window.wimDemo.state());
@@ -89,18 +94,37 @@ test("the buffer :upcase hands back is the one the native host writes", async ({
   expect(state.plugin.status).toBe(":upcase: バッファを書き換えました");
 });
 
-test("a name no plugin published is still the core's to refuse", async ({ page }) => {
+test("a name no plugin published is refused in the core's words", async ({ page }) => {
   // The host routes a line to a plugin only when the plugin registered that name, so the one
   // error hello-wim can raise on its own — `hello-wim has no command named ...`, which the native
-  // subcommand reaches by naming a command directly — is unreachable through an Ex line, and what
-  // answers instead is the core.
+  // subcommand reaches by naming a command directly — is unreachable through an Ex line.
   const state = await browser(page, ":nope", []);
-  // The events the core reports about itself are not part of what it refused; they are checked
-  // on their own (`e2e/autocmd.spec.js`).
+  // The core hands the name over rather than refusing it, because a plugin may well have a
+  // command under it; the refusal that follows is this host's, having found none. The events the
+  // core reports about itself are checked on their own (`e2e/autocmd.spec.js`).
   expect(state.effects.filter((effect) => effect.kind !== "event")).toEqual([
+    { kind: "unknown-ex-command", name: "nope", args: "" },
     { kind: "error", message: "not an editor command: nope" },
   ]);
   expect(state.text).toBe(BUFFER);
+});
+
+test("a macro replays the plugin command it recorded", async ({ page }) => {
+  await open(page);
+  // Recording types the line at the core, which runs it as it is typed; `u` takes that edit back
+  // so that what the replay does is the only thing left to see.
+  await page.evaluate(() => window.wimDemo.sendKeys("qa:upcase<CR>q"));
+  expect(await page.evaluate(() => window.wimDemo.state().text)).toBe("HELLO\nWIM\n");
+  await page.evaluate(() => window.wimDemo.sendKeys("u"));
+  expect(await page.evaluate(() => window.wimDemo.state().text)).toBe(BUFFER);
+
+  // The keys of a replay are typed inside the core and never reach this host, so the command runs
+  // because the core asked for it through an effect rather than because the host read the line —
+  // which is what a host taking the `<CR>` for itself could not do.
+  await page.evaluate(() => window.wimDemo.sendKeys("@a"));
+  const state = await page.evaluate(() => window.wimDemo.state());
+  expect(state.text).toBe("HELLO\nWIM\n");
+  expect(state.plugin.status).toBe(":upcase: バッファを書き換えました");
 });
 
 test("an argument :upcase does not take is refused in the same words", async ({ page }) => {

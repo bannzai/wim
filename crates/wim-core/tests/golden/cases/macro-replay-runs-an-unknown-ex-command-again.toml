@@ -1,0 +1,5 @@
+name = "a recorded : line the host runs is asked for again on replay"
+input = "alpha"
+keys = "qa:upcase<CR>q@a"
+expected = "alpha"
+expected_effects = ['unknown-ex-command upcase ""', 'unknown-ex-command upcase ""']

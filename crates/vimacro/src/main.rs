@@ -516,6 +516,14 @@ fn feed(editor: &mut Editor, keys: &[KeyEvent], applied: &mut Applied) -> Stop {
                     }
                 }
                 Effect::QuitRequested { .. } => return Stop::Quit,
+                // A name the core has no command for is a plugin's command in a host that loads
+                // plugins. This one loads none — what it runs is the keys it was given and
+                // nothing else — so there is nowhere for the name to be found, and it is refused
+                // in the words the core refuses a command of its own with.
+                Effect::UnknownExCommand { name, .. } => {
+                    applied.report(format!("not an editor command: {name}"));
+                    return Stop::Failed;
+                }
                 // An event is something to hang an autocmd on, and autocmds are declared in a
                 // config a host reads. This one takes no config: what it runs is the keys it
                 // was given and nothing else, so that a macro applied to a file does the same

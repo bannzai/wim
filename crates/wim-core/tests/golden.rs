@@ -31,6 +31,10 @@ struct Case {
     /// autocmds to. Not checked when absent.
     #[serde(default)]
     expected_events: Option<Vec<String>>,
+    /// What the keys should ask of the host, in order and in the wording [`request_lines`]
+    /// writes. Not checked when absent.
+    #[serde(default)]
+    expected_effects: Option<Vec<String>>,
 }
 
 #[test]
@@ -131,14 +135,42 @@ fn check(file: &Path) -> Option<String> {
             );
         }
     }
+    if let Some(wanted) = &case.expected_effects {
+        let actual = request_lines(&effects);
+        if &actual != wanted {
+            let _ = writeln!(
+                problems,
+                "  effects:\n    - expected {wanted:?}\n    + actual   {actual:?}"
+            );
+        }
+    }
     if problems.is_empty() {
         return None;
     }
     Some(report(&name, &case, &problems))
 }
 
-/// The names of the events among `effects`, in the order they were reported in. The requests an
-/// effect makes of a host — writing a file, quitting — are not part of a case (`README.md`).
+/// What `effects` asks of the host, one line each: the kind of request, then what it carries,
+/// with the text quoted so that a blank at either end of it shows. The events are left out — a
+/// case checks those by name through `expected_events`.
+fn request_lines(effects: &[Effect]) -> Vec<String> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Event(_) => None,
+            Effect::Error(message) => Some(format!("error {message:?}")),
+            Effect::SaveRequested { path } => {
+                Some(format!("save {:?}", path.as_deref().unwrap_or("")))
+            }
+            Effect::QuitRequested { force } => Some(format!("quit {force}")),
+            Effect::UnknownExCommand { name, args } => {
+                Some(format!("unknown-ex-command {name} {args:?}"))
+            }
+        })
+        .collect()
+}
+
+/// The names of the events among `effects`, in the order they were reported in.
 fn event_names(effects: &[Effect]) -> Vec<String> {
     effects
         .iter()

@@ -1,0 +1,5 @@
+name = "a name the core has no command for goes to the host with its arguments"
+input = "alpha"
+keys = ":upcase all<CR>"
+expected = "alpha"
+expected_effects = ['unknown-ex-command upcase "all"']

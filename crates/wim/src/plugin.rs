@@ -2,8 +2,9 @@
 //!
 //! This is the smallest thing that exercises a plugin end to end — load a component, hand it a
 //! buffer, apply what it hands back — and it exists to check that a plugin does what it says
-//! outside an editor. Registering a plugin's commands as Ex commands is Phase 4-4's, and until
-//! then the buffer is whatever comes in on standard input rather than a file wim is editing.
+//! outside an editor: the buffer is whatever comes in on standard input rather than a file wim is
+//! editing, and the command is named on the command line rather than typed as a `:` line. Typing
+//! one at an editor reaches the same call through `wim edit` (`crates/wim/src/edit.rs`).
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;

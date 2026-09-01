@@ -23,6 +23,24 @@ pub enum Effect {
         /// `:q!` rather than `:q`: quit whatever the state of the buffer.
         force: bool,
     },
+    /// A `:` line whose name is no command of the core's, with whatever was typed after it.
+    ///
+    /// The core does not know every command there is: a plugin publishes commands of its own and
+    /// the host is the one holding them (`wit/plugin.wit`), so a name the core has none of is
+    /// handed over rather than refused. The host runs the command it finds under `name`, and
+    /// refuses a name none of its plugins published itself, in the words the core used to refuse
+    /// it in: `not an editor command: {name}`.
+    ///
+    /// Going through an effect rather than through the host reading the command line is what
+    /// keeps a plugin's command working where the host cannot see the keys: `@a` replaying a
+    /// recorded `:upcase<CR>` runs it, and so does one inside `:norm`.
+    UnknownExCommand {
+        /// The name as it was typed, without its `:`.
+        name: String,
+        /// The rest of the line, less the one blank that separates it from the name. It crosses
+        /// as it was typed: what an argument is belongs to the command the host resolves.
+        args: String,
+    },
     /// Something happened that a host's autocmds may be bound to. The core only reports it;
     /// which handler runs is the host's (`documents/CONFIG.md`).
     Event(Event),

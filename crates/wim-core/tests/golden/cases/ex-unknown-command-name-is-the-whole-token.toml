@@ -1,0 +1,5 @@
+name = "a host's command may be named with more than letters, and the whole token goes over"
+input = "alpha"
+keys = ":sort-lines --numeric<CR>"
+expected = "alpha"
+expected_effects = ['unknown-ex-command sort-lines "--numeric"']

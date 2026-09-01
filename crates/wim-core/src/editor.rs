@@ -863,6 +863,14 @@ impl Editor {
     ///
     /// A `:q` also ends the run, where it is written rather than after the keys behind it:
     /// putting the editor down is the last thing the keys that asked for it get to do.
+    ///
+    /// A `:` line the host's to run ends it as well. The host cannot carry out an
+    /// [`Effect::UnknownExCommand`] until the key that asked for it has returned, so a key
+    /// behind it would reach the buffer the command was not run over yet and land in front of
+    /// what the command does: a command of the host's is the last thing fed keys get to do, and
+    /// what the register holds after it is left for a later `@` to type. It counts as not
+    /// having run for the same reason a refusal does — whether the host has the command is not
+    /// known here — so a `@a` with a count plays no further round.
     pub(crate) fn feed_keys(&mut self, keys: &[KeyEvent], effects: &mut Vec<Effect>) -> bool {
         self.fed_keys += 1;
         let mut ran = true;
@@ -880,7 +888,7 @@ impl Editor {
             let mut produced = self.handle_key(*key);
             ran = !produced
                 .iter()
-                .any(|effect| matches!(effect, Effect::Error(_)));
+                .any(|effect| matches!(effect, Effect::Error(_) | Effect::UnknownExCommand { .. }));
             let quit = produced
                 .iter()
                 .any(|effect| matches!(effect, Effect::QuitRequested { .. }));
@@ -2132,7 +2140,19 @@ mod tests {
             Vec::new(),
             "an empty line does nothing"
         );
-        assert_eq!(error("ab", ":nope<CR>"), "not an editor command: nope");
+        assert_eq!(
+            effects("ab", ":nope x<CR>"),
+            vec![Effect::UnknownExCommand {
+                name: "nope".to_owned(),
+                args: "x".to_owned()
+            }],
+            "a name the core has no command for is the host's to run or to refuse"
+        );
+        assert_eq!(
+            error("ab", ":%nope<CR>"),
+            ":nope takes no range",
+            "a host's command runs over the buffer it is handed"
+        );
     }
 
     #[test]

@@ -1,0 +1,9 @@
+name = "a range on a host's command is refused, because nothing carries the lines over"
+input = '''
+alpha
+bravo'''
+keys = ":%upcase<CR>"
+expected = '''
+alpha
+bravo'''
+expected_effects = ['error ":upcase takes no range"']

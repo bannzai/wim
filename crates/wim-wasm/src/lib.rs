@@ -50,9 +50,10 @@ impl KeyOutcome {
     ///
     /// One object per effect: `{"kind":"error","message":…}` for a key the mode had no
     /// meaning for, `{"kind":"save","path":…}` for `:w`, `{"kind":"quit","force":…}` for
-    /// `:q`, and `{"kind":"event","name":…,"payload":…}` for something a host's autocmds may
-    /// be bound to. JSON rather than an exported type per effect keeps the boundary to the one
-    /// value a batch of keys returns.
+    /// `:q`, `{"kind":"unknown-ex-command","name":…,"args":…}` for a `:` line naming a command
+    /// the core has none of, and `{"kind":"event","name":…,"payload":…}` for something a host's
+    /// autocmds may be bound to. JSON rather than an exported type per effect keeps the boundary
+    /// to the one value a batch of keys returns.
     #[wasm_bindgen(getter)]
     pub fn effects(&self) -> String {
         self.effects.clone()
@@ -250,6 +251,11 @@ fn effects_json(effects: &[Effect]) -> String {
             Effect::Error(message) => json!({ "kind": "error", "message": message }),
             Effect::SaveRequested { path } => json!({ "kind": "save", "path": path }),
             Effect::QuitRequested { force } => json!({ "kind": "quit", "force": force }),
+            // The arguments cross as the one string the core kept them in: what an argument is
+            // belongs to the plugin command the host resolves the name to.
+            Effect::UnknownExCommand { name, args } => {
+                json!({ "kind": "unknown-ex-command", "name": name, "args": args })
+            }
             // The payload crosses as the string the plugin ABI carries it in rather than as an
             // object of its own, so that a host passes on what the core wrote instead of
             // building the same JSON again (`wit/plugin.wit`).
@@ -450,6 +456,22 @@ mod tests {
             serde_json::json!({ "kind": "save", "path": "note" })
         );
         assert_eq!(editor.command_line(), None);
+    }
+
+    #[test]
+    fn a_command_the_core_has_no_name_for_crosses_with_what_was_typed_after_it() {
+        let mut editor = WimEditor::new("alpha");
+        editor
+            .handle_keys(":upcase all")
+            .expect("keys should parse");
+        let outcome = editor.handle_keys("<CR>").expect("keys should parse");
+        let effects: serde_json::Value =
+            serde_json::from_str(&outcome.effects()).expect("effects should be JSON");
+        assert_eq!(
+            effects[0],
+            serde_json::json!({ "kind": "unknown-ex-command", "name": "upcase", "args": "all" }),
+            "the host is the one holding the plugin commands, so the line goes over unsplit"
+        );
     }
 
     #[test]

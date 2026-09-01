@@ -1,0 +1,12 @@
+name = ":norm over a range asks the host for a command once, because the walk cannot go on past it"
+input = '''
+a
+b
+c'''
+keys = ":%norm :upcase<lt>CR>A!<lt>Esc><CR>"
+expected = '''
+a
+b
+c'''
+expected_cursor = [0, 0]
+expected_effects = ['unknown-ex-command upcase ""']
