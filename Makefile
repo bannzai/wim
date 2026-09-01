@@ -11,8 +11,10 @@ build-web:
 web: build-web
 	node web/serve.mjs
 
-# Runs the browser E2E against a freshly built demo.
+# Runs the browser E2E against a freshly built demo. The daemon is built too: the file-access
+# run starts it over a directory of its own and drives the demo against it.
 e2e: build-web
+	cargo build -p wim
 	cd web && npm ci && npx playwright install --with-deps chromium && npx playwright test
 
 # wasm-bindgen-cli has to match the crate version, which Cargo.lock holds.

@@ -7,6 +7,7 @@
 // that moves every row — a scroll, a resize, a new buffer — redraws the lot.
 
 import init, { WimEditor, display_cells } from "./pkg/wim_wasm.js";
+import { connect } from "./daemon.js";
 
 const INITIAL_TEXT = `wim is a Vim-grammar editor, not a Vim clone.
 The core is one pure Rust crate, compiled to Wasm for this page.
@@ -55,6 +56,18 @@ const imeInput = document.querySelector("#ime");
 /** The overlay the composition is drawn in, over the canvas at the cursor. */
 const preedit = document.querySelector("#preedit");
 
+/** The form that opens a file through a daemon, and the fields naming which one. */
+const daemonForm = document.querySelector("#daemon-form");
+const daemonAddress = document.querySelector("#daemon-address");
+const daemonToken = document.querySelector("#daemon-token");
+const daemonPath = document.querySelector("#daemon-path");
+
+/** The button that opens a file the browser itself hands over and writes back. */
+const localButton = document.querySelector("#local-open");
+
+/** Where opening and saving report what they did, under the file controls. */
+const fileStatus = document.querySelector("#file-status");
+
 /**
  * The modes whose keys are text rather than commands, which are the ones text may be composed
  * into. In every other mode a key is a command the moment it is pressed.
@@ -86,6 +99,16 @@ let view = {
 
 /** What an IME is composing right now, `""` when nothing is being composed. */
 let composition = "";
+
+/**
+ * Where the buffer came from and where `:w` writes it back, `null` until a file is opened.
+ *
+ * `{ kind: "daemon", client, path }` for a file a daemon serves, `{ kind: "local", handle, name }`
+ * for one the browser opened through the File System Access API. The two differ in more than
+ * where the bytes go: a daemon takes any path under the directory it serves, while the browser
+ * hands over the one file that was picked and no way of naming another.
+ */
+let openFile = null;
 
 /** Glyphs baked at the current scale and cell size, keyed by the colour they were baked in. */
 const atlas = {
@@ -174,7 +197,144 @@ function handleKeys(keys) {
   draw();
   // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
   syncImeFocus();
+  for (const effect of lastOutcome.effects) {
+    if (effect.kind === "save") {
+      // Writing reaches a daemon or the file system, and neither answers within the key that
+      // asked for it: what it did turns up in the report line once it is done.
+      void save(effect.path ?? null);
+    }
+  }
   return lastOutcome;
+}
+
+/** Shows `message` under the demo, which is where opening and saving report. */
+function report(message) {
+  fileStatus.textContent = message;
+}
+
+/** Replaces the buffer with `text`, which is what opening a file leaves behind. */
+function loadText(text) {
+  editor = new WimEditor(text);
+  lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
+  view = { ...view, scrollTop: 0 };
+  draw({ full: true });
+  // A fresh editor is in Normal mode, whatever the one it replaced was in.
+  syncImeFocus();
+}
+
+/** Lets go of whatever is open, closing the connection a daemon's file was read over. */
+function closeOpenFile() {
+  if (openFile !== null && openFile.kind === "daemon") {
+    openFile.client.close();
+  }
+  openFile = null;
+}
+
+/**
+ * Takes the browser's focus off the file controls, so that the keys typed after a file is opened
+ * are the editor's.
+ *
+ * Keys typed into the file controls belong to them, which is what the key handler leaves them to.
+ * A button that kept the focus after it was clicked would go on taking keys from there — and the
+ * Enter of a `:w` would press it again rather than save.
+ */
+function focusEditor() {
+  if (document.activeElement instanceof HTMLElement) {
+    document.activeElement.blur();
+  }
+  syncImeFocus();
+}
+
+/**
+ * Writes the buffer out for `:w`, to `path` when the command named one and to the file that was
+ * opened when it did not, which is what `null` says.
+ *
+ * The core does no file IO of its own — it hands back the request and the host carries it out
+ * (`documents/adr/0001-daemon-fs-provider.md`) — so this is where the demo's two ways of reaching
+ * a file are told apart.
+ */
+async function save(path) {
+  if (openFile === null) {
+    report("開いているファイルがありません");
+    return;
+  }
+  const text = editor.text();
+  try {
+    if (openFile.kind === "daemon") {
+      const destination = path ?? openFile.path;
+      await openFile.client.write(destination, text);
+      report(`${destination} を保存しました`);
+      return;
+    }
+    if (path !== null) {
+      // The browser hands over the one file the picker was pointed at and no way to name
+      // another, so writing somewhere else would take a picker of its own — which opens on a
+      // click rather than on a command.
+      report("ローカルファイルでは :w にパスを指定できません");
+      return;
+    }
+    const writable = await openFile.handle.createWritable();
+    await writable.write(text);
+    await writable.close();
+    report(`${openFile.name} を保存しました`);
+  } catch (error) {
+    report(`保存できません: ${error.message}`);
+  }
+}
+
+/** Opens the file the daemon form names, and keeps the connection for the saves that follow. */
+async function openFromDaemon() {
+  const path = daemonPath.value.trim();
+  report("デーモンに接続しています");
+  let client;
+  try {
+    client = await connect(daemonAddress.value, daemonToken.value);
+  } catch (error) {
+    report(`接続できません: ${error.message}`);
+    return;
+  }
+  let content;
+  try {
+    content = await client.read(path);
+  } catch (error) {
+    client.close();
+    report(`開けません: ${error.message}`);
+    return;
+  }
+  // The connection the file was read over is the one it is written back over, so a save reaches
+  // the daemon that has the file rather than whatever the form says by then.
+  closeOpenFile();
+  openFile = { kind: "daemon", client, path };
+  loadText(content);
+  focusEditor();
+  report(`${path} を開きました`);
+}
+
+/** Opens a file the browser hands over, which is the one it will let the page write back. */
+async function openLocalFile() {
+  let handle;
+  try {
+    [handle] = await window.showOpenFilePicker();
+  } catch (error) {
+    // Closing the picker without choosing anything throws, and is not a failure to report: it
+    // is someone deciding not to open a file after all.
+    if (error.name !== "AbortError") {
+      report(`開けません: ${error.message}`);
+    }
+    return;
+  }
+  let text;
+  try {
+    text = await (await handle.getFile()).text();
+  } catch (error) {
+    report(`開けません: ${error.message}`);
+    return;
+  }
+  closeOpenFile();
+  openFile = { kind: "local", handle, name: handle.name };
+  loadText(text);
+  focusEditor();
+  report(`${handle.name} を開きました`);
 }
 
 /** The cells `text` draws as: one per column the core counts, carrying its display width. */
@@ -504,6 +664,11 @@ draw({ full: true });
 // Listening only once the editor exists is what keeps a key typed during the wasm fetch from
 // reaching a demo that has nothing to type into.
 window.addEventListener("keydown", (event) => {
+  // The file controls are text fields and buttons of the page's own, and a key typed into one
+  // of them is theirs: taking it here would leave an address that cannot be typed.
+  if (event.target instanceof Element && event.target.closest("#file-access") !== null) {
+    return;
+  }
   const keys = keyNotation(event);
   if (keys === null) {
     return;
@@ -559,18 +724,26 @@ canvas.addEventListener("pointerdown", (event) => {
   syncImeFocus();
 });
 
+daemonForm.addEventListener("submit", (event) => {
+  // The form is the page's own: it opens a file over a WebSocket rather than navigating.
+  event.preventDefault();
+  void openFromDaemon();
+});
+
+localButton.addEventListener("click", () => void openLocalFile());
+
+if (window.showOpenFilePicker === undefined) {
+  // Firefox and Safari have no File System Access API, and without it a page can read a file
+  // through an `<input type="file">` but has nowhere to write it back to.
+  localButton.disabled = true;
+  localButton.title = "このブラウザは File System Access API に対応していません";
+}
+
 // The handle the E2E run drives and inspects the demo through.
 window.wimDemo = {
   sendKeys: handleKeys,
   /** Replaces the buffer, which is how the E2E run gets one taller than the viewport. */
-  load: (text) => {
-    editor = new WimEditor(text);
-    lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
-    view = { ...view, scrollTop: 0 };
-    draw({ full: true });
-    // A fresh editor is in Normal mode, whatever the one it replaced was in.
-    syncImeFocus();
-  },
+  load: loadText,
   /** Redraws every row, which the E2E run compares the damage-driven redraw against. */
   redraw: () => draw({ full: true }),
   state: () => ({

@@ -87,6 +87,72 @@
       a {
         color: inherit;
       }
+
+      /* The two ways a file reaches the buffer: a daemon that serves a directory, and the
+         browser's own picker. */
+      #file-access {
+        margin-top: 16px;
+      }
+
+      #file-access form {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        align-items: center;
+      }
+
+      /* A label and the field it names, kept together so that a row which wraps does not leave
+         the label on one line and the box it belongs to on the next. */
+      #file-access .field {
+        display: flex;
+        flex: 1 1 220px;
+        gap: 6px;
+        align-items: center;
+      }
+
+      #file-access label {
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      #file-access input {
+        flex: 1 1 auto;
+        /* Without this a flex item refuses to shrink under the width of its own placeholder,
+           which would push the row past the page on a narrow screen. */
+        min-width: 0;
+        padding: 6px 8px;
+        border: 1px solid #2b303b;
+        border-radius: 4px;
+        background: #171a21;
+        color: var(--foreground);
+        font: inherit;
+        font-size: 13px;
+      }
+
+      #file-access button {
+        padding: 6px 12px;
+        border: 1px solid #2b303b;
+        border-radius: 4px;
+        background: #1c2129;
+        color: var(--foreground);
+        font: inherit;
+        font-size: 13px;
+        cursor: pointer;
+      }
+
+      #file-access button:disabled {
+        color: var(--muted);
+        cursor: not-allowed;
+      }
+
+      #local-open {
+        margin-top: 8px;
+      }
+
+      #file-status {
+        margin-bottom: 0;
+      }
     </style>
   </head>
   <body>
@@ -95,7 +161,7 @@
       <p>
         キーボードで直接編集できます。<code>i</code> / <code>a</code> / <code>o</code> で Insert、<code>Esc</code> で Normal、
         <code>hjkl</code> <code>w</code> <code>b</code> <code>0</code> <code>$</code> <code>gg</code> <code>G</code> で移動、<code>x</code> <code>dd</code>
-        <code>yy</code> <code>p</code> <code>u</code> と <code>:</code> の Ex コマンドが使えます。Insert と Ex コマンドラインでは日本語入力 (IME) が使えます。ファイル操作はまだ入っていません。
+        <code>yy</code> <code>p</code> <code>u</code> と <code>:</code> の Ex コマンドが使えます。Insert と Ex コマンドラインでは日本語入力 (IME) が使えます。
       </p>
       <div class="screen">
         <canvas id="screen" width="880" height="440"></canvas>
@@ -109,6 +175,48 @@
         ></textarea>
         <div id="preedit" hidden></div>
       </div>
+      <section id="file-access">
+        <p>
+          ファイルを開くと <code>:w</code> で書き戻せます。デーモン経由で開くには手元で
+          <code>wim serve --root .</code> を実行し、表示されたアドレスとトークンを入れてください。ローカルファイルは
+          File System Access API 対応ブラウザ (Chrome / Edge) でのみ開けます。
+        </p>
+        <form id="daemon-form">
+          <div class="field">
+            <label for="daemon-address">アドレス</label>
+            <input
+              id="daemon-address"
+              placeholder="127.0.0.1:8765"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </div>
+          <div class="field">
+            <label for="daemon-token">トークン</label>
+            <input
+              id="daemon-token"
+              placeholder="起動時に表示される値"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </div>
+          <div class="field">
+            <label for="daemon-path">パス</label>
+            <input
+              id="daemon-path"
+              placeholder="notes.md"
+              autocomplete="off"
+              spellcheck="false"
+              required
+            />
+          </div>
+          <button type="submit">デーモンから開く</button>
+        </form>
+        <button type="button" id="local-open">ローカルファイルを開く</button>
+        <p id="file-status" role="status">ファイルを開いていません</p>
+      </section>
       <p><a href="https://github.com/bannzai/wim">github.com/bannzai/wim</a></p>
     </main>
     <script type="module" src="./main.js"></script>
