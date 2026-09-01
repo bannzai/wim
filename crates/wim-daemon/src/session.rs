@@ -319,6 +319,11 @@ async fn read(shared: &Shared, params: FsReadParams) -> Result<Value, ResponseEr
 /// own and renamed over the destination: a write that fails partway leaves what was there before,
 /// and two connections writing the same path at the same time leave one of the two whole instead
 /// of one's opening followed by the other's tail.
+///
+/// Staging asks for a directory one may create in, which a file one may write to does not: a file
+/// that is `0644` in a directory that is `0555` was writable before writes were staged. That one
+/// case falls back to writing in place
+/// (`documents/adr/0002-daemon-watch-and-staging-robustness.md`).
 async fn write(shared: &Shared, params: FsWriteParams) -> Result<Value, ResponseError> {
     let path = shared.root.resolve(&params.path).await?;
     if path == shared.root.path() {
@@ -329,9 +334,27 @@ async fn write(shared: &Shared, params: FsWriteParams) -> Result<Value, Response
             format!("{}: is the directory this daemon serves", params.path),
         ));
     }
-    let staged = stage(&path, &params.content)
-        .await
-        .map_err(|error| io_error(&params.path, error))?;
+    let staged = match stage(&path, &params.content).await {
+        Ok(staged) => staged,
+        Err(error) => {
+            // A directory that cannot be staged in is the only reason to write any other way, and
+            // a file that is already there the only thing to write that way: a destination that is
+            // not there has to be created, which is the permission the directory just refused.
+            if error.kind() != io::ErrorKind::PermissionDenied
+                || !fs::metadata(&path)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_file())
+            {
+                return Err(io_error(&params.path, error));
+            }
+            // The error worth reporting is the one the write actually ended on, so the fallback's
+            // own failure replaces the refusal that led here.
+            write_in_place(&path, &params.content)
+                .await
+                .map_err(|error| io_error(&params.path, error))?;
+            return serialized(&Ack {});
+        }
+    };
     if let Err(error) = fs::rename(&staged, &path).await {
         // The staged file is not something to leave behind; if it cannot be taken away either, the
         // error worth reporting is still the first one.
@@ -339,6 +362,27 @@ async fn write(shared: &Shared, params: FsWriteParams) -> Result<Value, Response
         return Err(io_error(&params.path, error));
     }
     serialized(&Ack {})
+}
+
+/// Writes `content` into the file that is already at `path`, over the bytes that are there.
+///
+/// What a write costs when it cannot be staged: the file is truncated and filled where the client
+/// reads it, so a write that fails partway — or a machine that goes down mid-write — leaves the
+/// file neither the old content nor the new one. That is the trade the fallback makes to keep a
+/// writable file in an unwritable directory writable at all, and it is what Vim's `backupcopy=yes`
+/// trades for the same reason.
+///
+/// No `create`: the directory this runs for is one that refused a new file, so a destination that
+/// is not there is not something this could make: the fallback replaces content and never widens
+/// what a write may bring into existence.
+async fn write_in_place(path: &Path, content: &str) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await?;
+    file.write_all(content.as_bytes()).await?;
+    file.flush().await
 }
 
 /// Stages `content` in a file of its own beside `destination`, and names that file for the rename
@@ -528,6 +572,80 @@ mod tests {
             std::fs::read_to_string(&path).expect("the file should be readable"),
             "#!/bin/sh\necho hello\n"
         );
+    }
+
+    /// Whether `directory` refuses a file being created in it, which is what a write falls back
+    /// out of staging for.
+    ///
+    /// A process running as root is refused nothing whatever the mode says, so a test of the
+    /// fallback has nothing to test where this is false and says so rather than failing.
+    #[cfg(unix)]
+    fn refuses_creation(directory: &Path) -> bool {
+        let probe = directory.join("probe");
+        match std::fs::File::create(&probe) {
+            Ok(_) => {
+                std::fs::remove_file(&probe).expect("the probe should be removed");
+                false
+            }
+            Err(error) => error.kind() == io::ErrorKind::PermissionDenied,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_over_a_file_in_a_directory_that_refuses_staging_goes_through_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_directory, shared) = shared().await;
+        let path = shared.root.path().join("notes.md");
+        std::fs::write(&path, "before\n").expect("the file should be written");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("the permissions of the file should be set");
+        std::fs::set_permissions(shared.root.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("the permissions of the directory should be set");
+
+        let outcome = if refuses_creation(shared.root.path()) {
+            Some(write_through(&shared, "notes.md", "after\n").await)
+        } else {
+            None
+        };
+
+        // Put back before anything may panic, so that the temporary directory can be taken away.
+        std::fs::set_permissions(shared.root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("the permissions of the directory should be put back");
+        let Some(outcome) = outcome else {
+            return;
+        };
+        outcome.expect("the write should go through");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file should be readable"),
+            "after\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_of_a_file_that_is_not_there_fails_in_a_directory_that_refuses_staging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_directory, shared) = shared().await;
+        let path = shared.root.path().join("notes.md");
+        std::fs::set_permissions(shared.root.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("the permissions of the directory should be set");
+
+        let outcome = if refuses_creation(shared.root.path()) {
+            Some(write_through(&shared, "notes.md", "hello\n").await)
+        } else {
+            None
+        };
+
+        std::fs::set_permissions(shared.root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("the permissions of the directory should be put back");
+        let Some(outcome) = outcome else {
+            return;
+        };
+        outcome.expect_err("a file that is not there should not be created in place");
+        assert!(!path.exists(), "the file is not brought into existence");
     }
 
     #[tokio::test]

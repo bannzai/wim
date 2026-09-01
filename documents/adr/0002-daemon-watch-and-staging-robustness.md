@@ -58,6 +58,14 @@ FSEvents はストリーム開始直後の変更を取りこぼす window があ
 - 64 の根拠: エディタセッションが張る watch は開いているファイル + 作業ディレクトリ程度で 1 桁〜2 桁前半。64 は対話利用の上限として十分大きく、1 watcher が使う OS 資源 (FSEvents ストリーム / inotify fd / スレッド) × 64 × 接続数はローカルデーモンの許容範囲
 - 接続数自体の上限は設けない (トークンを持つクライアントしか watch を張れず、ADR 0001 の脅威モデルで接続爆発は守備範囲外)
 
+### 6. 書込不可ディレクトリ内の既存ファイルへは in-place write にフォールバックする (issue #41-2)
+
+staged + rename は親ディレクトリへの書込権限を要求するため、`0555` のディレクトリ内にある `0644` のファイル (旧実装の直接 `fs::write` なら更新できた構成) が書けなくなる。staging ファイルの作成が `PermissionDenied` で失敗し、**かつ書き込み先のファイルが既に存在する**場合に限り、そのファイルを開いて `truncate` + 書き込みする in-place write にフォールバックする。
+
+- 原子性のトレードオフ: in-place write はクライアントが読む当のファイルを切り詰めてから埋めるため、途中で失敗すると新旧どちらでもない内容が残り得る。書けないより書ける方を採る判断で、Vim の `backupcopy=yes` が同じ理由で払うコストと同じ
+- 新規作成には適用しない (`create` を付けない)。書込不可ディレクトリに新しいファイルは作れないため、フォールバックで write の意味論を広げない。存在しないパスへの write は従来どおり失敗する
+- フォールバック自体が失敗した場合は、そのエラー (最後に実際に試みた書き込みのもの) を返す
+
 ## Consequences
 
 - `.wim-*` はクライアントから見えず・触れない名前になる (ワイヤ上のメソッドは不変。`fs.list` / `fs.changed` の結果からの除外とパス拒否はサーバー側の意味論)
@@ -65,9 +73,10 @@ FSEvents はストリーム開始直後の変更を取りこぼす window があ
 - `fs.watch` の成功応答は「以降の変更は報告される」を (best effort で) 意味するようになる。ただし実測で FSEvents のストリーム開始が 2 秒の予算を超えることがあり (約 4 秒の観測例)、その場合は best effort に倒れるため、E2E の変更リトライは保険として残す (`crates/wim-daemon/tests/e2e.rs` の `CHANGE_RETRY` に測定値を記録)
 - symlink への watch は名前の監視になり、実体追跡が欲しいクライアントは実体パスを watch する
 - issue #31 (cap-std) はこの ADR の 4 を前提に、read/write/list の閉じ込めだけを置き換える
+- write の原子性は「staging が作れる限り保証される」になる。書込不可ディレクトリ内の既存ファイルへの write だけは非原子的な上書きになり、失敗時に中途半端な内容が残り得る
 
 ## 参照
 
-- issue: https://github.com/bannzai/wim/issues/40 / https://github.com/bannzai/wim/issues/41 (1. 可視性)
+- issue: https://github.com/bannzai/wim/issues/40 / https://github.com/bannzai/wim/issues/41 (1. 可視性 / 2. 書込不可ディレクトリ)
 - 発端のレビュー: PR #30 discussion_r3898987153 / r3898987157 / r3898987163 / r3898987166、PR #33 discussion_r3899062055
 - ADR 0001 (脅威モデル・プロトコル)
