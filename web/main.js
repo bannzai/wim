@@ -376,6 +376,10 @@ function handleKeys(keys) {
     // A plugin may rewrite the whole buffer, and what it did is not in the core's damage.
     draw({ full: true });
     syncImeFocus();
+    // The buffer a panel is drawn from may be the one the command just rewrote, and no event
+    // carries that: an edit a command made raises none, and the panels of a handler's edit are
+    // redrawn by the dispatch that ran it.
+    refreshPanels();
     return lastOutcome;
   }
   const outcome = editor.handle_keys(keys);
@@ -384,9 +388,22 @@ function handleKeys(keys) {
     damageEnd: outcome.damage_end,
     effects: JSON.parse(outcome.effects),
   };
-  // Reparsing before the frame is what lets the rows whose colours changed be drawn with the rows
-  // whose text did. The viewport of the frame just gone is the one to look at: a key that moves it
-  // redraws everything anyway.
+  reparse();
+  draw();
+  // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
+  syncImeFocus();
+  carryOut(lastOutcome.effects);
+  return lastOutcome;
+}
+
+/**
+ * Parses the buffer as it now stands and keeps the rows whose colours changed.
+ *
+ * Reparsing before the frame is what lets the rows whose colours changed be drawn with the rows
+ * whose text did. The viewport of the frame just gone is the one to look at: a change that moves
+ * it redraws everything anyway.
+ */
+function reparse() {
   highlightDamage =
     highlighter === null
       ? new Set()
@@ -394,11 +411,6 @@ function handleKeys(keys) {
           editor.text(),
           Array.from({ length: view.visibleRows }, (_, row) => view.scrollTop + row),
         );
-  draw();
-  // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
-  syncImeFocus();
-  carryOut(lastOutcome.effects);
-  return lastOutcome;
 }
 
 /**
@@ -530,7 +542,10 @@ function bufferSnapshot() {
   return {
     name: bufferName,
     text: editor.text(),
-    cursor: { line: editor.cursor_line(), column: editor.cursor_col() },
+    // The ABI counts a column in Unicode scalars, while a column in the core is a grapheme:
+    // the cursor after an `é` written as `e` and a combining acute is at column 1 here and at
+    // scalar 2 over there (`wit/plugin.wit`).
+    cursor: { line: editor.cursor_line(), column: editor.cursor_scalar_col() },
   };
 }
 
@@ -592,11 +607,26 @@ function runPlugin({ command, args }) {
   }
 }
 
+/**
+ * Puts the text a plugin's edit leaves behind in place of the buffer, as one change `u` walks
+ * back through.
+ *
+ * The editor is the one that was already open rather than a new one over the text: a plugin's
+ * edit is an edit of the session, so the cursor stays where it was, and the undo history, the
+ * registers and the marks of everything typed before the plugin ran are still there afterwards
+ * (`crates/wim-wasm/src/lib.rs`). The buffer is still the same one under the same name, so the
+ * grammar in force stays and it is only the tree parsed from the old text that is out of date.
+ */
+function replaceBuffer(text) {
+  editor.replace_text(text);
+  reparse();
+}
+
 /** Carries out one `edit` of the ABI and says what it did (`wit/plugin.wit`). */
 function applyEdit(edit) {
   switch (edit.tag) {
     case "replace-all":
-      void loadText(edit.val, bufferName);
+      replaceBuffer(edit.val);
       return "バッファを書き換えました";
     case "replace-lines": {
       // Each line keeps its own newline, so a buffer whose last line has none stays that way
@@ -613,10 +643,7 @@ function applyEdit(edit) {
         // asked for it reported as one that ran.
         throw new Error(`${start}..${end} 行は ${lines.length} 行のバッファにありません`);
       }
-      void loadText(
-        lines.slice(0, start).join("") + edit.val.text + lines.slice(end).join(""),
-        bufferName,
-      );
+      replaceBuffer(lines.slice(0, start).join("") + edit.val.text + lines.slice(end).join(""));
       // Counted from 1, the way the gutter numbers the row this landed on.
       return `${start + 1} 行目からを書き換えました`;
     }

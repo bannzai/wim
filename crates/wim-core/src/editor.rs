@@ -230,6 +230,22 @@ impl Editor {
         Ok(effects)
     }
 
+    /// Puts `text` in place of the buffer as one change `u` walks back through.
+    ///
+    /// This is how a host applies an edit that did not come from keys — the text a plugin
+    /// answered with (`wit/plugin.wit`) — and it is a change of the editor rather than a new
+    /// editor: the history, the registers, the marks and the macros of everything done before
+    /// it are still there afterwards, and `u` goes back to the text this replaced. The cursor
+    /// stays where it was, on the nearest position the new text has for it.
+    pub fn replace_text(&mut self, text: &str) {
+        let before = std::mem::replace(&mut self.buffer, Buffer::new(text));
+        self.history.begin(&before, self.cursor);
+        self.cursor = self.buffer.clamp(self.cursor);
+        self.motion_context.desired_col = self.cursor.col;
+        self.move_marks(&before);
+        self.commit_change();
+    }
+
     /// Works out the span `operator` would act on, `None` when the target resolves to
     /// nothing — a motion that cannot move, a text object the cursor is not in, or a
     /// selection outside Visual mode.
@@ -1571,6 +1587,61 @@ mod tests {
             run("ab", "lixyz<Esc>u").cursor(),
             Position::new(0, 1),
             "an Insert session goes back to the column it was opened in"
+        );
+    }
+
+    #[test]
+    fn replacing_the_buffer_is_one_change_undo_walks_back_through() {
+        let mut editor = run("alpha\nbravo", "jx");
+        editor.replace_text("PLUGIN\nEDIT");
+        assert_eq!(editor.text(), "PLUGIN\nEDIT");
+        assert_eq!(
+            editor.cursor(),
+            Position::new(1, 0),
+            "the cursor stays where it was rather than going back to the start"
+        );
+
+        editor.handle_keys("u").expect("key string should parse");
+        assert_eq!(editor.text(), "alpha\nravo", "back to the text it replaced");
+        assert_eq!(editor.cursor(), Position::new(1, 0));
+        editor.handle_keys("u").expect("key string should parse");
+        assert_eq!(
+            editor.text(),
+            "alpha\nbravo",
+            "the changes made before the replacement are still there to walk back through"
+        );
+        editor.handle_keys("<C-r><C-r>").expect("keys should parse");
+        assert_eq!(editor.text(), "PLUGIN\nEDIT", "and forward again");
+    }
+
+    #[test]
+    fn replacing_the_buffer_keeps_what_the_session_holds_and_clamps_the_cursor() {
+        let mut editor = run("alpha\nbravo\ncharlie", "yyjjll");
+        editor.replace_text("one\n");
+        assert_eq!(
+            editor.cursor(),
+            Position::new(0, 2),
+            "onto the last position the shorter text has for it"
+        );
+        assert_eq!(
+            editor.registers().get(None),
+            Some(&RegisterContent::linewise("alpha\n".to_owned())),
+            "a yank from before the replacement is still there to paste"
+        );
+        editor.handle_keys("p").expect("key string should parse");
+        assert_eq!(editor.text(), "one\nalpha\n");
+    }
+
+    #[test]
+    fn replacing_the_buffer_with_the_text_it_already_holds_is_no_change() {
+        let mut editor = run("alpha", "x");
+        editor.replace_text("lpha");
+        assert_eq!(editor.text(), "lpha");
+        editor.handle_keys("u").expect("key string should parse");
+        assert_eq!(
+            editor.text(),
+            "alpha",
+            "the one change to walk back through is the key that made one"
         );
     }
 

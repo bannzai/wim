@@ -328,7 +328,10 @@ impl Session {
             text: self.editor.text(),
             cursor: Position {
                 line: self.editor.cursor().line as u32,
-                column: self.editor.cursor().col as u32,
+                // The ABI counts a column in Unicode scalars while the core counts it in
+                // graphemes, and a cluster made of several scalars is where the two part
+                // company (`wit/plugin.wit`).
+                column: self.editor.buffer().scalar_col(self.editor.cursor()) as u32,
             },
         };
         let host = self
@@ -346,10 +349,11 @@ impl Session {
             .map_err(|error| format!("{plugin} failed on {}: {error}", event.name()))?;
         let (text, message) = plugin::apply(&buffer.text, edit)?;
         if text != buffer.text {
-            // The core has no way of being handed a buffer, so the edited text becomes an editor
-            // of its own — which is what the browser host does with a plugin's edit as well. The
-            // undo history and the cursor of the run so far go with the old one.
-            self.editor = Editor::new(&text);
+            // One change of the editor the run is holding, rather than an editor of its own:
+            // the undo history, the registers and the cursor of the run so far survive a
+            // handler that rewrites the buffer, and `u` walks back over what it wrote. The
+            // browser host applies a plugin's edit through the same call.
+            self.editor.replace_text(&text);
             return Ok("rewrote the buffer".to_owned());
         }
         Ok(message.unwrap_or_else(|| "left the buffer alone".to_owned()))
