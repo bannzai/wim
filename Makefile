@@ -1,6 +1,8 @@
 WASM := target/wasm32-unknown-unknown/release/wim_wasm.wasm
+PLUGINS := plugins/Cargo.toml
+HELLO_WIM := plugins/target/wasm32-wasip2/release/hello_wim.wasm
 
-.PHONY: build-web web e2e install-wasm-bindgen vendor-tree-sitter
+.PHONY: build-web web e2e install-wasm-bindgen vendor-tree-sitter build-plugins check-plugins
 
 # Builds the wasm module and the JS glue the demo page imports.
 build-web:
@@ -25,3 +27,16 @@ vendor-tree-sitter:
 # wasm-bindgen-cli has to match the crate version, which Cargo.lock holds.
 install-wasm-bindgen:
 	cargo install wasm-bindgen-cli --version "$$(bash scripts/wasm-bindgen-version.sh)" --locked
+
+# Builds the sample plugin as a wasm component. wasm32-wasip2 links the component itself, so the
+# rustup target is the whole toolchain requirement.
+build-plugins:
+	cargo build --manifest-path $(PLUGINS) --target wasm32-wasip2 --release --locked
+	bash scripts/check-wasm-component.sh $(HELLO_WIM)
+
+# Checks the plugins on the host target, where the ABI bindings still compile even though the
+# cdylib cannot be linked. `--lib` is what keeps the test run off that link step.
+check-plugins:
+	cargo fmt --manifest-path $(PLUGINS) --all --check
+	cargo clippy --manifest-path $(PLUGINS) --all-targets --locked -- -D warnings
+	cargo test --manifest-path $(PLUGINS) --lib --locked

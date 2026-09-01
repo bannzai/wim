@@ -80,15 +80,25 @@ vimacro --ex '%s/foo/bar/g' --keys 'ggA!<Esc>' notes.txt
 - CRLF のファイルは LF として読み、CRLF のまま書き戻します
 - オプションの完全な説明は `vimacro --help` にあります
 
+## プラグイン
+
+プラグインは Wasm Component Model の component で、ABI は [wit/plugin.wit](wit/plugin.wit) が定義します。コマンド登録・イベントフック・HTML パネルの 3 つを export し、バッファはハンドルではなくテキストの値で受け渡す純関数型のインターフェースです。ABI の読み方とビルド方法は [wit/README.md](wit/README.md)、最小の実装例は [plugins/hello-wim](plugins/hello-wim) にあります。
+
+```sh
+rustup target add wasm32-wasip2
+make build-plugins
+```
+
 ## 開発コマンド
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+make check-plugins  # plugins/ は別 workspace のため --workspace に入りません
 ```
 
-wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`) と、デモページに対する Playwright の E2E (`make e2e`) は CI が行います。
+wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`)、プラグインの component ビルド (`make build-plugins`)、デモページに対する Playwright の E2E (`make e2e`) は CI が行います。
 
 ## License
 
