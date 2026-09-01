@@ -1,6 +1,8 @@
 //! Parameters and results of the methods the daemon serves.
 //!
 //! Paths are the daemon's own, in its own syntax; the crate neither parses nor normalizes them.
+//! That holds for the paths a listing hands back as well, so a client walking a directory sends
+//! one of them on rather than building a path out of a name and a separator it would have to guess.
 
 use serde::{Deserialize, Serialize};
 
@@ -39,8 +41,13 @@ pub struct FsListResult {
 /// A single child of a listed directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirEntry {
-    /// File name, not the full path.
+    /// File name, to show. Not something to build a path out of; that is what `path` is.
     pub name: String,
+    /// The whole path to this child, in the daemon's own syntax, ready to be the `path` of an
+    /// `fs.read`, `fs.list` or `fs.watch` without anything being joined to it. A client that never
+    /// looks inside it needs to know nothing about how the daemon's file system spells a path
+    /// (`documents/adr/0004-protocol-envelope-and-listing-contract.md`).
+    pub path: String,
     /// What the name points at.
     pub kind: EntryKind,
 }
@@ -55,6 +62,9 @@ pub enum EntryKind {
     Directory,
     /// A symlink, reported without following it.
     Symlink,
+    /// A child that is none of the three: a socket, a FIFO, a device. It is in the listing because
+    /// a listing names every child of the directory, and it is not something to read or write.
+    Other,
 }
 
 /// `fs.read` params.
@@ -142,18 +152,25 @@ mod tests {
             entries: vec![
                 DirEntry {
                     name: "src".to_owned(),
+                    path: "/tmp/src".to_owned(),
                     kind: EntryKind::Directory,
                 },
                 DirEntry {
                     name: "Cargo.toml".to_owned(),
+                    path: "/tmp/Cargo.toml".to_owned(),
                     kind: EntryKind::File,
+                },
+                DirEntry {
+                    name: "wim.sock".to_owned(),
+                    path: "/tmp/wim.sock".to_owned(),
+                    kind: EntryKind::Other,
                 },
             ],
         };
         let json = serde_json::to_string(&result).expect("listing should serialize");
         assert_eq!(
             json,
-            r#"{"entries":[{"name":"src","kind":"directory"},{"name":"Cargo.toml","kind":"file"}]}"#
+            r#"{"entries":[{"name":"src","path":"/tmp/src","kind":"directory"},{"name":"Cargo.toml","path":"/tmp/Cargo.toml","kind":"file"},{"name":"wim.sock","path":"/tmp/wim.sock","kind":"other"}]}"#
         );
         assert_eq!(
             serde_json::from_str::<FsListResult>(&json).expect("listing should parse"),
