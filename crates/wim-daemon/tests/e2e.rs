@@ -559,6 +559,51 @@ async fn a_child_path_composed_from_a_listing_reads_back_the_child() {
     assert_eq!(read.content, "found\n");
 }
 
+/// Writes a file in `directory` whose name is not UTF-8, and says whether the file system took one.
+///
+/// APFS and HFS+ hold names as UTF-8 and refuse anything else, so a test of what a listing does
+/// with such a name has nothing to test on a macOS machine and says so rather than failing.
+#[cfg(unix)]
+fn write_a_name_that_is_not_utf8(directory: &Path) -> bool {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // `0xff` begins no UTF-8 sequence, in a name that is otherwise an ordinary one.
+    std::fs::write(
+        directory.join(OsStr::from_bytes(b"not-utf8-\xff.txt")),
+        "bytes\n",
+    )
+    .is_ok()
+}
+
+/// The name a listing gives a child is one the client composes a path out of and passes back, so a
+/// child whose name is not UTF-8 is left out of the listing rather than named by the replacement
+/// characters it would read as (`crates/wim-protocol/src/fs.rs`).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_child_whose_name_is_not_utf8_is_left_out_of_a_listing() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    if !write_a_name_that_is_not_utf8(&fixture.root) {
+        return;
+    }
+    let mut client = Client::authenticated(&fixture).await;
+
+    let listing: FsListResult = client
+        .ok(Method::FsList(FsListParams {
+            path: ".".to_owned(),
+        }))
+        .await;
+
+    assert_eq!(
+        listing.entries,
+        [DirEntry {
+            name: "notes.txt".to_owned(),
+            kind: EntryKind::File,
+        }],
+        "a name no path could be composed out of is not one a client is handed"
+    );
+}
+
 #[tokio::test]
 async fn a_connection_that_presents_the_wrong_token_is_refused_and_dropped() {
     let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
@@ -804,6 +849,31 @@ async fn a_watch_reports_a_change_made_outside_the_daemon() {
         change.path.ends_with("planted.txt"),
         "the change names the path that changed: {change:?}"
     );
+}
+
+/// A path below the root is written with `/` between its components whichever platform the daemon
+/// runs on (`crates/wim-protocol/src/fs.rs`), and a watch is the one method handed the absolute
+/// path rather than the path relative to the root: this is that path reaching the backend on a
+/// nested directory, and the changes under it coming back.
+#[tokio::test]
+async fn a_watch_on_a_nested_path_reports_the_changes_under_it() {
+    let fixture = Fixture::start(&[("src/nested/deep.txt", "found\n")]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let watch: FsWatchResult = client
+        .ok(Method::FsWatch(FsWatchParams {
+            path: "src/nested".to_owned(),
+            recursive: false,
+        }))
+        .await;
+
+    let change = client
+        .change_to("deep.txt", async |_: &mut Client| {
+            fixture.write("src/nested/deep.txt", "changed\n")
+        })
+        .await;
+
+    assert_eq!(change.watch_id, watch.watch_id);
 }
 
 #[tokio::test]

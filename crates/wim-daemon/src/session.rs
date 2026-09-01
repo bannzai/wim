@@ -256,9 +256,16 @@ async fn list(shared: &Shared, params: FsListParams) -> Result<Value, ResponseEr
                 if is_reserved(&name) {
                     continue;
                 }
+                // A name that is not UTF-8 is left out rather than reported with the replacement
+                // characters `to_string_lossy` puts in its place: what a client composes onto the
+                // listed directory's path is the name it is given, and that one names nothing
+                // (`crates/wim-protocol/src/fs.rs`).
+                let Some(name) = name.to_str().map(str::to_owned) else {
+                    continue;
+                };
                 let kind = entry.file_type()?;
                 entries.push(DirEntry {
-                    name: name.to_string_lossy().into_owned(),
+                    name,
                     kind: if kind.is_symlink() {
                         EntryKind::Symlink
                     } else if kind.is_dir() {
@@ -826,6 +833,54 @@ mod tests {
                 ("notes.md".to_owned(), EntryKind::File),
                 ("outside.md".to_owned(), EntryKind::Symlink),
             ]
+        );
+    }
+
+    /// A file in `directory` whose name is not UTF-8, and `None` where the file system will not
+    /// take one.
+    ///
+    /// APFS and HFS+ hold names as UTF-8 and refuse anything else, so a test of what a listing does
+    /// with such a name has nothing to test on a macOS machine and says so rather than failing.
+    #[cfg(unix)]
+    fn write_a_name_that_is_not_utf8(directory: &Path) -> Option<PathBuf> {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        // `0xff` begins no UTF-8 sequence, in a name that is otherwise an ordinary one.
+        let path = directory.join(OsStr::from_bytes(b"not-utf8-\xff.md"));
+        std::fs::write(&path, "bytes\n").ok().map(|()| path)
+    }
+
+    /// A child whose name is not UTF-8 is one no client could name back, so the listing leaves it
+    /// out rather than reporting the replacement characters the name reads as
+    /// (`crates/wim-protocol/src/fs.rs`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listing_leaves_out_a_child_whose_name_is_not_utf8() {
+        let (_directory, shared) = shared().await;
+        std::fs::write(shared.root.path().join("notes.md"), "hello\n")
+            .expect("the file should be written");
+        let Some(_path) = write_a_name_that_is_not_utf8(shared.root.path()) else {
+            return;
+        };
+
+        let result = list(
+            &shared,
+            FsListParams {
+                path: ".".to_owned(),
+            },
+        )
+        .await
+        .expect("the root should be listed");
+
+        let listed: FsListResult =
+            serde_json::from_value(result).expect("the result should be a listing");
+        assert_eq!(
+            listed.entries,
+            [DirEntry {
+                name: "notes.md".to_owned(),
+                kind: EntryKind::File,
+            }]
         );
     }
 

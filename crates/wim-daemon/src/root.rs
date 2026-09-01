@@ -1,8 +1,9 @@
 //! The directory the daemon serves, and the one place a request's path becomes a real path.
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::sync::Arc;
 
 use cap_std::ambient_authority;
@@ -108,7 +109,8 @@ impl Root {
     /// because watching reads nothing: what a watch reports are names under the root.
     pub fn resolve_lexically(&self, requested: &str) -> Result<PathBuf, ResponseError> {
         refuse_reserved(requested)?;
-        let asked = Path::new(requested);
+        let written = with_platform_separators(requested);
+        let asked = Path::new(written.as_ref());
         let candidate = if asked.is_absolute() {
             asked.to_path_buf()
         } else {
@@ -204,6 +206,23 @@ fn refuse_reserved(requested: &str) -> Result<(), ResponseError> {
         ));
     }
     Ok(())
+}
+
+/// `requested` with the `/` the protocol writes between path components read as a separator by the
+/// platform this daemon runs on.
+///
+/// A root is what `canonicalize` returned, which on Windows is a verbatim path (`\\?\C:\...`), and
+/// a verbatim path is read with `\` alone: `src/nested` joined onto one stays a single component
+/// whose name holds a slash, which is a path nothing opens or watches. The data methods hand on
+/// the path relative to the root, where `/` is read as a separator again, so where this is felt is
+/// the absolute path a watch is set up on; it is done here all the same, because this is the one
+/// place a request's path becomes a real path (`crates/wim-protocol/src/fs.rs`).
+fn with_platform_separators(requested: &str) -> Cow<'_, str> {
+    if cfg!(windows) && requested.contains('/') {
+        Cow::Owned(requested.replace('/', MAIN_SEPARATOR_STR))
+    } else {
+        Cow::Borrowed(requested)
+    }
 }
 
 /// `path` with its `.` and `..` components worked out, without asking the file system.
@@ -319,6 +338,26 @@ mod tests {
             .expect_err("a path that does not begin with the root should be refused");
 
         assert_eq!(error.code, ErrorCode::PermissionDenied);
+    }
+
+    /// A client composes a path out of `/` whichever platform the daemon runs on
+    /// (`crates/wim-protocol/src/fs.rs`), so a nested one has to reach the same place a watch and a
+    /// read are given — on Windows, where the root is a verbatim path that reads no `/` at all,
+    /// as much as here.
+    #[tokio::test]
+    async fn a_nested_path_written_with_the_separator_the_protocol_uses_resolves_under_the_root() {
+        let (_directory, root) = root().await;
+
+        assert_eq!(
+            root.resolve_lexically("src/nested")
+                .expect("a nested path should resolve"),
+            root.path().join("src").join("nested")
+        );
+        assert_eq!(
+            root.relative("src/nested")
+                .expect("a nested path should resolve"),
+            Path::new("src").join("nested")
+        );
     }
 
     #[tokio::test]

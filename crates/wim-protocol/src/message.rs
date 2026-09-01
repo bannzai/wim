@@ -82,6 +82,10 @@ pub struct Rejected {
 /// Both steps are here rather than at each call site so that every side of the protocol reads a
 /// message the same way, and so that what a message of a later version is answered with is the
 /// crate's own contract rather than one daemon's reading of it.
+///
+/// A request under [`RESERVED_ID`] is refused here as well, so that the id kept for answers no
+/// request could be matched to is one the reading side holds free rather than one the sending side
+/// is asked to leave alone.
 pub fn read_request(text: &str) -> Result<Request, Rejected> {
     let message: Value = match serde_json::from_str(text) {
         Ok(message) => message,
@@ -105,13 +109,28 @@ pub fn read_request(text: &str) -> Result<Request, Rejected> {
             ),
         });
     }
-    serde_json::from_value(message).map_err(|error| Rejected {
+    let request: Request = serde_json::from_value(message).map_err(|error| Rejected {
         id: envelope.id,
         error: ResponseError::new(
             ErrorCode::InvalidRequest,
             format!("the message is not a request this build serves: {error}"),
         ),
-    })
+    })?;
+    if request.id == RESERVED_ID {
+        // Under the id it asked for, which is the reserved one: an answer carrying it is what the
+        // client is told to expect for a message no request could be matched to, and this is one.
+        return Err(Rejected {
+            id: RESERVED_ID,
+            error: ResponseError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "id {RESERVED_ID} is reserved for answers no request could be matched to; \
+                     requests are numbered from 1"
+                ),
+            ),
+        });
+    }
+    Ok(request)
 }
 
 /// The number a field of an envelope holds, and `None` when it holds anything else.
@@ -137,7 +156,8 @@ pub struct Request {
     #[serde(rename = "v")]
     pub version: u32,
     /// Names the response that answers this request. Chosen by the client, and numbered from 1:
-    /// [`RESERVED_ID`] is kept for answers that could not be matched to a request at all.
+    /// [`RESERVED_ID`] is kept for answers that could not be matched to a request at all, and a
+    /// request carrying it is refused by [`read_request`] rather than served.
     pub id: u64,
     /// The method and its params.
     #[serde(flatten)]
@@ -146,7 +166,11 @@ pub struct Request {
 
 impl Request {
     /// A request for the current protocol version.
+    ///
+    /// `id` is the client's own, numbered from 1: a request built under [`RESERVED_ID`] is one the
+    /// reading side refuses, so it is caught here in a debug build rather than sent to be refused.
     pub fn new(id: u64, method: Method) -> Self {
+        debug_assert!(id != RESERVED_ID, "request ids are numbered from 1");
         Self {
             version: PROTOCOL_VERSION,
             id,
@@ -548,6 +572,23 @@ mod tests {
             Method::FsRead(crate::fs::FsReadParams {
                 path: "/tmp/notes.md".to_owned(),
             })
+        );
+    }
+
+    /// The id kept for answers no request could be matched to is held free by the side that reads
+    /// requests, so a client cannot take it by sending one under it.
+    #[test]
+    fn a_request_under_the_reserved_id_is_refused_rather_than_served() {
+        let text = r#"{"v":1,"id":0,"method":"fs.read","params":{"path":"/tmp/notes.md"}}"#;
+
+        let rejected = read_request(text).expect_err("a request under the reserved id is refused");
+
+        assert_eq!(rejected.id, RESERVED_ID);
+        assert_eq!(rejected.error.code, ErrorCode::InvalidRequest);
+        assert!(
+            rejected.error.message.contains("reserved"),
+            "the refusal says what is wrong with the id: {}",
+            rejected.error.message
         );
     }
 
