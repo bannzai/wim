@@ -6,6 +6,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
+use std::fs::{File, Metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -304,23 +305,37 @@ fn is_crlf(text: &str) -> bool {
 /// another. Two `:w path` writes to the same directory would otherwise pick the same name.
 static WRITES: AtomicUsize = AtomicUsize::new(0);
 
+/// How many names a temporary file is given before the write is called off.
+///
+/// A name that is taken is a name someone else is holding — another run of the program, or
+/// someone waiting for this one to write through a file of their choosing — and the next name
+/// carries a different clock reading. A handful of tries is far past what a name nobody can
+/// predict needs, and the run fails rather than looping where a directory is being filled with
+/// them on purpose.
+const TEMPORARY_NAME_TRIES: usize = 8;
+
 /// Writes `text` to `path` by way of a temporary file next to it, so that a write which fails
 /// partway leaves the file with the text it had rather than with half of the new text.
 ///
 /// The rename is what makes the new text appear all at once, and it replaces the old file only
 /// when the two are on one file system, which a sibling of the target is. A file being replaced
 /// keeps the permissions it had, so that a script stays as runnable as it was.
+///
+/// A symbolic link is followed rather than replaced: the file the link names is the one the run
+/// read and edited, and renaming over the link would leave the text nowhere and the link gone.
+/// A file that cannot be written to is not written to by way of the directory it sits in
+/// either, so that a read-only file is refused the way it would be if the text went straight
+/// into it.
 fn write_all_at_once(path: &Path, text: &str) -> io::Result<()> {
-    let name = path.file_name().unwrap_or_else(|| OsStr::new("vimacro"));
-    let mut temporary_name = OsString::from(".");
-    temporary_name.push(name);
-    temporary_name.push(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        WRITES.fetch_add(1, Ordering::Relaxed)
-    ));
-    let temporary = path.with_file_name(temporary_name);
-    match write_then_rename(&temporary, path, text) {
+    let path = &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let existing = std::fs::metadata(path).ok();
+    if existing.is_some() {
+        // Opening for writing is what asks the file system whether this write is allowed, and
+        // without a truncation it is the whole question: the file is left as it is.
+        std::fs::OpenOptions::new().write(true).open(path)?;
+    }
+    let (temporary, file) = create_temporary(path)?;
+    match write_then_rename(file, &temporary, path, text, existing) {
         Ok(()) => Ok(()),
         Err(error) => {
             // The temporary file holds nothing anyone asked for, and a directory left with one
@@ -331,11 +346,62 @@ fn write_all_at_once(path: &Path, text: &str) -> io::Result<()> {
     }
 }
 
+/// Makes a temporary file next to `path` and hands back its name and the handle to write
+/// through.
+///
+/// The file is created rather than opened: a name that is already taken — by a symbolic link
+/// someone put there to have this write land somewhere else — is left alone and another name is
+/// tried. The name carries the process id, a counter and a reading of the clock, so that it is
+/// neither shared with another write of this run nor worth guessing at.
+fn create_temporary(path: &Path) -> io::Result<(PathBuf, File)> {
+    let name = path.file_name().unwrap_or_else(|| OsStr::new(PROGRAM));
+    let mut last = None;
+    for _ in 0..TEMPORARY_NAME_TRIES {
+        let mut temporary_name = OsString::from(".");
+        temporary_name.push(name);
+        temporary_name.push(format!(
+            ".{}.{}.{}.tmp",
+            std::process::id(),
+            WRITES.fetch_add(1, Ordering::Relaxed),
+            nanos_of_the_second()
+        ));
+        let temporary = path.with_file_name(temporary_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
+}
+
+/// The nanoseconds of the current second, which is the part of the clock that tells two writes
+/// of one program apart. A clock that cannot be read reads as zero: the process id and the
+/// counter still tell the names apart, and a name that is taken is tried again.
+fn nanos_of_the_second() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.subsec_nanos())
+}
+
 /// The write itself, split out so that a failure anywhere along it is one place to clean up
 /// after.
-fn write_then_rename(temporary: &Path, path: &Path, text: &str) -> io::Result<()> {
-    std::fs::write(temporary, text)?;
-    if let Ok(existing) = std::fs::metadata(path) {
+fn write_then_rename(
+    mut file: File,
+    temporary: &Path,
+    path: &Path,
+    text: &str,
+    existing: Option<Metadata>,
+) -> io::Result<()> {
+    file.write_all(text.as_bytes())?;
+    // The file is closed before the rename, which is what a file system that will not rename an
+    // open file needs.
+    drop(file);
+    if let Some(existing) = existing {
         std::fs::set_permissions(temporary, existing.permissions())?;
     }
     std::fs::rename(temporary, path)
@@ -532,6 +598,27 @@ mod tests {
         assert!(!is_crlf("alpha\nbravo\n"));
         assert!(!is_crlf("alpha"), "a file of one unterminated line is LF");
         assert!(!is_crlf(""));
+    }
+
+    #[test]
+    fn a_temporary_file_is_made_new_and_named_afresh_for_every_write() {
+        let directory = tempfile::TempDir::new().expect("a directory should be available");
+        let path = directory.path().join("notes.txt");
+        let (first, _) = create_temporary(&path).expect("a temporary file should be made");
+        let (second, _) = create_temporary(&path).expect("a temporary file should be made");
+        assert_ne!(first, second, "two writes of one run share no name");
+        for temporary in [&first, &second] {
+            assert_eq!(
+                temporary.parent(),
+                path.parent(),
+                "the temporary file sits next to the file it is for"
+            );
+            assert_eq!(
+                std::fs::read_to_string(temporary).expect("the file should be there"),
+                "",
+                "the file is the one that was just made rather than one that was there"
+            );
+        }
     }
 
     #[test]

@@ -354,6 +354,48 @@ fn in_place_leaves_a_file_the_permissions_it_had() {
 
 #[cfg(unix)]
 #[test]
+fn in_place_writes_through_a_symbolic_link_to_the_file_it_names() {
+    let directory = directory(&[("notes.txt", "alpha\n")]);
+    let link = directory.path().join("link.txt");
+    std::os::unix::fs::symlink("notes.txt", &link).expect("the link should be made");
+    vimacro(&directory)
+        .args(["-i", "A!<Esc>", "link.txt"])
+        .assert()
+        .success();
+    assert_eq!(
+        read(&directory, "notes.txt"),
+        "alpha!\n",
+        "the file the link names is the one the run read, and the one it writes"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .expect("the link should be there")
+            .file_type()
+            .is_symlink(),
+        "the link is still a link rather than a file of its own"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_leaves_a_file_that_cannot_be_written_to_alone() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = directory(&[("notes.txt", "alpha\n")]);
+    let path = directory.path().join("notes.txt");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444))
+        .expect("the permissions should be settable");
+    vimacro(&directory)
+        .args(["-i", "A!<Esc>", "notes.txt"])
+        .assert()
+        .failure()
+        // The directory is writable, so nothing but asking the file itself stops the write.
+        .stderr(contains("notes.txt:"));
+    assert_eq!(read(&directory, "notes.txt"), "alpha\n");
+}
+
+#[cfg(unix)]
+#[test]
 fn a_file_named_in_bytes_that_are_not_text_is_read_and_written() {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
