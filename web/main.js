@@ -49,6 +49,18 @@ function fontAt(size) {
 const canvas = document.querySelector("#screen");
 const context = canvas.getContext("2d");
 
+/** The textarea an IME composes into, which is focused only in the modes whose keys are text. */
+const imeInput = document.querySelector("#ime");
+
+/** The overlay the composition is drawn in, over the canvas at the cursor. */
+const preedit = document.querySelector("#preedit");
+
+/**
+ * The modes whose keys are text rather than commands, which are the ones text may be composed
+ * into. In every other mode a key is a command the moment it is pressed.
+ */
+const TEXT_MODES = new Set(["INSERT", "COMMAND"]);
+
 /** The editor, which cannot be built before the wasm module is initialised. */
 let editor;
 
@@ -65,11 +77,15 @@ let view = {
   cellWidth: 0,
   gutterWidth: 0,
   textLeft: 0,
+  statusTop: 0,
   visibleRows: 0,
   scrollTop: 0,
   lineCount: 0,
   cursorLine: 0,
 };
+
+/** What an IME is composing right now, `""` when nothing is being composed. */
+let composition = "";
 
 /** Glyphs baked at the current scale and cell size, keyed by the colour they were baked in. */
 const atlas = {
@@ -92,10 +108,27 @@ const atlas = {
 const CORE_CTRL_KEYS = new Set(["r"]);
 
 /**
+ * `text` as a key string `parse_keys` reads back as exactly those characters.
+ *
+ * `<` is the one character the notation spells for itself: left alone it would open a `<…>`
+ * group and be read as some other key, or fail to parse and take the whole batch with it.
+ */
+function keysOf(text) {
+  return text.replaceAll("<", "<lt>");
+}
+
+/**
  * The key notation `parse_keys` reads for `event`, or `null` for a key the core has no name
  * for — a bare modifier, an arrow, a browser shortcut — which the browser keeps.
  */
 function keyNotation(event) {
+  // Every key of a dead-key or IME composition belongs to the composition, the named ones
+  // included: Enter and Esc confirm and abandon what is being composed, and Backspace edits it.
+  // Taking any of them here would type the raw key, or leave Insert mode with a composition
+  // still open in the textarea. What is composed reaches the editor on `compositionend`.
+  if (event.isComposing) {
+    return null;
+  }
   switch (event.key) {
     case "Escape":
       return "<Esc>";
@@ -108,18 +141,11 @@ function keyNotation(event) {
     default:
       break;
   }
-  // A key that is part of a dead-key or IME composition is the browser's until the composed
-  // character is done; taking it here would type the raw key instead of what is being
-  // composed. Proper composition input, IME included, is issue #36's.
-  if (event.isComposing) {
-    return null;
-  }
   // Anything longer than one character is a named key the core does not know.
   if (event.key.length !== 1 || event.metaKey) {
     return null;
   }
-  // `<` is the one character the notation spells for itself, so it goes in as its escape.
-  const literal = event.key === "<" ? "<lt>" : event.key;
+  const literal = keysOf(event.key);
   // A key typed with Alt involved is either composed text or a shortcut, and the modifier
   // flags alone cannot tell the two apart: Firefox on Windows raises the AltGraph state for
   // plain Ctrl+Alt, and Alt+F is the browser's own menu shortcut. What does tell them apart
@@ -146,12 +172,77 @@ function handleKeys(keys) {
     effects: JSON.parse(outcome.effects),
   };
   draw();
+  // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
+  syncImeFocus();
   return lastOutcome;
 }
 
 /** The cells `text` draws as: one per column the core counts, carrying its display width. */
 function cellsOf(text) {
   return JSON.parse(display_cells(text));
+}
+
+/** The CSS pixels `cells` occupy on a row. */
+function cellsWidth(cells) {
+  return cells.reduce((width, cell) => width + cell.width * view.cellWidth, 0);
+}
+
+/**
+ * Points the browser's input focus at the hidden textarea in the modes whose keys are text, and
+ * away from it in the ones whose keys are commands.
+ *
+ * Focus is what turns an IME on and off here, rather than `readonly` or `inputmode`, because it
+ * is the one control that certainly stops a composition: text is only ever composed into the
+ * focused editable element, so an unfocused textarea composes nothing, and a key pressed in
+ * Normal mode arrives as itself and is consumed as a command. `readonly` leaves the element
+ * focused and browsers disagree over whether an IME may still open on it, and `inputmode` only
+ * speaks to on-screen keyboards. Nothing else on the page takes focus, and the key handler sits
+ * on `window`, so the keys the demo reads are the same either way.
+ */
+function syncImeFocus() {
+  if (TEXT_MODES.has(editor.mode())) {
+    if (document.activeElement !== imeInput) {
+      // Focusing scrolls the element into view by default, which would jump the page on a
+      // textarea that sits wherever the cursor happens to be.
+      imeInput.focus({ preventScroll: true });
+    }
+    return;
+  }
+  if (document.activeElement === imeInput) {
+    imeInput.blur();
+  }
+}
+
+/** Where the cursor is drawn, in CSS pixels from the top left corner of the canvas. */
+function cursorPoint() {
+  const commandLine = editor.command_line();
+  if (commandLine !== undefined) {
+    // Command-line mode types into the status line, so that is where the cursor is.
+    return { x: PADDING + cellsWidth(cellsOf(commandLine)), y: view.statusTop };
+  }
+  const cells = cellsOf(editor.line(editor.cursor_line()));
+  return {
+    x: view.textLeft + cellsWidth(cells.slice(0, editor.cursor_col())),
+    y: PADDING + (editor.cursor_line() - view.scrollTop) * LINE_HEIGHT,
+  };
+}
+
+/**
+ * Draws the composition over the canvas at the cursor, and moves the textarea under it.
+ *
+ * The composition is not the editor's text until the IME confirms it, so it is drawn as an
+ * overlay rather than pushed through the core and taken back out again. The textarea follows
+ * the cursor because the candidate window the IME opens is placed against the element it is
+ * composing into.
+ */
+function drawComposition() {
+  const point = cursorPoint();
+  imeInput.style.left = `${point.x}px`;
+  imeInput.style.top = `${point.y}px`;
+  preedit.style.left = `${point.x}px`;
+  preedit.style.top = `${point.y}px`;
+  preedit.textContent = composition;
+  preedit.hidden = composition === "";
 }
 
 function statusText() {
@@ -256,15 +347,11 @@ function drawCells(cells, x, y, color) {
 /** Draws the cursor under the text, so that the character it sits on stays readable. */
 function drawCursor(cells, top) {
   const col = editor.cursor_col();
-  let left = view.textLeft;
-  for (const cell of cells.slice(0, col)) {
-    left += cell.width * view.cellWidth;
-  }
   // A cell past the end of the line is the one an empty line's cursor sits in, one wide.
   const width =
     editor.mode() === "INSERT" ? 2 : (cells[col]?.width ?? 1) * view.cellWidth;
   context.fillStyle = COLORS.cursor;
-  context.fillRect(left, top, width, LINE_HEIGHT);
+  context.fillRect(view.textLeft + cellsWidth(cells.slice(0, col)), top, width, LINE_HEIGHT);
 }
 
 /** Redraws one line of the buffer over the background, leaving nothing of the old row. */
@@ -383,6 +470,7 @@ function draw({ full = false } = {}) {
     cellWidth,
     gutterWidth,
     textLeft: PADDING + gutterWidth,
+    statusTop,
     visibleRows,
     scrollTop,
     lineCount,
@@ -400,10 +488,17 @@ function draw({ full = false } = {}) {
   }
   // The mode, the position and the command line change on keys that damage no text at all.
   drawStatusLine(statusTop);
+  // The overlay is a DOM element rather than pixels on the canvas, so it does not follow a
+  // cursor that moved, a viewport that scrolled or a resize on its own.
+  drawComposition();
 }
 
 await init();
 editor = new WimEditor(INITIAL_TEXT);
+// The overlay draws the same glyphs at the same size as the canvas, and `main.js` is where that
+// size is decided, so the two cannot drift.
+preedit.style.font = fontAt(FONT_SIZE);
+preedit.style.lineHeight = `${LINE_HEIGHT}px`;
 draw({ full: true });
 
 // Listening only once the editor exists is what keeps a key typed during the wasm fetch from
@@ -419,6 +514,51 @@ window.addEventListener("keydown", (event) => {
 
 window.addEventListener("resize", () => draw());
 
+// An IME composes into the textarea; the demo only watches, and takes the text once the IME
+// says it is confirmed. Until then what is on screen is the overlay, and the buffer is untouched
+// — which is what lets a composition be abandoned without the editor ever having heard of it.
+imeInput.addEventListener("compositionstart", (event) => {
+  // `data` is `null` on a start that carries no text, which is every one of them here: the
+  // textarea is emptied after each composition, so there is never anything to compose over.
+  composition = event.data ?? "";
+  drawComposition();
+});
+
+imeInput.addEventListener("compositionupdate", (event) => {
+  composition = event.data ?? "";
+  drawComposition();
+});
+
+imeInput.addEventListener("compositionend", (event) => {
+  composition = "";
+  drawComposition();
+  // The textarea is only somewhere for the IME to work in. What it is left holding is the
+  // editor's now, so it goes in as keys and the textarea starts the next composition empty.
+  imeInput.value = "";
+  // A composition that was abandoned rather than confirmed ends with no text, and there is
+  // nothing to type: the buffer never held any of it.
+  const text = event.data ?? "";
+  if (text !== "") {
+    handleKeys(keysOf(text));
+  }
+});
+
+// Text can reach a focused textarea without a composition — a paste, a drop, an autofill — and
+// none of those are wired through the core yet. Dropping it keeps the textarea empty, so that
+// the leftovers cannot turn up in front of the next composition.
+imeInput.addEventListener("input", (event) => {
+  if (!event.isComposing) {
+    imeInput.value = "";
+  }
+});
+
+// A click would otherwise move focus off the textarea and leave Insert mode without an IME.
+// The canvas holds no selectable text of its own, so nothing is lost by keeping the focus.
+canvas.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  syncImeFocus();
+});
+
 // The handle the E2E run drives and inspects the demo through.
 window.wimDemo = {
   sendKeys: handleKeys,
@@ -428,6 +568,8 @@ window.wimDemo = {
     lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
     view = { ...view, scrollTop: 0 };
     draw({ full: true });
+    // A fresh editor is in Normal mode, whatever the one it replaced was in.
+    syncImeFocus();
   },
   /** Redraws every row, which the E2E run compares the damage-driven redraw against. */
   redraw: () => draw({ full: true }),
@@ -440,6 +582,13 @@ window.wimDemo = {
     damage: { start: lastOutcome.damageStart, end: lastOutcome.damageEnd },
     effects: lastOutcome.effects,
     viewport: { top: view.scrollTop, rows: view.visibleRows },
+    ime: {
+      /** What an IME is composing, which the overlay shows and the buffer does not hold yet. */
+      composition,
+      /** Whether the textarea an IME composes into is the focused element. */
+      focused: document.activeElement === imeInput,
+      cursor: cursorPoint(),
+    },
     layout: {
       cellWidth: view.cellWidth,
       textLeft: view.textLeft,
