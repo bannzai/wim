@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 wim-daemon.workspace = true
+wim-plugin-host.workspace = true
 clap.workspace = true
 tokio.workspace = true
 

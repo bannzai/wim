@@ -50,6 +50,34 @@ make check-plugins   # ホスト target で fmt / clippy / unit test
 プラグインのロジックの test はローカルで行える。wasm32 系の std を持たない環境 (Homebrew の
 Rust など) で `.wasm` を作れないのは Phase 3 と同じで、component のビルドは CI が正になる。
 
+## ホスト
+
+ネイティブ側のホストは `crates/wim-plugin-host` で、バインディングは wit-bindgen ではなく
+wasmtime の `bindgen!` が同じ `wit/` から生成する。ロード時に行うことは 3 つある。
+
+- component かどうかを先頭 8 バイトで見る (`scripts/check-wasm-component.sh` と同じ判定)。
+  wasm32-wasip2 以外の wasm32 target でビルドしたプラグインは core module になる
+- export 名 (`wim:plugin/commands@0.1.0`) が持つ ABI バージョンを見て、major.minor が
+  ホストのものと違う component を拒否する。ホスト側のバージョンは `wit/plugin.wit` の
+  package 行から読むので、定数として二重に持たない
+- linker に何も足さずに instantiate する。world が import する `wim:plugin/buffer` は型だけの
+  interface で、wasmtime は関数を持たない instance を linker の定義なしで満たすため、それ以外を
+  import する component — WASI を要求する component すべて — はここで弾かれる。これが
+  サンドボックスで、実行時に禁止するのではなくロード時に成立しない形にしてある
+
+エディタに組み込まずに動かす入口が `wim plugin run <wasm> <command> [--input TEXT]` で、
+標準入力 (または `--input`) のテキストを snapshot として渡し、返ってきた edit を適用した結果を
+標準出力へ書く。Ex コマンドへの配線は Phase 4-4 の autocmd・設定と合わせて行う。
+
+```sh
+make build-plugins      # component をビルドする (要 wasm32-wasip2)
+make test-plugin-host   # ビルドした component をホストで実際にロードして動かす
+```
+
+`make test-plugin-host` は component のパスを `WIM_PLUGIN_WASM` でテストに渡す。素の
+`cargo test --workspace` ではこの変数が無いため、component を要するテストは skip される
+(component をビルドできない環境でも workspace のテストが通るようにするため)。
+
 ## 新しいプラグインを足す
 
 `plugins/hello-wim` が最小の実装例で、コマンド 1 つ (`:upcase`)・イベントフック 1 つ・パネル

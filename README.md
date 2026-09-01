@@ -89,6 +89,13 @@ rustup target add wasm32-wasip2
 make build-plugins
 ```
 
+ビルドした component は `crates/wim-plugin-host` が wasmtime でロードします。プラグインには WASI を一切渡さないため、ファイル IO・ネットワーク・時刻に触れる component はロード時点で拒否されます。エディタに組み込まずに動かすには `wim plugin run` を使います (Ex コマンドへの配線は Phase 4-4)。
+
+```sh
+echo 'hello wim' | cargo run -p wim -- plugin run plugins/target/wasm32-wasip2/release/hello_wim.wasm upcase
+# => HELLO WIM
+```
+
 ## 開発コマンド
 
 ```sh
@@ -98,7 +105,7 @@ cargo test --workspace
 make check-plugins  # plugins/ は別 workspace のため --workspace に入りません
 ```
 
-wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`)、プラグインの component ビルド (`make build-plugins`)、デモページに対する Playwright の E2E (`make e2e`) は CI が行います。
+wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`)、プラグインの component ビルド (`make build-plugins`)、ビルドした component を実際にロードするホストのテスト (`make test-plugin-host`)、デモページに対する Playwright の E2E (`make e2e`) は CI が行います。
 
 ## License
 

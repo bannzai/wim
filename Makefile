@@ -2,7 +2,7 @@ WASM := target/wasm32-unknown-unknown/release/wim_wasm.wasm
 PLUGINS := plugins/Cargo.toml
 HELLO_WIM := plugins/target/wasm32-wasip2/release/hello_wim.wasm
 
-.PHONY: build-web web e2e install-wasm-bindgen vendor-tree-sitter build-plugins check-plugins
+.PHONY: build-web web e2e install-wasm-bindgen vendor-tree-sitter build-plugins check-plugins test-plugin-host
 
 # Builds the wasm module and the JS glue the demo page imports.
 build-web:
@@ -40,3 +40,10 @@ check-plugins:
 	cargo fmt --manifest-path $(PLUGINS) --all --check
 	cargo clippy --manifest-path $(PLUGINS) --all-targets --locked -- -D warnings
 	cargo test --manifest-path $(PLUGINS) --lib --locked
+
+# Runs the native host against the sample plugin it was built to load. WIM_PLUGIN_WASM is what
+# points the tests at the component, and it has to be absolute: a test binary runs in its own
+# package directory, not here. The tests that need it step aside when it is unset, which is what
+# `cargo test --workspace` does on a machine without the wasm32-wasip2 target.
+test-plugin-host: build-plugins
+	WIM_PLUGIN_WASM="$(CURDIR)/$(HELLO_WIM)" cargo test -p wim-plugin-host -p wim --locked
