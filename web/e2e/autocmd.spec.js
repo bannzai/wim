@@ -84,13 +84,22 @@ function stubPicker(page, name, text, { gateFirstWrite = false } = {}) {
  * `edit` is what it answers every command and every event with, written as the ABI's `edit`
  * variant (`wit/plugin.wit`). The manifest and the module are both served by the route, so
  * nothing of the real transpile step is needed.
+ *
+ * It has no panel: the world's third interface is exported the way a component has to export it,
+ * and answers `undefined`, which is the `none` of `option<panel>`. A panel is checked where a
+ * plugin that has one is (`web/e2e/markdown-preview.spec.js`).
  */
 function stubPlugin(page, name, edit) {
   const module = `
     const EDIT = ${JSON.stringify(edit)};
     const commands = { listCommands: () => [], run: () => EDIT };
     const events = { subscriptions: () => ["buffer-write"], onEvent: () => EDIT };
-    export { commands as "wim:plugin/commands@0.1.0", events as "wim:plugin/events@0.1.0" };
+    const ui = { render: () => undefined };
+    export {
+      commands as "wim:plugin/commands@0.1.0",
+      events as "wim:plugin/events@0.1.0",
+      ui as "wim:plugin/ui@0.1.0",
+    };
   `;
   return Promise.all([
     page.route("**/plugins/manifest.json", (route) =>

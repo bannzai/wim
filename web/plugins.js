@@ -30,6 +30,9 @@ const COMMANDS = "wim:plugin/commands";
 /** The interface an event is delivered over. */
 const EVENTS = "wim:plugin/events";
 
+/** The interface a panel is rendered over. */
+const UI = "wim:plugin/ui";
+
 /**
  * Loads every plugin the build transpiled: the commands keyed by the name `:name` runs them
  * under, and the plugins themselves keyed by the name an autocmd names them by.
@@ -75,6 +78,7 @@ async function loadPlugin(declared, abi) {
     throw new Error(abiComplaint(module, abi));
   }
   const events = module[`${EVENTS}@${abi}`];
+  const ui = module[`${UI}@${abi}`];
   const published = commands.listCommands().map((command) => ({
     name: command.name,
     description: command.description,
@@ -94,6 +98,13 @@ async function loadPlugin(declared, abi) {
       subscriptions: events.subscriptions(),
       /** Delivers one of those events, answering with an edit the way a command does. */
       onEvent: (event, buffer) => events.onEvent(event, buffer),
+      /**
+       * The panel to show over `buffer`, `undefined` when the plugin has none — which is the
+       * `none` of the ABI's `option<panel>`, and the host's cue to close the panel
+       * (`wit/plugin.wit`). What comes back is HTML this host does not trust; where it may be
+       * drawn is decided in `web/main.js`.
+       */
+      render: (buffer) => ui.render(buffer),
     },
   };
 }

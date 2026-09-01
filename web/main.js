@@ -128,6 +128,9 @@ const fileStatus = document.querySelector("#file-status");
 const pluginCommandList = document.querySelector("#plugin-commands");
 const pluginStatus = document.querySelector("#plugin-status");
 
+/** Where the panels the loaded plugins render are put, one section each. */
+const panelList = document.querySelector("#panels");
+
 /** The line listing the autocmds the config declared, and the one a handler reports on. */
 const autocmdList = document.querySelector("#autocmd-list");
 const autocmdStatus = document.querySelector("#autocmd-status");
@@ -162,6 +165,14 @@ let pluginCommands = new Map();
  * looked up in `pluginCommands`; this is what an event is delivered over.
  */
 let plugins = new Map();
+
+/**
+ * The panels on screen, keyed by the name of the plugin that rendered each one. The elements are
+ * kept rather than rebuilt so that a redraw of the same HTML leaves the frame where it is: an
+ * iframe reloads its document every time `srcdoc` is written, which would blank the panel and
+ * throw away where it was scrolled to on every keystroke that changes the buffer.
+ */
+const panels = new Map();
 
 /**
  * The autocmds the config declared, in the order they are written. Empty until `wim.jsonc` has
@@ -402,8 +413,10 @@ function carryOut(effects) {
   // A handler that rewrites the buffer replaces the editor, which starts a new outcome; what
   // this batch of keys did is the one to report, so it is put back afterwards.
   const outcome = lastOutcome;
+  let textChanged = false;
   for (const effect of effects) {
     if (effect.kind === "event") {
+      textChanged ||= effect.name === "text-changed";
       dispatch(effect.name, effect.payload);
     }
     if (effect.kind === "save") {
@@ -411,6 +424,12 @@ function carryOut(effects) {
       // asked for it: what it did turns up in the report line once it is done.
       void save(effect.path ?? null);
     }
+  }
+  if (textChanged) {
+    // The core saying the buffer changed is the other thing `render` is called for, and this is
+    // after the handlers rather than with them: a handler may edit the buffer again, and the
+    // panel is to be drawn from the buffer the keys finally left behind.
+    refreshPanels();
   }
   lastOutcome = outcome;
 }
@@ -434,9 +453,11 @@ function dispatch(name, payload) {
   }
   reportAutocmd(lastAutocmds.join(" / "));
   // A handler may have rewritten the buffer, and what it did is not in the damage the keys
-  // reported.
+  // reported — nor in the events they reported, so the panels are redrawn from here as well as
+  // from the `text-changed` a key raises.
   draw({ full: true });
   syncImeFocus();
+  refreshPanels();
 }
 
 /** Runs one handler and says what it did, for the line under the list of them. */
@@ -496,16 +517,19 @@ function callPlugin(name, payload, plugin) {
     // The ABI has the host deliver nothing a plugin did not subscribe to.
     throw new Error(`${plugin} は ${name} を購読していません`);
   }
-  return applyEdit(
-    loaded.onEvent(
-      { name, payload },
-      {
-        name: bufferName,
-        text: editor.text(),
-        cursor: { line: editor.cursor_line(), column: editor.cursor_col() },
-      },
-    ),
-  );
+  return applyEdit(loaded.onEvent({ name, payload }, bufferSnapshot()));
+}
+
+/**
+ * The buffer as a plugin is given it: a copy of the text with the name it is under and where the
+ * cursor is, and nothing that points back at the host (`wit/plugin.wit`).
+ */
+function bufferSnapshot() {
+  return {
+    name: bufferName,
+    text: editor.text(),
+    cursor: { line: editor.cursor_line(), column: editor.cursor_col() },
+  };
 }
 
 /** Shows `message` under the demo, which is where opening and saving report. */
@@ -558,11 +582,7 @@ function runPlugin({ command, args }) {
     // Applying the edit is inside the same `try` as the call that answered with it: an edit the
     // host cannot carry out — a range that is not in the buffer — is the plugin's failure just
     // as a refusal is, and `wim plugin run` reports the two the same way.
-    const edit = command.run(args, {
-      name: bufferName,
-      text: editor.text(),
-      cursor: { line: editor.cursor_line(), column: editor.cursor_col() },
-    });
+    const edit = command.run(args, bufferSnapshot());
     reportPlugin(`:${command.name}: ${applyEdit(edit)}`);
   } catch (error) {
     // What the plugin refuses arrives as the `result<edit, string>` error half, in its wording.
@@ -609,6 +629,118 @@ function applyEdit(edit) {
 }
 
 /**
+ * Renders the panel of every loaded plugin over the buffer as it stands, opening the ones that
+ * answer with a panel and closing the ones that answer with none.
+ *
+ * This is the whole of the `ui` half of the ABI: the host calls `render` when it opens a panel
+ * and when the buffer changes, and `none` is what closes one (`wit/plugin.wit`). It is not wired
+ * through the autocmds, and could not be: a handler of kind `plugin` reaches `on-event` and
+ * answers with an edit, which is not a panel. So `markdown-preview` subscribes to no events at
+ * all, and a config that bound it to one would be refused as an autocmd that could never be
+ * delivered.
+ *
+ * A plugin that fails to render loses its panel and is reported, rather than taking the panels of
+ * the other plugins down with it.
+ */
+function refreshPanels() {
+  for (const [name, plugin] of plugins) {
+    let panel;
+    try {
+      panel = plugin.render(bufferSnapshot());
+    } catch (error) {
+      closePanel(name);
+      reportPlugin(`${name} のパネルを描けません: ${error.message}`);
+      continue;
+    }
+    if (panel === undefined) {
+      closePanel(name);
+      continue;
+    }
+    openPanel(name, panel);
+  }
+}
+
+/** Puts `panel` on screen under the plugin's name, building the frame it goes in on first use. */
+function openPanel(name, panel) {
+  let element = panels.get(name);
+  if (element === undefined) {
+    const section = document.createElement("section");
+    section.className = "panel";
+    section.dataset.plugin = name;
+    const heading = document.createElement("h2");
+    const frame = document.createElement("iframe");
+    // The sandbox, which is what a panel's HTML is trusted by rather than sanitized by
+    // (`wit/README.md`). An empty attribute is every restriction turned on: `allow-scripts` is
+    // not among them, so nothing in there runs, and `allow-same-origin` is not either, so the
+    // document sits on an opaque origin and cannot reach this page, its storage or its cookies.
+    frame.setAttribute("sandbox", "");
+    // A panel that does load an image is not to say which page it was loaded from.
+    frame.setAttribute("referrerpolicy", "no-referrer");
+    section.append(heading, frame);
+    panelList.append(section);
+    element = { section, heading, frame };
+    panels.set(name, element);
+  }
+  element.heading.textContent = panel.title;
+  element.frame.title = `${panel.title} のパネル`;
+  const rendered = panelDocument(panel.html);
+  // Writing `srcdoc` reloads the frame whatever it is written with, so the same panel is left
+  // alone rather than reloaded on every keystroke that reaches here.
+  if (element.frame.srcdoc !== rendered) {
+    element.frame.srcdoc = rendered;
+  }
+}
+
+/** Takes the panel a plugin no longer has off the page. */
+function closePanel(name) {
+  panels.get(name)?.section.remove();
+  panels.delete(name);
+}
+
+/**
+ * The document a panel's HTML is drawn as: what the plugin returned, in a page of the host's own.
+ *
+ * The frame is sandboxed, so this is styling rather than safety — a sandboxed frame is on an
+ * opaque origin and inherits nothing of this page, down to the dark colour scheme, and a panel
+ * left to the browser's defaults would be a white rectangle in a dark page.
+ *
+ * The one line that is not styling is the policy. The sandbox stops the document from running
+ * anything; it does not stop it from fetching, and untrusted markup is a thing that fetches:
+ * `default-src 'none'` is what keeps a panel from reaching the network at all. Images are the
+ * exception, because a Markdown file that shows one is the point of previewing it.
+ */
+function panelDocument(html) {
+  return `<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https:;">
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0;
+    padding: 12px 16px;
+    background: #12141a;
+    color: #d8dee9;
+    font-family: system-ui, sans-serif;
+    font-size: 13px;
+    line-height: 1.7;
+  }
+  h1, h2, h3, h4, h5, h6 { font-size: 15px; line-height: 1.4; }
+  a { color: #5c9cf5; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  pre { padding: 8px 12px; border-radius: 4px; background: #171a21; overflow-x: auto; }
+  img { max-width: 100%; }
+  table { border-collapse: collapse; }
+  th, td { padding: 4px 8px; border: 1px solid #2b303b; }
+  blockquote { margin: 0; padding-left: 12px; border-left: 2px solid #2b303b; color: #6a7383; }
+</style>
+</head>
+<body>${html}</body>
+</html>`;
+}
+
+/**
  * Fetches the transpiled plugins and registers what they publish, which is the browser's half of
  * what `Plugin::from_file` and `list_commands` do natively.
  */
@@ -626,6 +758,9 @@ async function startPlugins() {
   if (failures.length > 0) {
     reportPlugin(`読み込めないプラグインがあります: ${failures.join(" / ")}`);
   }
+  // The panels a plugin has for the buffer that is already on screen. This is the "when the host
+  // opens the panel" half of what `render` is called for; the other half is the buffer changing.
+  refreshPanels();
 }
 
 /**
@@ -699,6 +834,9 @@ function loadText(text, name = "") {
   draw({ full: true });
   // A fresh editor is in Normal mode, whatever the one it replaced was in.
   syncImeFocus();
+  // Another buffer under another name, which is a different answer to `render`: the panel a
+  // plugin had for the buffer that was here may be gone, and one it had none for may now be open.
+  refreshPanels();
   return highlighted;
 }
 
@@ -1520,6 +1658,16 @@ window.wimDemo = {
     plugin: {
       /** What running a plugin command last did, which is where its message or its error lands. */
       status: pluginStatus.textContent,
+      /**
+       * The panels on screen, in the order they were opened. A plugin that answered `none` has
+       * none here, which is what a closed panel is.
+       */
+      panels: [...panels].map(([plugin, { heading, frame }]) => ({
+        plugin,
+        title: heading.textContent,
+        /** The document the frame holds, which is the plugin's HTML inside the host's page. */
+        srcdoc: frame.srcdoc,
+      })),
     },
     autocmd: {
       /** What the handlers the last batch of keys ran did, one entry each. */

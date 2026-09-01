@@ -78,14 +78,14 @@ jobs:
           workspaces: |
             .
             plugins
-      # The generated bindings compile on the host target, so the ABI and the sample are checked
+      # The generated bindings compile on the host target, so the ABI and the plugins are checked
       # here the same way they are locally.
       - run: make check-plugins
       - run: make build-plugins
-      # The one place the two halves of the ABI meet: the component built just above is loaded by
-      # the native host and run. This is the only job that builds the component, so it is the
-      # only one where those tests do anything; in the `test` job they step aside for want of a
-      # component, the way they do on a machine that cannot build one.
+      # The one place the two halves of the ABI meet: the components built just above are loaded
+      # by the native host and run. This is the only job that builds them, so it is the only one
+      # where those tests do anything; in the `test` job they step aside for want of a component,
+      # the way they do on a machine that cannot build one.
       - run: make test-plugin-host
 
   browser-e2e:
@@ -99,8 +99,8 @@ jobs:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          # The plugin the demo loads is built out of its own workspace, the way the `plugins`
-          # job builds it.
+          # The plugins the demo loads are built out of their own workspace, the way the
+          # `plugins` job builds them.
           workspaces: |
             .
             plugins
@@ -116,16 +116,17 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      # Installs the node packages, builds the sample plugin and transpiles it into the module
-      # the demo imports. Nothing it writes is committed, so the demo gets a plugin here rather
-      # than out of the tree.
+      # Installs the node packages, builds the first-party plugins and transpiles them into the
+      # modules the demo imports. Nothing it writes is committed, so the demo gets its plugins
+      # here rather than out of the tree.
       - run: make build-web-plugins
       - run: npx playwright install --with-deps chromium
         working-directory: web
       - run: npx playwright test
         working-directory: web
         env:
-          # The very component the step above transpiled, so that the run puts one `.wasm`
-          # through both hosts. The path is `HELLO_WIM` in the Makefile; the run fails rather
-          # than skipping when it names no file.
+          # The very components the step above transpiled, so that the run puts one `.wasm` of
+          # each through both hosts. The paths are `HELLO_WIM` and `MARKDOWN_PREVIEW` in the
+          # Makefile; the run fails rather than skipping when one of them names no file.
           WIM_PLUGIN_WASM: ${{ github.workspace }}/plugins/target/wasm32-unknown-unknown/release/hello_wim.component.wasm
+          WIM_MARKDOWN_PREVIEW_WASM: ${{ github.workspace }}/plugins/target/wasm32-unknown-unknown/release/markdown_preview.component.wasm
