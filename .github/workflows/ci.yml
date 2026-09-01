@@ -67,6 +67,9 @@ jobs:
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --version "$(bash scripts/wasm-bindgen-version.sh)" --locked
       - run: make build-web
+      # The file-access run starts this binary over a directory of its own and drives the demo
+      # against it, so the daemon has to be built before the browser is.
+      - run: cargo build -p wim
       - uses: actions/setup-node@v4
         with:
           node-version: 22
