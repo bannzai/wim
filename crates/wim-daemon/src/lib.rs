@@ -68,8 +68,10 @@ struct Shared {
 impl Daemon {
     /// Takes `addr` and anchors the daemon at `root`.
     ///
-    /// The root is resolved once, here, so that a path a request names is compared against a
-    /// directory that holds no symlink of its own.
+    /// The root is resolved and opened once, here, and every path a request names afterwards is
+    /// opened relative to what that left open, so that no name a request carries is looked up in
+    /// the file system this process was started in
+    /// (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
     pub async fn bind(addr: SocketAddr, root: impl AsRef<Path>) -> io::Result<Self> {
         let root = Root::new(root).await?;
         let listener = TcpListener::bind(addr).await?;

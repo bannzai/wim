@@ -22,6 +22,14 @@ wim-protocol = { path = "crates/wim-protocol", version = "0.0.0" }
 wim-daemon = { path = "crates/wim-daemon", version = "0.0.0" }
 wim-plugin-host = { path = "crates/wim-plugin-host", version = "0.0.0" }
 ropey = "1.6"
+# The daemon's confinement: a directory handle every path under the root is opened relative to,
+# rather than a canonicalized path compared against the root
+# (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+cap-std = "4.0"
+# `OpenOptions::follow`, which cap-std keeps out of its own API because `std` has nothing like it.
+# The in-place write of `fs.write` needs it: what it opens has to be the file itself and never a
+# link left at its name (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+cap-fs-ext = "4.0"
 # Pinned rather than left to a caret range, the way `wit-bindgen` is in plugins/Cargo.toml: the
 # host bindings this generates are the other half of the ABI, and wasmtime's component API still
 # moves between majors.

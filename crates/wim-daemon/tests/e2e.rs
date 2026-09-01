@@ -70,6 +70,11 @@ impl Fixture {
         let directory = TempDir::new().expect("a temporary directory should be available");
         let root = directory.path().join("root");
         std::fs::create_dir(&root).expect("the root should be created");
+        // Resolved, because an absolute path a request names is confined by the root's own name:
+        // a temporary directory reached through a link — `/var` on macOS — is a path the daemon
+        // does not serve under the name it was made with
+        // (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+        let root = std::fs::canonicalize(&root).expect("the root should resolve");
         std::fs::write(directory.path().join("secret.md"), "secret\n")
             .expect("the file should be written");
         for (path, content) in files {
@@ -604,6 +609,44 @@ async fn a_path_inside_the_root_is_served_however_it_is_written() {
             .await;
         assert_eq!(read.content, "fn main() {}\n", "{path}");
     }
+}
+
+/// A link under the root is followed for as long as it stays under it, and refused where it leads
+/// out with the answer a path that leaves the root lexically gets. The refusal is now the open's
+/// rather than a check taken before it, and this is what fixes that the client cannot tell
+/// (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_is_read_through_inside_the_root_and_refused_where_it_leads_out_of_it() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    // Relative, because what an absolute link target names is a path in the file system the daemon
+    // was started in rather than one under the root.
+    std::os::unix::fs::symlink("notes.txt", fixture.root.join("inside.txt"))
+        .expect("the link should be created");
+    std::os::unix::fs::symlink(
+        fixture.outside("secret.md"),
+        fixture.root.join("outside.txt"),
+    )
+    .expect("the link should be created");
+    let mut client = Client::authenticated(&fixture).await;
+
+    let read: FsReadResult = client
+        .ok(Method::FsRead(FsReadParams {
+            path: "inside.txt".to_owned(),
+        }))
+        .await;
+    assert_eq!(read.content, "hello\n");
+
+    let error = client
+        .err(Method::FsRead(FsReadParams {
+            path: "outside.txt".to_owned(),
+        }))
+        .await;
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert_eq!(
+        error.message,
+        "outside.txt: outside the directory this daemon serves"
+    );
 }
 
 #[tokio::test]
