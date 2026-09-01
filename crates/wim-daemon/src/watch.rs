@@ -2,13 +2,48 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::fs;
+use tokio::sync::Notify;
+use tokio::sync::mpsc::Sender;
+use tokio::time::{Instant, timeout_at};
 use tokio_tungstenite::tungstenite::Message;
 use wim_protocol::{ErrorCode, Event, FsChangeKind, FsChangedParams, ResponseError, ServerPush};
 
 use crate::io_error;
+use crate::root::{RESERVED_PREFIX, names_reserved};
+
+/// How many watches one connection may hold at a time.
+///
+/// Every watch is a watcher of its own — an FSEvents stream, an inotify descriptor, a thread — so
+/// a client that never drops one could take the operating system's supply of them. What an editor
+/// holds is a watch per open file and one per working directory, which is one or two digits, so
+/// this is far above what a session uses and far below what a machine minds
+/// (`documents/adr/0002-daemon-watch-and-staging-robustness.md`).
+const WATCH_LIMIT: usize = 64;
+
+/// How long a watch probes for readiness before it answers anyway.
+///
+/// inotify and ReadDirectoryChangesW report from the moment they are registered and FSEvents is
+/// sub-second behind at worst, so a watch that has not seen a probe by now is on a machine where
+/// events arrive late rather than one where they never arrive: the watch is answered as it is, and
+/// what it reports comes late too (`documents/adr/0002-daemon-watch-and-staging-robustness.md`).
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long one probe is waited for before another is made.
+///
+/// A backend that is not watching yet reports nothing about the probe made in front of it and
+/// never will, so readiness is found by probing again rather than by waiting longer; the interval
+/// is what a run that is already watching pays, and short enough not to be felt while opening a
+/// file.
+const PROBE_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How many random bytes a probe name is made of. 64 bits, so that two watches starting at once
+/// probe through files of their own rather than through one another's.
+const PROBE_BYTES: usize = 8;
 
 /// The watches of one connection, each holding the watcher that feeds it.
 ///
@@ -28,14 +63,30 @@ impl Watches {
     /// `requested` is the path as the client wrote it, so that an error names what it asked for;
     /// `path` is that path resolved under the root, and `directory` says which of the two kinds of
     /// watch it is. `recursive` is a directory's alone: a file has nothing below it.
-    pub(crate) fn start(
+    ///
+    /// It answers only once the watch is live, so that a change made after it is one the client is
+    /// told about. `overflowed` is what says the connection has to end: a client that stops
+    /// reading fills the outbox, and a watch that then dropped what it could not push would leave
+    /// the client holding a file it believes is current (`documents/adr/0002-daemon-watch-and-
+    /// staging-robustness.md`).
+    pub(crate) async fn start(
         &mut self,
         requested: &str,
         path: &Path,
         recursive: bool,
         directory: bool,
-        outgoing: &UnboundedSender<Message>,
+        outgoing: &Sender<Message>,
+        overflowed: &Arc<Notify>,
     ) -> Result<u64, ResponseError> {
+        if self.watchers.len() >= WATCH_LIMIT {
+            return Err(ResponseError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "{requested}: this connection holds {WATCH_LIMIT} watches, which is as many as \
+                     it may; drop one with fs.unwatch"
+                ),
+            ));
+        }
         // What the backends watch is directories: macOS reports nothing at all for a stream opened
         // on a file. Watching a file is therefore watching the directory holding it, and reporting
         // only what happens to the file itself.
@@ -51,7 +102,12 @@ impl Watches {
             (parent, Some(path.to_path_buf()))
         };
         let watch_id = self.next_id + 1;
+        let probe = target.join(probe_name());
+        let observed = Arc::new(Notify::new());
         let outgoing = outgoing.clone();
+        let overflowed = Arc::clone(overflowed);
+        let seen = Arc::clone(&observed);
+        let probed = probe.clone();
         let mut watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                 // A watch that fails mid-flight has nothing in the protocol to report it with, and
@@ -60,6 +116,16 @@ impl Watches {
                     return;
                 };
                 for (path, kind) in changes(event) {
+                    // The probe is looked for ahead of the filters the client's watch is made of,
+                    // both of which would drop it: it is in the reserved namespace, and a file
+                    // watch reports one path that is not this one.
+                    if path == probed {
+                        seen.notify_one();
+                        continue;
+                    }
+                    if names_reserved(&path) {
+                        continue;
+                    }
                     if only.as_ref().is_some_and(|only| only != &path) {
                         continue;
                     }
@@ -69,8 +135,13 @@ impl Watches {
                         kind,
                     }));
                     let push = serde_json::to_string(&push).expect("a push should serialize");
-                    // The connection may already be gone, and its watches go with it.
-                    let _ = outgoing.send(Message::text(push));
+                    // The backend runs this on a thread of its own that must not be left waiting on
+                    // a client, so a full outbox is not waited out: the connection is ended, and
+                    // the client reconnects and reads again.
+                    if outgoing.try_send(Message::text(push)).is_err() {
+                        overflowed.notify_one();
+                        return;
+                    }
                 }
             })
             .map_err(|error| watch_error(requested, error))?;
@@ -84,6 +155,7 @@ impl Watches {
             .map_err(|error| watch_error(requested, error))?;
         self.watchers.insert(watch_id, watcher);
         self.next_id = watch_id;
+        wait_until_watching(&probe, &observed).await;
         Ok(watch_id)
     }
 
@@ -94,6 +166,63 @@ impl Watches {
     pub(crate) fn stop(&mut self, watch_id: u64) {
         self.watchers.remove(&watch_id);
     }
+}
+
+/// Makes changes a fresh watch already knows about until it is told about one.
+///
+/// A backend answers that it is watching before it is: on macOS the changes made in the window
+/// right after an FSEvents stream starts are reported by nobody, so a probe made in that window is
+/// not late — it is gone. Probing again is therefore what finds the moment the watch became live,
+/// and seeing one come back is what turns the answer to `fs.watch` into a promise that the changes
+/// after it are reported.
+///
+/// Best effort, and both of the ways it gives up are deliberate: a directory that cannot be
+/// written in is a directory worth watching all the same, and a window wider than [`PROBE_TIMEOUT`]
+/// costs the promise rather than the watch.
+async fn wait_until_watching(probe: &Path, observed: &Notify) {
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        // Waited on from before the probe is made, so that an event that arrives while it is still
+        // being made is one this waits out rather than one it waits for.
+        let notified = observed.notified();
+        if !probe_once(probe).await {
+            return;
+        }
+        let round = (Instant::now() + PROBE_INTERVAL).min(deadline);
+        if timeout_at(round, notified).await.is_ok() || round == deadline {
+            return;
+        }
+    }
+}
+
+/// Makes one probe under `probe`, and says whether it could be made at all.
+async fn probe_once(probe: &Path) -> bool {
+    // `create_new`, so that the name is this probe's own: a file another process left there —
+    // a symlink pointing out of the root — is a probe that is skipped, not one written through.
+    let created = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(probe)
+        .await;
+    let Ok(file) = created else {
+        return false;
+    };
+    drop(file);
+    fs::remove_file(probe).await.is_ok()
+}
+
+/// A name for one watch's probe.
+///
+/// Under the daemon's reserved prefix, so that the client neither sees the probe nor can plant a
+/// file at its name.
+///
+/// Not idempotent, and has to be: two watches starting at once must not probe through one file,
+/// where the first probe's removal would answer for the second's readiness.
+fn probe_name() -> String {
+    let mut bytes = [0u8; PROBE_BYTES];
+    getrandom::fill(&mut bytes).expect("the operating system should have a random generator");
+    let probe: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("{RESERVED_PREFIX}probe-{probe}")
 }
 
 /// What one event reports, path by path, and nothing at all for an event the protocol does not
@@ -236,5 +365,13 @@ mod tests {
         );
         assert_eq!(error.code, ErrorCode::NotFound);
         assert!(error.message.starts_with("nowhere: "), "{}", error.message);
+    }
+
+    #[test]
+    fn a_probe_is_named_out_of_the_clients_reach_and_no_two_of_them_match() {
+        let one = probe_name();
+        let other = probe_name();
+        assert!(names_reserved(Path::new(&one)), "{one}");
+        assert_ne!(one, other);
     }
 }
