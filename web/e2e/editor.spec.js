@@ -97,17 +97,21 @@ async function ime(page) {
   };
 }
 
-/** The overlay the composition is drawn in, as `{ text, visible, left, top }`. */
-function overlayOf(page) {
-  return page.evaluate(() => {
-    const preedit = document.querySelector("#preedit");
-    return {
-      text: preedit.textContent,
-      visible: !preedit.hidden,
-      left: Number.parseFloat(preedit.style.left),
-      top: Number.parseFloat(preedit.style.top),
-    };
-  });
+/**
+ * What the demo is composing and where it draws it, as `{ text, visible, left, top }`.
+ *
+ * The composition is drawn into the row the cursor is on rather than into an element of its own,
+ * so where it starts is the cursor the demo reports. That it reaches the pixels there is what
+ * "a composition pushes the rest of the line right instead of hiding it" checks.
+ */
+async function preeditOf(page) {
+  const state = await page.evaluate(() => window.wimDemo.state());
+  return {
+    text: state.ime.composition,
+    visible: state.ime.composition !== "",
+    left: state.ime.cursor.x,
+    top: state.ime.cursor.y,
+  };
 }
 
 test.beforeEach(async ({ page }) => {
@@ -215,7 +219,7 @@ test("AltGr and Option type their character rather than a shortcut", async ({ pa
   expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe(`@€${FIRST_LINE}`);
 });
 
-test("a composition is an overlay until the IME confirms it", async ({ page }) => {
+test("a composition is drawn into the row until the IME confirms it", async ({ page }) => {
   await page.keyboard.press("i");
   expect(await page.evaluate(() => window.wimDemo.state().ime.focused)).toBe(true);
 
@@ -228,12 +232,12 @@ test("a composition is an overlay until the IME confirms it", async ({ page }) =
   expect(composing.lines[0]).toBe(FIRST_LINE);
   expect(composing.cursor).toEqual({ line: 0, col: 0 });
 
-  const overlay = await overlayOf(page);
-  expect(overlay).toMatchObject({ text: "にほんご", visible: true });
+  const preedit = await preeditOf(page);
+  expect(preedit).toMatchObject({ text: "にほんご", visible: true });
   // Drawn where the cursor is, which on the first column of the first line is the top left of
   // the text area.
-  expect(overlay.left).toBeCloseTo(composing.layout.textLeft);
-  expect(overlay.top).toBe(composing.layout.padding);
+  expect(preedit.left).toBeCloseTo(composing.layout.textLeft);
+  expect(preedit.top).toBe(composing.layout.padding);
 
   await composer.commit("日本語");
 
@@ -247,7 +251,50 @@ test("a composition is an overlay until the IME confirms it", async ({ page }) =
     committed.layout.textLeft + 6 * committed.layout.cellWidth,
   );
   expect(committed.ime.composition).toBe("");
-  expect(await overlayOf(page)).toMatchObject({ visible: false });
+  expect(await preeditOf(page)).toMatchObject({ visible: false });
+});
+
+test("a composition pushes the rest of the line right instead of hiding it", async ({ page }) => {
+  await page.evaluate(() => window.wimDemo.load("ABC"));
+  await page.keyboard.press("i");
+  const canvas = page.locator("#screen");
+
+  // `にほん` is three full-width graphemes, so six cells: composing it at column zero moves `BC`
+  // — the suffix past the character the caret sits on — from the second cell to the eighth.
+  const suffixArea = (state) =>
+    rowArea(
+      state,
+      0,
+      state.layout.textLeft + 7 * state.layout.cellWidth,
+      2 * state.layout.cellWidth,
+    );
+
+  const before = await page.evaluate(() => window.wimDemo.state());
+  const empty = await pixelsIn(page, suffixArea(before));
+  expect(empty.filter((pixel) => !isColour(pixel, BACKGROUND))).toHaveLength(0);
+  const plain = await canvas.evaluate((element) => element.toDataURL());
+
+  const composer = await ime(page);
+  await composer.compose("にほん");
+
+  const composing = await page.evaluate(() => window.wimDemo.state());
+  // None of it is confirmed, so the line the core holds is still the one it started with.
+  expect(composing.lines[0]).toBe("ABC");
+  const suffix = await pixelsIn(page, suffixArea(composing));
+  expect(suffix.filter((pixel) => !isColour(pixel, BACKGROUND)).length).toBeGreaterThan(0);
+
+  // What is being composed is underlined, in the colour the cursor is drawn in, over the six
+  // cells it occupies.
+  const preedit = await pixelsIn(
+    page,
+    rowArea(composing, 0, composing.layout.textLeft, 6 * composing.layout.cellWidth),
+  );
+  expect(preedit.filter((pixel) => isColour(pixel, CURSOR)).length).toBeGreaterThan(0);
+
+  // A composition the IME drops takes the row back to the pixels it had before it opened.
+  await composer.cancel();
+  expect(await page.evaluate(() => window.wimDemo.state().ime.composition)).toBe("");
+  expect(await canvas.evaluate((element) => element.toDataURL())).toBe(plain);
 });
 
 test("Normal mode has nothing for an IME to compose into", async ({ page }) => {
@@ -261,7 +308,7 @@ test("Normal mode has nothing for an IME to compose into", async ({ page }) => {
   expect(state.lines[0]).toBe(FIRST_LINE);
   expect(state.mode).toBe("NORMAL");
   expect(state.ime.composition).toBe("");
-  expect(await overlayOf(page)).toMatchObject({ visible: false });
+  expect(await preeditOf(page)).toMatchObject({ visible: false });
 
   // Keys are still read as commands rather than as text to compose.
   await page.keyboard.press("x");
@@ -294,7 +341,7 @@ test("Esc belongs to the IME while it is composing", async ({ page }) => {
   expect(dropped.mode).toBe("INSERT");
   expect(dropped.ime.composition).toBe("");
   expect(dropped.lines[0]).toBe(FIRST_LINE);
-  expect(await overlayOf(page)).toMatchObject({ visible: false });
+  expect(await preeditOf(page)).toMatchObject({ visible: false });
 
   // With the composition gone the next Esc is the editor's again, and the mode it leaves behind
   // takes keys as commands.
@@ -305,6 +352,28 @@ test("Esc belongs to the IME while it is composing", async ({ page }) => {
 
   await page.keyboard.press("x");
   expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe(FIRST_LINE.slice(1));
+});
+
+test("the key code an IME is still processing stays with it", async ({ page }) => {
+  await page.keyboard.press("i");
+  const before = await page.evaluate(() => window.wimDemo.state().lines);
+
+  // Safari confirms a composition with a keydown that says `isComposing` is false and carries
+  // only the reserved key code 229 to say the IME is handling it. Taking that Enter would split
+  // the line under the text the IME is about to hand over.
+  for (const key of ["Enter", "Escape", "Backspace", "Process"]) {
+    expect(await dispatchKey(page, { key, keyCode: 229 })).toBe(false);
+  }
+
+  const state = await page.evaluate(() => window.wimDemo.state());
+  expect(state.mode).toBe("INSERT");
+  expect(state.lines).toEqual(before);
+  expect(state.cursor).toEqual({ line: 0, col: 0 });
+
+  // A key that carries its own code is the editor's, so the guard costs nothing outside a
+  // composition: this Esc leaves Insert mode.
+  expect(await dispatchKey(page, { key: "Escape", keyCode: 27 })).toBe(true);
+  expect(await page.evaluate(() => window.wimDemo.state().mode)).toBe("NORMAL");
 });
 
 test("the command line takes composed text too", async ({ page }) => {
@@ -321,10 +390,10 @@ test("the command line takes composed text too", async ({ page }) => {
   expect(composing.commandLine).toBe(":w ");
   // The command line is typed into the status line, so that is where the composition is drawn:
   // under every row of the buffer, three cells along for the `:w ` already typed.
-  const overlay = await overlayOf(page);
-  expect(overlay).toMatchObject({ text: "めも", visible: true });
-  expect(overlay.left).toBeCloseTo(composing.layout.padding + 3 * composing.layout.cellWidth);
-  expect(overlay.top).toBeGreaterThanOrEqual(
+  const preedit = await preeditOf(page);
+  expect(preedit).toMatchObject({ text: "めも", visible: true });
+  expect(preedit.left).toBeCloseTo(composing.layout.padding + 3 * composing.layout.cellWidth);
+  expect(preedit.top).toBeGreaterThanOrEqual(
     composing.layout.padding + composing.viewport.rows * composing.layout.lineHeight,
   );
 

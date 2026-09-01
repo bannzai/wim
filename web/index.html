@@ -44,8 +44,8 @@
         border-radius: 6px;
       }
 
-      /* The box the IME's two elements are positioned inside, so that the pixel offsets
-         `main.js` measures on the canvas are the ones they are placed at. */
+      /* The box the textarea an IME composes into is positioned inside, so that the pixel
+         offsets `main.js` measures on the canvas are the ones it is placed at. */
       .screen {
         position: relative;
         max-width: 880px;
@@ -66,22 +66,10 @@
         resize: none;
         overflow: hidden;
         opacity: 0;
-        /* What is being composed is drawn by #preedit, so the textarea's own copy of it is
+        /* What is being composed is drawn on the canvas, so the textarea's own copy of it is
            never seen even where the element itself shows through. */
         color: transparent;
         background: transparent;
-      }
-
-      /* The composed text, drawn over the canvas at the cursor until the IME confirms it. The
-         font is set from `main.js`, which owns the size the canvas is drawn at. */
-      #preedit {
-        position: absolute;
-        white-space: pre;
-        pointer-events: none;
-        background: var(--background);
-        color: var(--foreground);
-        /* Vim, and every IME's own inline mode, underlines what is not confirmed yet. */
-        text-decoration: underline;
       }
 
       a {
@@ -173,7 +161,6 @@
           autocorrect="off"
           spellcheck="false"
         ></textarea>
-        <div id="preedit" hidden></div>
       </div>
       <section id="file-access">
         <p>

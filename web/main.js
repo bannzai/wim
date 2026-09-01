@@ -36,6 +36,13 @@ const COLORS = {
 const NUMBER_DIGITS = 3;
 
 /**
+ * Thickness in CSS pixels of the line drawn under an unconfirmed composition. Two pixels is the
+ * thinnest that stays visible on a display with one device pixel per CSS pixel and still clears
+ * the descenders of a 16px font on a 22px row.
+ */
+const PREEDIT_UNDERLINE = 2;
+
+/**
  * Side of the glyph atlas in device pixels. 1024 holds around a thousand cells of this font
  * size, which is more than the glyphs one page of text uses; a buffer that outgrows it rebakes
  * from the top left.
@@ -52,9 +59,6 @@ const context = canvas.getContext("2d");
 
 /** The textarea an IME composes into, which is focused only in the modes whose keys are text. */
 const imeInput = document.querySelector("#ime");
-
-/** The overlay the composition is drawn in, over the canvas at the cursor. */
-const preedit = document.querySelector("#preedit");
 
 /** The form that opens a file through a daemon, and the fields naming which one. */
 const daemonForm = document.querySelector("#daemon-form");
@@ -149,7 +153,13 @@ function keyNotation(event) {
   // included: Enter and Esc confirm and abandon what is being composed, and Backspace edits it.
   // Taking any of them here would type the raw key, or leave Insert mode with a composition
   // still open in the textarea. What is composed reaches the editor on `compositionend`.
-  if (event.isComposing) {
+  //
+  // Safari raises the keydown that confirms a composition — Enter, most of the time — with
+  // `isComposing` already false and `compositionend` not yet fired, and the only thing left
+  // marking it is the key code 229 that UI Events reserves for a key the IME is processing
+  // (https://www.w3.org/TR/uievents/#determine-keydown-keyup-keyCode). Reading that one as
+  // `<CR>` would split the line or run the Ex command while the IME is still committing.
+  if (event.isComposing || event.keyCode === 229) {
     return null;
   }
   switch (event.key) {
@@ -388,21 +398,38 @@ function cursorPoint() {
 }
 
 /**
- * Draws the composition over the canvas at the cursor, and moves the textarea under it.
- *
- * The composition is not the editor's text until the IME confirms it, so it is drawn as an
- * overlay rather than pushed through the core and taken back out again. The textarea follows
- * the cursor because the candidate window the IME opens is placed against the element it is
- * composing into.
+ * Moves the textarea an IME composes into under the cursor, because the candidate window the IME
+ * opens is placed against the element it is composing into.
  */
-function drawComposition() {
+function placeImeInput() {
   const point = cursorPoint();
   imeInput.style.left = `${point.x}px`;
   imeInput.style.top = `${point.y}px`;
-  preedit.style.left = `${point.x}px`;
-  preedit.style.top = `${point.y}px`;
-  preedit.textContent = composition;
-  preedit.hidden = composition === "";
+}
+
+/**
+ * The cells of what an IME is composing into a buffer line, empty when there is no composition
+ * to draw there.
+ *
+ * The composition is not the editor's text until the IME confirms it, so it never goes through
+ * the core: it is spliced into the row the cursor is on at drawing time and taken back out when
+ * the IME is done. Command-line mode composes into the status line instead, which is drawn from
+ * `statusText` rather than from a buffer line.
+ */
+function composingCells() {
+  if (composition === "" || editor.command_line() !== undefined) {
+    return [];
+  }
+  return cellsOf(composition);
+}
+
+/**
+ * Underlines `width` CSS pixels of the row starting at `top`, which is how Vim and an IME's own
+ * inline mode mark the text that is not confirmed yet.
+ */
+function drawPreeditUnderline(left, top, width) {
+  context.fillStyle = COLORS.cursor;
+  context.fillRect(left, top + LINE_HEIGHT - PREEDIT_UNDERLINE, width, PREEDIT_UNDERLINE);
 }
 
 function statusText() {
@@ -504,9 +531,8 @@ function drawCells(cells, x, y, color) {
   }
 }
 
-/** Draws the cursor under the text, so that the character it sits on stays readable. */
-function drawCursor(cells, top) {
-  const col = editor.cursor_col();
+/** Draws the cursor on column `col` of `cells`, under the text so the character stays readable. */
+function drawCursor(cells, col, top) {
   // A cell past the end of the line is the one an empty line's cursor sits in, one wide.
   const width =
     editor.mode() === "INSERT" ? 2 : (cells[col]?.width ?? 1) * view.cellWidth;
@@ -534,16 +560,40 @@ function drawRow(line) {
   );
 
   const cells = cellsOf(editor.line(line));
-  if (line === view.cursorLine) {
-    drawCursor(cells, top);
+  if (line !== view.cursorLine) {
+    drawCells(cells, view.textLeft, top, COLORS.text);
+    return;
   }
-  drawCells(cells, view.textLeft, top, COLORS.text);
+  // A composition is drawn as part of the row rather than over it, so the text after the cursor
+  // moves right by the width of what is being composed — where it lands once the composition is
+  // confirmed — instead of sitting hidden underneath it.
+  const col = editor.cursor_col();
+  const preedit = composingCells();
+  const row = [...cells.slice(0, col), ...preedit, ...cells.slice(col)];
+  // The caret goes after what has been composed so far, which is where the next character lands.
+  drawCursor(row, col + preedit.length, top);
+  drawCells(row, view.textLeft, top, COLORS.text);
+  if (preedit.length > 0) {
+    drawPreeditUnderline(
+      view.textLeft + cellsWidth(row.slice(0, col)),
+      top,
+      cellsWidth(preedit),
+    );
+  }
 }
 
 function drawStatusLine(top) {
   context.fillStyle = COLORS.background;
   context.fillRect(0, top, view.width, LINE_HEIGHT);
-  drawCells(cellsOf(statusText()), PADDING, top, COLORS.muted);
+  const cells = cellsOf(statusText());
+  // Command-line mode types into the status line, so a composition open over it is drawn at the
+  // end of the command line, which is where its cursor is.
+  const preedit =
+    composition !== "" && editor.command_line() !== undefined ? cellsOf(composition) : [];
+  drawCells([...cells, ...preedit], PADDING, top, COLORS.muted);
+  if (preedit.length > 0) {
+    drawPreeditUnderline(PADDING + cellsWidth(cells), top, cellsWidth(preedit));
+  }
 }
 
 /** Where the viewport starts after following the cursor, which is what keeps it on screen. */
@@ -648,17 +698,13 @@ function draw({ full = false } = {}) {
   }
   // The mode, the position and the command line change on keys that damage no text at all.
   drawStatusLine(statusTop);
-  // The overlay is a DOM element rather than pixels on the canvas, so it does not follow a
+  // The textarea is a DOM element rather than pixels on the canvas, so it does not follow a
   // cursor that moved, a viewport that scrolled or a resize on its own.
-  drawComposition();
+  placeImeInput();
 }
 
 await init();
 editor = new WimEditor(INITIAL_TEXT);
-// The overlay draws the same glyphs at the same size as the canvas, and `main.js` is where that
-// size is decided, so the two cannot drift.
-preedit.style.font = fontAt(FONT_SIZE);
-preedit.style.lineHeight = `${LINE_HEIGHT}px`;
 draw({ full: true });
 
 // Listening only once the editor exists is what keeps a key typed during the wasm fetch from
@@ -679,24 +725,25 @@ window.addEventListener("keydown", (event) => {
 
 window.addEventListener("resize", () => draw());
 
-// An IME composes into the textarea; the demo only watches, and takes the text once the IME
-// says it is confirmed. Until then what is on screen is the overlay, and the buffer is untouched
-// — which is what lets a composition be abandoned without the editor ever having heard of it.
+// An IME composes into the textarea; the demo only watches, and takes the text once the IME says
+// it is confirmed. Until then what is on screen is a row drawn with the composition spliced into
+// it, and the buffer is untouched — which is what lets a composition be abandoned without the
+// editor ever having heard of it.
 imeInput.addEventListener("compositionstart", (event) => {
   // `data` is `null` on a start that carries no text, which is every one of them here: the
   // textarea is emptied after each composition, so there is never anything to compose over.
   composition = event.data ?? "";
-  drawComposition();
+  draw();
 });
 
 imeInput.addEventListener("compositionupdate", (event) => {
   composition = event.data ?? "";
-  drawComposition();
+  draw();
 });
 
 imeInput.addEventListener("compositionend", (event) => {
   composition = "";
-  drawComposition();
+  draw();
   // The textarea is only somewhere for the IME to work in. What it is left holding is the
   // editor's now, so it goes in as keys and the textarea starts the next composition empty.
   imeInput.value = "";
@@ -756,7 +803,7 @@ window.wimDemo = {
     effects: lastOutcome.effects,
     viewport: { top: view.scrollTop, rows: view.visibleRows },
     ime: {
-      /** What an IME is composing, which the overlay shows and the buffer does not hold yet. */
+      /** What an IME is composing, which the row is drawn with and the buffer does not hold. */
       composition,
       /** Whether the textarea an IME composes into is the focused element. */
       focused: document.activeElement === imeInput,
