@@ -413,11 +413,15 @@ function carryOut(effects) {
   // A handler that rewrites the buffer replaces the editor, which starts a new outcome; what
   // this batch of keys did is the one to report, so it is put back afterwards.
   const outcome = lastOutcome;
-  let textChanged = false;
+  let renderAfter = false;
   for (const effect of effects) {
     if (effect.kind === "event") {
-      textChanged ||= effect.name === "text-changed";
-      dispatch(effect.name, effect.payload);
+      // A dispatch that ran handlers redrew the panels itself, from the buffer the handlers
+      // finally left behind; only a `text-changed` nothing was bound to still needs its render.
+      const handled = dispatch(effect.name, effect.payload);
+      if (effect.name === "text-changed" && !handled) {
+        renderAfter = true;
+      }
     }
     if (effect.kind === "save") {
       // Writing reaches a daemon or the file system, and neither answers within the key that
@@ -425,10 +429,7 @@ function carryOut(effects) {
       void save(effect.path ?? null);
     }
   }
-  if (textChanged) {
-    // The core saying the buffer changed is the other thing `render` is called for, and this is
-    // after the handlers rather than with them: a handler may edit the buffer again, and the
-    // panel is to be drawn from the buffer the keys finally left behind.
+  if (renderAfter) {
     refreshPanels();
   }
   lastOutcome = outcome;
@@ -437,11 +438,11 @@ function carryOut(effects) {
 /** Runs every autocmd bound to the event `name`, and redraws what they changed. */
 function dispatch(name, payload) {
   if (inHandler) {
-    return;
+    return false;
   }
   const bound = autocmds.filter((autocmd) => autocmd.event === name);
   if (bound.length === 0) {
-    return;
+    return false;
   }
   inHandler = true;
   try {
@@ -458,6 +459,7 @@ function dispatch(name, payload) {
   draw({ full: true });
   syncImeFocus();
   refreshPanels();
+  return true;
 }
 
 /** Runs one handler and says what it did, for the line under the list of them. */
@@ -716,15 +718,17 @@ function closePanel(name) {
  *
  * The one line that is not styling is the policy. The sandbox stops the document from running
  * anything; it does not stop it from fetching, and untrusted markup is a thing that fetches:
- * `default-src 'none'` is what keeps a panel from reaching the network at all. Images are the
- * exception, because a Markdown file that shows one is the point of previewing it.
+ * `default-src 'none'` is what keeps a panel from reaching the network at all. The one image
+ * source allowed is `data:`, which carries no request: a remote `img-src` would let a plugin
+ * encode the buffer into URLs the browser then delivers to whoever the plugin names, so a
+ * remote image in a previewed file shows as its alt text rather than being fetched.
  */
 function panelDocument(html) {
   return `<!doctype html>
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: https:;">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:;">
 <style>
   :root { color-scheme: dark; }
   body {
