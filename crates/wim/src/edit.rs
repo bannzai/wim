@@ -77,6 +77,10 @@ pub fn main(edit: Edit) -> ExitCode {
             for report in run.reports {
                 println!("{report}");
             }
+            if let Some(complaint) = run.complaint {
+                eprintln!("{PROGRAM}: {complaint}");
+                return ExitCode::FAILURE;
+            }
             if run.failed {
                 // What failed is in the report lines; the status is what a script reads.
                 eprintln!("{PROGRAM}: an autocmd failed");
@@ -91,10 +95,14 @@ pub fn main(edit: Edit) -> ExitCode {
     }
 }
 
-/// What a run left behind: what the autocmds did, and whether any of them failed.
+/// What a run left behind: what the autocmds did, and how it ended.
 struct Ran {
     reports: Vec<String>,
+    /// Whether a handler failed, which the run ends with a non-zero status for.
     failed: bool,
+    /// What the core refused a key with, `None` when every key ran. A refused key ends the run
+    /// where it stands, and the reports of the keys in front of it are still the run's to print.
+    complaint: Option<String>,
 }
 
 /// Runs the keys over the file and hands back what the autocmds did, one line each.
@@ -111,12 +119,19 @@ fn run(edit: Edit) -> Result<Ran, String> {
         .map_err(|error| format!("{}: {error}", edit.file.display()))?;
     let mut session = Session::new(&edit.file, &text, config, plugins);
     session.check_subscriptions()?;
-    if session.feed(&keys)? == Stop::Failed {
-        return Err(session.complaint.unwrap_or_default());
-    }
+    // A key the core refuses ends the run, but it does not undo the keys in front of it: a `:w`
+    // that already ran a handler and put the file where it is has to be reported, or a script
+    // reading standard output is told nothing about an autocmd that already had its way with the
+    // file. So this comes back as a run that ended badly rather than as an error with nothing in
+    // it — an error is for a run that never got as far as a key.
+    let complaint = match session.feed(&keys)? {
+        Stop::Failed => Some(session.complaint.take().unwrap_or_default()),
+        Stop::Ran | Stop::Quit => None,
+    };
     Ok(Ran {
         reports: session.reports,
         failed: session.failed,
+        complaint,
     })
 }
 
@@ -282,20 +297,23 @@ impl Session {
     }
 
     /// Types the keys of a handler at the editor and carries out what they asked for.
+    ///
+    /// Each key is carried out before the next one is typed, the way the run's own keys are: a
+    /// `:w` halfway through a handler puts the buffer as it stands at that point on the file
+    /// rather than what the keys after it went on to write, and a key the core rejects ends the
+    /// handler where it stands rather than letting the rest of the sequence edit the buffer of a
+    /// handler that is going to be reported as failed.
     fn type_keys(&mut self, keys: &[KeyEvent]) -> Result<(), String> {
-        let mut effects = Vec::new();
-        for key in keys {
-            effects.extend(self.editor.handle_key(*key));
-        }
         // A handler that left a command half-typed would leave the keys that follow it being
         // read as part of that command, the way `:norm` closes what its keys left open.
-        for _ in 0..2 {
-            effects.extend(self.editor.handle_key(KeyEvent::key(KeyCode::Esc)));
-        }
-        // A `:q` inside a handler is not the run's to end — the run is the keys the editor was
-        // given — so what comes back is only ever read for what failed.
-        if self.carry_out(effects)? == Stop::Failed {
-            return Err(self.complaint.take().unwrap_or_default());
+        let closing = [KeyEvent::key(KeyCode::Esc), KeyEvent::key(KeyCode::Esc)];
+        for key in keys.iter().chain(&closing) {
+            let effects = self.editor.handle_key(*key);
+            // A `:q` inside a handler is not the run's to end — the run is the keys the editor
+            // was given — so what comes back is only ever read for what failed.
+            if self.carry_out(effects)? == Stop::Failed {
+                return Err(self.complaint.take().unwrap_or_default());
+            }
         }
         Ok(())
     }
@@ -453,6 +471,28 @@ mod tests {
             Stop::Failed
         );
         assert!(session.complaint.is_some(), "the complaint is the core's");
+    }
+
+    #[test]
+    fn a_handler_stops_at_the_first_key_the_core_rejects() {
+        // `z` is no command of its own, and the keys behind it never reach the buffer: a handler
+        // that is going to be reported as failed leaves nothing half-done for the handlers after
+        // it to run over.
+        let mut session = session(
+            "ab\n",
+            config(
+                r#"{ "event": "text-changed", "handler": { "kind": "keys", "keys": "zA!<Esc>" } }"#,
+            ),
+        );
+        let keys = parse_keys("x").expect("keys should parse");
+        assert_eq!(
+            session.feed(&keys).expect("the run should go through"),
+            Stop::Ran
+        );
+        assert_eq!(session.editor.text(), "b\n");
+        assert!(session.failed);
+        assert_eq!(session.reports.len(), 1, "{:?}", session.reports);
+        assert!(session.reports[0].starts_with("text-changed keys failed:"));
     }
 
     #[test]

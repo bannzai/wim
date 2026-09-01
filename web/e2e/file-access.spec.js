@@ -79,10 +79,13 @@ function startDaemon(root) {
   });
 }
 
-/** The demo, once the editor behind it exists. */
+/** The demo, once the editor behind it exists and is taking keys. */
 async function openDemo(page) {
   await page.goto("/index.html");
   await page.waitForFunction(() => window.wimDemo !== undefined);
+  // The editor holds the keys it is pressed with until the autocmds are in, so that no event goes
+  // out over a config that has not been read yet (`web/main.js`).
+  await page.evaluate(() => window.wimDemo.autocmds());
 }
 
 /** The line the demo reports opening and saving on. */

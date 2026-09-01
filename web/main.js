@@ -176,6 +176,20 @@ let autocmds = [];
  */
 let inHandler = false;
 
+/**
+ * Whether the autocmds have been read and checked, which is when the editor starts taking keys.
+ *
+ * An event is reported once and never again: a `text-changed` or a `buffer-write` raised while
+ * `wim.jsonc` was still being fetched would find nothing bound, and the handler that was meant to
+ * run over it has no second chance. Replaying the events afterwards is no answer either — a
+ * `buffer-write` handler edits the buffer in front of the write, and by then the bytes are on the
+ * file — so it is the keys that wait rather than the events that catch up.
+ */
+let autocmdsBound = false;
+
+/** Keys pressed before that, which are typed in the order they arrived once it happens. */
+let pendingKeys = [];
+
 /** What the handlers of the last batch of keys did, which the E2E run reads. */
 let lastAutocmds = [];
 
@@ -334,6 +348,12 @@ function keyNotation(event) {
 }
 
 function handleKeys(keys) {
+  if (!autocmdsBound) {
+    // Held rather than dropped: what someone typed is theirs, and the buffer they go on to see is
+    // the one every key they pressed was typed into.
+    pendingKeys.push(keys);
+    return lastOutcome;
+  }
   const invocation = pluginInvocation(keys);
   if (invocation !== null) {
     // The core has no `:upcase`, and letting it read the line would answer with its own "not an
@@ -534,19 +554,20 @@ function pluginInvocation(keys) {
  * the ABI lets a plugin touch (`wit/README.md`): the edit is applied here, by the host.
  */
 function runPlugin({ command, args }) {
-  let edit;
   try {
-    edit = command.run(args, {
+    // Applying the edit is inside the same `try` as the call that answered with it: an edit the
+    // host cannot carry out — a range that is not in the buffer — is the plugin's failure just
+    // as a refusal is, and `wim plugin run` reports the two the same way.
+    const edit = command.run(args, {
       name: bufferName,
       text: editor.text(),
       cursor: { line: editor.cursor_line(), column: editor.cursor_col() },
     });
+    reportPlugin(`:${command.name}: ${applyEdit(edit)}`);
   } catch (error) {
     // What the plugin refuses arrives as the `result<edit, string>` error half, in its wording.
     reportPlugin(`:${command.name} が失敗しました: ${error.message}`);
-    return;
   }
-  reportPlugin(`:${command.name}: ${applyEdit(edit)}`);
 }
 
 /** Carries out one `edit` of the ABI and says what it did (`wit/plugin.wit`). */
@@ -564,7 +585,11 @@ function applyEdit(edit) {
       const lines = text === "" ? [""] : text.split(/(?<=\n)/);
       const { start, end } = edit.val;
       if (start > end || end > lines.length) {
-        return `${start}..${end} 行は ${lines.length} 行のバッファにありません`;
+        // A range the buffer has no such lines for is refused rather than carried out, which is
+        // what `plugin::apply` does with the same edit natively (`crates/wim/src/plugin.rs`).
+        // Answering with the complaint as though it were a message would leave the handler that
+        // asked for it reported as one that ran.
+        throw new Error(`${start}..${end} 行は ${lines.length} 行のバッファにありません`);
       }
       void loadText(
         lines.slice(0, start).join("") + edit.val.text + lines.slice(end).join(""),
@@ -610,11 +635,31 @@ async function startPlugins() {
  * A handler of kind `plugin` is checked against what that plugin subscribed to once the plugins
  * are in, so that a binding which could never fire is reported where the config is read rather
  * than by never running.
+ *
+ * Nothing is bound until that check has been made. Binding first would leave an event raised
+ * while the plugins were still in the air reaching a handler over an empty `plugins`, which
+ * reports a plugin that is there as one that is not; and it would leave a binding the check goes
+ * on to refuse having already run.
  */
 async function startAutocmds() {
   const config = await loadConfig(CONFIG);
   if (config.error !== null) {
     autocmdList.textContent = `${CONFIG} を読めません: ${config.error}`;
+    return;
+  }
+  await pluginsStarted;
+  const unreachable = config.autocmds
+    .filter((autocmd) => autocmd.handler.kind === "plugin")
+    .filter(
+      (autocmd) =>
+        !plugins.get(autocmd.handler.plugin)?.subscriptions.includes(autocmd.event),
+    )
+    .map((autocmd) => `${autocmd.handler.plugin} → ${autocmd.event}`);
+  if (unreachable.length > 0) {
+    // The native host refuses the whole config over a binding it could never deliver rather than
+    // running the rest of it (`Session::check_subscriptions`), and a config one host takes and
+    // the other does not is what the two readers are written to avoid.
+    autocmdList.textContent = `${CONFIG} を読めません: 配送されない autocmd があります: ${unreachable.join(" / ")}`;
     return;
   }
   autocmds = config.autocmds;
@@ -623,17 +668,6 @@ async function startAutocmds() {
     declared.length === 0
       ? "autocmd は設定されていません"
       : `autocmd ${declared.join(" / ")}`;
-  await pluginsStarted;
-  const unreachable = autocmds
-    .filter((autocmd) => autocmd.handler.kind === "plugin")
-    .filter(
-      (autocmd) =>
-        !plugins.get(autocmd.handler.plugin)?.subscriptions.includes(autocmd.event),
-    )
-    .map((autocmd) => `${autocmd.handler.plugin} → ${autocmd.event}`);
-  if (unreachable.length > 0) {
-    reportAutocmd(`配送されない autocmd があります: ${unreachable.join(" / ")}`);
-  }
 }
 
 /** One handler, as the list of declared autocmds shows it. */
@@ -782,12 +816,28 @@ function save(path) {
   // was on screen when it was typed even when it waits for an earlier save to finish first.
   const file = openFile;
   const text = withNewline(editor.text(), file.newline);
+  // Whether a handler asked for this write is read here for the same reason: the write lands
+  // after the handler has finished and `inHandler` has gone back down, and a `buffer-write-post`
+  // handler that runs `:w` would then be run again by its own write, and again by that one's,
+  // with no end to it. Autocmds here never nest, and the native host — which writes inside the
+  // key rather than after it — suppresses the same event (`crates/wim/src/edit.rs`).
+  const askedForByHandler = inHandler;
+  // The buffer this write is of, for the same reason again: a save queued behind a slow one may
+  // land after another file has been opened or a sample loaded, and both put a new editor in
+  // place of this one. A `buffer-write-post` handler runs over the editor as it stands, so
+  // raising the event then would give the handler of the file that was saved the file that is
+  // open now to read and to edit.
+  const savedEditor = editor;
   writing = writing.then(async () => {
     // Whether a write happened is the host's to know, so `buffer-write-post` is raised here
     // rather than by the core, and only once the bytes are on the file.
-    if (await writeOut(file, path, text)) {
-      dispatch("buffer-write-post", "");
+    if (!(await writeOut(file, path, text)) || askedForByHandler) {
+      return;
     }
+    if (editor !== savedEditor) {
+      return;
+    }
+    dispatch("buffer-write-post", "");
   });
 }
 
@@ -1411,13 +1461,20 @@ if (window.showOpenFilePicker === undefined) {
 
 // The handle the E2E run drives and inspects the demo through.
 window.wimDemo = {
-  sendKeys: handleKeys,
   /**
    * Replaces the buffer, which is how the E2E run gets one taller than the viewport, under `name`
    * when it is to be highlighted as the language that name says. The answer settles once the
    * grammar has been fetched and the first highlighted frame is up.
    */
   load: loadText,
+  /**
+   * Types keys, waiting for the autocmds the way a key pressed at the page does: what a run
+   * types is never typed into a demo whose handlers are not bound yet.
+   */
+  sendKeys: async (keys) => {
+    await autocmdsStarted;
+    return handleKeys(keys);
+  },
   /** Redraws every row, which the E2E run compares the damage-driven redraw against. */
   redraw: () => draw({ full: true }),
   /**
@@ -1484,3 +1541,12 @@ window.wimDemo = {
     },
   }),
 };
+
+// The config has been read and its handlers checked, so an event now has somewhere to go. The
+// keys the listeners were holding go in, in the order they were pressed, and every key from here
+// on is typed as it arrives.
+await autocmdsStarted;
+autocmdsBound = true;
+for (const keys of pendingKeys.splice(0)) {
+  handleKeys(keys);
+}

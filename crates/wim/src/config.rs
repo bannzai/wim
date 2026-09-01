@@ -105,9 +105,17 @@ pub fn read(path: &Path) -> Result<Config, Error> {
 pub fn parse(text: &str) -> Result<Config, Error> {
     let value: serde_json::Value =
         jsonc_parser::parse_to_serde_value(text, &options()).map_err(Error::Syntax)?;
-    // An empty file is a config that binds nothing rather than a config that is missing: what
-    // the reader makes of one is `null`, which is not an object serde can read.
-    if value.is_null() {
+    // An empty file is a config that binds nothing rather than a config that is missing. What the
+    // reader makes of one is `null` — but it makes the same of the JSON text `null`, which is a
+    // value the schema has no place for and which the browser's reader refuses (`web/config.js`
+    // holds the config to an object). Which of the two this was is asked of the reader rather
+    // than read off the value, and only in the one case where they are told apart: a document
+    // holding no value at all is the empty file, and anything else goes on to the schema.
+    if value.is_null()
+        && jsonc_parser::parse_to_value(text, &options())
+            .map_err(Error::Syntax)?
+            .is_none()
+    {
         return Ok(Config::default());
     }
     let config: Config = serde_json::from_value(value).map_err(Error::Schema)?;
@@ -198,6 +206,19 @@ mod tests {
     }
 
     #[test]
+    fn the_json_text_null_is_not_an_empty_config() {
+        // A file holding nothing and a file holding `null` read as the same value, and only the
+        // first of them is a config. The browser's reader refuses `null` for the same reason —
+        // its schema is an object — and a config one host takes and the other does not is what
+        // both readers are written to avoid (`web/config.js`).
+        assert!(
+            matches!(parse("null"), Err(Error::Schema(_))),
+            "null is a value, not an empty file"
+        );
+        assert!(matches!(parse("// a comment\nnull"), Err(Error::Schema(_))));
+    }
+
+    #[test]
     fn an_event_nothing_raises_is_reported_where_it_is_written() {
         let error = parse(
             r#"{"autocmds": [{ "event": "BufWritePre",
@@ -234,5 +255,18 @@ mod tests {
             matches!(parse(r#"{"autocmds": [] "x": 1}"#), Err(Error::Syntax(_))),
             "a missing comma is not JSONC"
         );
+    }
+
+    #[test]
+    fn a_block_comment_that_is_never_closed_is_refused() {
+        // Reading the rest of the file as a comment would leave `{} /*` accepted as `{}`, and the
+        // browser's reader refuses the same text rather than reading it that way
+        // (`web/config.js`).
+        for text in ["{} /*", r#"{"autocmds": [] /* nothing closes this"#] {
+            assert!(
+                matches!(parse(text), Err(Error::Syntax(_))),
+                "{text} should not be a config"
+            );
+        }
     }
 }

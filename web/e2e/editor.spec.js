@@ -126,6 +126,10 @@ async function preeditOf(page) {
 test.beforeEach(async ({ page }) => {
   await page.goto("/index.html");
   await page.waitForFunction(() => window.wimDemo !== undefined);
+  // The editor holds the keys it is pressed with until the autocmds are in, so that no event goes
+  // out over a config that has not been read yet (`web/main.js`). Waiting for that is what makes
+  // a key pressed here one the editor types rather than one it queues.
+  await page.evaluate(() => window.wimDemo.autocmds());
 });
 
 test("starts in Normal mode over the initial buffer", async ({ page }) => {

@@ -24,17 +24,25 @@ const HANDLERS = { ex: "command", keys: "keys", plugin: "plugin" };
  * A demo served without a config is the normal state of one: nothing is bound, and the answer is
  * a config that binds nothing. A config that is there but cannot be read is another matter and
  * comes back as `error`, since something was meant to be bound and is not.
+ *
+ * The one failure that says there was nothing to bind is the server saying so: a 404 is a file
+ * that is not there. Everything else — a 500, a connection that never landed, a body that could
+ * not be read — is a config that may well be there and was not read, which is reported rather
+ * than passed off as a demo that binds nothing.
  */
 export async function loadConfig(url) {
   let text;
   try {
     const response = await fetch(url);
+    if (response.status === 404) {
+      return { autocmds: [], error: null };
+    }
     if (!response.ok) {
-      throw new Error(`${response.status}`);
+      throw new Error(`${response.status} が返りました`);
     }
     text = await response.text();
-  } catch {
-    return { autocmds: [], error: null };
+  } catch (error) {
+    return { autocmds: [], error: error.message };
   }
   try {
     return { autocmds: parseConfig(text), error: null };
@@ -137,7 +145,12 @@ function dropComments(text) {
     }
     if (character === "/" && text[index + 1] === "*") {
       const end = text.indexOf("*/", index + 2);
-      index = end === -1 ? text.length : end + 2;
+      if (end === -1) {
+        // Taking the rest of the file as the comment would leave `{} /*` read as `{}`, which the
+        // native reader refuses (`crates/wim/src/config.rs`).
+        throw new Error("閉じられていないブロックコメントがあります");
+      }
+      index = end + 2;
       // A block comment stood between two values, which is a place a space may stand.
       stripped += " ";
       continue;

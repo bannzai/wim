@@ -130,6 +130,50 @@ fn a_keys_handler_runs_on_a_change_and_is_not_run_by_its_own() {
 }
 
 #[test]
+fn a_write_inside_a_handler_puts_the_buffer_as_it_then_stood_on_the_file() {
+    // The `:w` is halfway through the handler's keys, so what lands on the file is the buffer as
+    // it stood when the write was asked for: the `Y` typed after it is in the buffer the run ends
+    // with and not in the bytes on disk.
+    let workspace = Workspace::new(
+        "one\n",
+        r#"{
+          "autocmds": [
+            { "event": "text-changed", "handler": { "kind": "keys", "keys": "iX<Esc>:w<CR>iY<Esc>" } }
+          ]
+        }"#,
+    );
+    let output = edit(&workspace, "x", &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(workspace.text(), "Xne\n");
+    assert_eq!(stdout(&output), "text-changed keys: iX<Esc>:w<CR>iY<Esc>\n");
+}
+
+#[test]
+fn a_write_asked_for_by_a_post_write_handler_does_not_run_that_handler_again() {
+    // `buffer-write-post` is raised by the write the keys asked for, and the handler it runs asks
+    // for a write of its own. That write happens — a `:w` inside a handler still writes — but the
+    // event it would raise is the handler's own, which autocmds here never nest on: the run
+    // settles with the handler having run once. The browser host settles the same way over its
+    // queued writes (`web/e2e/autocmd.spec.js`).
+    let workspace = Workspace::new(
+        "one\n",
+        r#"{
+          "autocmds": [
+            { "event": "buffer-write-post", "handler": { "kind": "keys", "keys": "A!<Esc>:w<CR>" } }
+          ]
+        }"#,
+    );
+    let output = edit(&workspace, ":w<CR>", &[]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "buffer-write-post keys: A!<Esc>:w<CR>\n",
+        "the handler's own write raises no post event to run it again"
+    );
+    assert_eq!(workspace.text(), "one!\n", "the handler's write landed");
+}
+
+#[test]
 fn a_config_with_no_autocmds_leaves_the_run_as_the_keys_wrote_it() {
     let workspace = Workspace::new("one\n", "{}");
     let output = edit(&workspace, "x:w<CR>", &[]);
@@ -193,6 +237,26 @@ fn a_handler_that_fails_is_reported_and_the_ones_after_it_still_run() {
         "alpha!\n",
         "the handler after it still ran"
     );
+}
+
+#[test]
+fn a_key_the_core_refuses_still_reports_the_handlers_that_already_ran() {
+    // The `z` is no command and ends the run where it stands — but the `:w` in front of it had
+    // already run its handler and put the file where it is. A script reading standard output has
+    // to be told that, or a side effect the run left behind is one it never reported.
+    let workspace = Workspace::new(
+        "one\n",
+        r#"{"autocmds": [{ "event": "buffer-write",
+                          "handler": { "kind": "keys", "keys": "A!<Esc>" } }]}"#,
+    );
+    let output = edit(&workspace, ":w<CR>z", &[]);
+    assert!(!output.status.success());
+    assert_eq!(stdout(&output), "buffer-write keys: A!<Esc>\n");
+    assert!(
+        !stderr(&output).trim().is_empty(),
+        "what the core refused is still reported"
+    );
+    assert_eq!(workspace.text(), "one!\n", "the handler's write landed");
 }
 
 #[test]
