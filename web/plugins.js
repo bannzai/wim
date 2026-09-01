@@ -40,6 +40,12 @@ const UI = "wim:plugin/ui";
  * Loads every plugin the build transpiled: the commands keyed by the name `:name` runs them
  * under, and the plugins themselves keyed by the name an autocmd names them by.
  *
+ * A name another plugin already published is refused, which is the one thing a plugin that
+ * otherwise loaded is turned away for: which of them `:name` would run is nothing either host
+ * can decide — the manifest's order here, the order the aliases sort natively
+ * (`crates/wim/src/edit.rs`) — so neither picks one. Natively that refuses the run; here it
+ * refuses the plugin, and none of its commands are registered.
+ *
  * Nothing here throws: a demo served without plugins is the normal state of a checkout that
  * cannot build components, and a plugin that fails to load is reported rather than taking the
  * rest of them down with it.
@@ -62,8 +68,20 @@ export async function loadPlugins() {
   for (const declared of manifest.plugins) {
     try {
       const { published, plugin } = await loadPlugin(declared, manifest.abi);
+      // Claimed first and registered afterwards, so that a plugin refused over its second
+      // command leaves none of its first behind: what it publishes goes in whole or not at all.
+      const claimed = new Map();
       for (const command of published) {
-        commands.set(command.name, command);
+        const taken = commands.get(command.name) ?? claimed.get(command.name);
+        if (taken !== undefined) {
+          throw new Error(
+            `${taken.plugin} publishes :${command.name} as well, and a command name is one plugin's`,
+          );
+        }
+        claimed.set(command.name, command);
+      }
+      for (const [name, command] of claimed) {
+        commands.set(name, command);
       }
       plugins.set(plugin.name, plugin);
     } catch (error) {

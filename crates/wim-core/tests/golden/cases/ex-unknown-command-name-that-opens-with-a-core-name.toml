@@ -1,0 +1,5 @@
+name = "a host's name that opens with the letters of a core command is not that command"
+input = "alpha"
+keys = ":write-json --pretty<CR>"
+expected = "alpha"
+expected_effects = ['unknown-ex-command write-json "--pretty"']

@@ -161,9 +161,10 @@ impl Plugins {
 /// `list-commands` is the ABI's registration step, so it is called once here rather than on every
 /// `:` line the core hands over (`wit/plugin.wit`): a plugin that publishes its commands only
 /// while it is starting up keeps them for the whole run, and one that traps later takes none of
-/// the other plugins' commands down with it. The plugins are asked in the order they are keyed,
-/// and a name two of them publish stays with the first that published it, which is a collision
-/// this host does not arbitrate.
+/// the other plugins' commands down with it.
+///
+/// A name two of them publish is refused here rather than arbitrated, so that no `:` line is ever
+/// run by whichever plugin an ordering happened to put first (`web/plugins.js` refuses it too).
 fn load_plugins(declared: &[String]) -> Result<Plugins, String> {
     let mut hosts = BTreeMap::new();
     for declaration in declared {
@@ -181,12 +182,32 @@ fn load_plugins(declared: &[String]) -> Result<Plugins, String> {
             .list_commands()
             .map_err(|error| format!("{plugin} cannot be asked for its commands: {error}"))?;
         for command in published {
-            commands
-                .entry(command.name)
-                .or_insert_with(|| plugin.clone());
+            publish_command(&mut commands, plugin, command.name)?;
         }
     }
     Ok(Plugins { hosts, commands })
+}
+
+/// Notes that `plugin` publishes `name`, refusing a name another loaded plugin already published.
+///
+/// Which plugin `:name` would run is nothing either host can decide: here the plugins are asked in
+/// the order their aliases sort, and the browser asks them in the order the manifest lists them
+/// (`web/plugins.js`), so keeping the first would make the same `:` line run different components
+/// in the two hosts. It is refused instead, while the plugins are loading rather than at the line
+/// that reaches one of them, and the complaint names both so that whoever wrote the two `--plugin`
+/// declarations knows which pair to take apart.
+fn publish_command(
+    commands: &mut BTreeMap<String, String>,
+    plugin: &str,
+    name: String,
+) -> Result<(), String> {
+    if let Some(published) = commands.get(&name) {
+        return Err(format!(
+            "both {published} and {plugin} publish :{name}, and a command name is one plugin's"
+        ));
+    }
+    commands.insert(name, plugin.to_owned());
+    Ok(())
 }
 
 /// One run: the buffer, the file it came from, and everything the autocmds may reach.
@@ -621,6 +642,33 @@ mod tests {
             .check_subscriptions()
             .expect_err("no plugin was loaded as nope");
         assert!(error.contains("nope"), "{error}");
+    }
+
+    #[test]
+    fn a_command_name_two_plugins_publish_is_refused_and_the_complaint_names_both() {
+        let mut commands = BTreeMap::new();
+        publish_command(&mut commands, "alpha", "upcase".to_owned())
+            .expect("the first plugin to publish it keeps it");
+        let Err(complaint) = publish_command(&mut commands, "bravo", "upcase".to_owned()) else {
+            panic!("a name two plugins publish is no one's");
+        };
+        assert!(complaint.contains("alpha"), "{complaint}");
+        assert!(complaint.contains("bravo"), "{complaint}");
+        assert!(complaint.contains(":upcase"), "{complaint}");
+        assert_eq!(
+            commands.get("upcase").map(String::as_str),
+            Some("alpha"),
+            "the run is refused rather than the name changing hands"
+        );
+    }
+
+    #[test]
+    fn names_two_plugins_do_not_share_are_published_by_each_of_them() {
+        let mut commands = BTreeMap::new();
+        publish_command(&mut commands, "alpha", "upcase".to_owned()).expect("a name of its own");
+        publish_command(&mut commands, "bravo", "downcase".to_owned()).expect("a name of its own");
+        assert_eq!(commands.get("upcase").map(String::as_str), Some("alpha"));
+        assert_eq!(commands.get("downcase").map(String::as_str), Some("bravo"));
     }
 
     #[test]
