@@ -32,18 +32,22 @@ ABI のバージョンは wit の package バージョン (`wim:plugin@0.1.0`) �
 
 ## ビルド
 
-`plugins/` は root の Cargo workspace とは別の workspace になっている。プラグインは
-wasm32-wasip2 でしかリンクできないため、root の `cargo test --workspace` /
+`plugins/` は root の Cargo workspace とは別の workspace になっている。プラグインの cdylib は
+wasm でしかリンクできないため、root の `cargo test --workspace` /
 `cargo clippy --workspace` に混ぜないための分離で、`wit-bindgen` のバージョンは
 `plugins/Cargo.toml` の `[workspace.dependencies]` で固定し `plugins/Cargo.lock` を commit する。
 
 ```sh
-make build-plugins   # wasm32-wasip2 でビルドし、成果物が component であることを確認する
+make build-plugins   # wasm32-unknown-unknown でビルドして componentize する
 make check-plugins   # ホスト target で fmt / clippy / unit test
 ```
 
-`wasm32-wasip2` はリンク時に component を直接出力するため、cargo-component や wasm-tools は
-要らない (cargo-component は上流で deprecate が進んでいる)。必要なのは rustup の target だけ。
+target は `wasm32-wasip2` ではなく `wasm32-unknown-unknown` を使う。wasip2 の std は
+wasi:io などの WASI import を component に残し、ホストのサンドボックス (WASI を import する
+component をロード時に拒否する) が自分のプラグインを弾いてしまうため。unknown-unknown の
+core module には ABI 由来の import しか残らず、pin した wasm-tools
+(`scripts/install-wasm-tools.sh` がリリースバイナリを取得) の `component new` で component に
+する (cargo-component は上流で deprecate が進んでいるため使わない)。
 
 `check-plugins` の test が `--lib` に限定されているのは、cdylib のリンクだけがホスト target で
 失敗するため。バインディングの生成とコンパイルはホスト target でも通るので、wit の型検査と
@@ -56,7 +60,7 @@ Rust など) で `.wasm` を作れないのは Phase 3 と同じで、component 
 wasmtime の `bindgen!` が同じ `wit/` から生成する。ロード時に行うことは 3 つある。
 
 - component かどうかを先頭 8 バイトで見る (`scripts/check-wasm-component.sh` と同じ判定)。
-  wasm32-wasip2 以外の wasm32 target でビルドしたプラグインは core module になる
+  componentize していないビルド成果物 (素の core module) はここで弾かれる
 - export 名 (`wim:plugin/commands@0.1.0`) が持つ ABI バージョンを見て、major.minor が
   ホストのものと違う component を拒否する。ホスト側のバージョンは `wit/plugin.wit` の
   package 行から読むので、定数として二重に持たない
@@ -70,7 +74,7 @@ wasmtime の `bindgen!` が同じ `wit/` から生成する。ロード時に行
 標準出力へ書く。Ex コマンドへの配線は Phase 4-4 の autocmd・設定と合わせて行う。
 
 ```sh
-make build-plugins      # component をビルドする (要 wasm32-wasip2)
+make build-plugins      # component をビルドする (要 wasm32-unknown-unknown)
 make test-plugin-host   # ビルドした component をホストで実際にロードして動かす
 ```
 
