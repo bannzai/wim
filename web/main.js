@@ -371,9 +371,12 @@ function handleKeys(keys) {
   // carried out before the next one is typed, the way `wim edit` types the same keys natively
   // (`crates/wim/src/edit.rs`).
   let typing = keys;
-  // One batch is one report, however many pieces the core hands it back in: the effects and the
-  // damage a test or the status line reads belong to everything that was submitted, not to the
-  // piece that happened to come last.
+  // One batch is one report, however many pieces the core hands it back in: the effects, the
+  // damage and the autocmds a test or the status line reads belong to everything that was
+  // submitted, not to the piece that happened to come last. The autocmd list is emptied here
+  // rather than in `carryOut`, which runs once per piece and would drop what the earlier
+  // pieces ran.
+  lastAutocmds = [];
   const batch = { damageStart: 0, damageEnd: 0, effects: [] };
   while (typing !== "") {
     const outcome = editor.handle_keys(typing);
@@ -436,7 +439,6 @@ function reparse() {
  * Says whether a `:` line was refused, which is what ends the batch of keys it came from.
  */
 function carryOut(effects) {
-  lastAutocmds = [];
   // A handler that rewrites the buffer replaces the editor, which starts a new outcome; what
   // this batch of keys did is the one to report, so it is put back afterwards.
   const outcome = lastOutcome;
