@@ -4,10 +4,12 @@
 //! typing the keys at an [`Editor`], carrying out the [`Effect`]s the core hands back, and
 //! writing the result out.
 
+use std::ffi::{OsStr, OsString};
 use std::fmt::Display;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
@@ -56,13 +58,17 @@ Errors:
   buffer still goes to standard output, so that a pipe keeps carrying the text.
 
 Line endings:
-  A file that holds CRLF line endings is read as LF, which is what the core edits, and
-  written back as CRLF."
+  A file whose every line ends in CRLF is read as LF, which is what the core edits, and
+  written back as CRLF. A file that mixes CRLF with LF is edited as it stands, carriage
+  returns and all, rather than having endings the run never touched rewritten."
 )]
 struct Cli {
     /// The key sequence to run, then the files to run it over.
+    ///
+    /// A file is named in whatever the operating system calls it, text or not; only the key
+    /// sequence has to be text, since it is a program.
     #[arg(value_name = "KEYS|FILE")]
-    operands: Vec<String>,
+    operands: Vec<OsString>,
 
     /// Key sequence to run, named explicitly so that it can be combined with --ex.
     #[arg(short = 'k', long, value_name = "KEYS", conflicts_with = "global")]
@@ -75,11 +81,12 @@ struct Cli {
         long_help = "\
 Run the key sequence at the start of every line, from the first to the last.
 
-The line to run on is found by its index rather than by following the cursor, so the keys
-need no trailing 'j': the cursor is put at the start of line 1, then of line 2, and so on.
-A run that took lines away leaves the following line at the index that ran, so the index
-stays where it is; a run that added lines steps past what it added, the way :g does. That
-is what ends the loop on a macro that would otherwise keep feeding itself lines."
+The lines are taken before anything runs and are then carried through whatever the keys do,
+the way :g carries the lines its pattern matched, so the keys need no trailing 'j': the
+cursor is put at the start of each of them in turn. A line the keys took away is not run
+over, and a line the keys added is not either — what runs is the lines the file came with,
+each once. That is what ends the loop on a macro that would otherwise keep feeding itself
+the lines it wrote."
     )]
     repeat_to_eof: bool,
 
@@ -111,12 +118,15 @@ impl Cli {
     ///
     /// The first operand is the key sequence only when nothing else says what to run, so
     /// that `vimacro --ex '%s/foo/bar/g' notes.txt` reads its one operand as a file.
-    fn keys_and_files(&self) -> (Option<&str>, &[String]) {
+    fn keys_and_files(&self) -> (Option<&OsStr>, &[OsString]) {
         if self.keys.is_some() || self.global.is_some() || self.ex.is_some() {
-            return (self.keys.as_deref(), self.operands.as_slice());
+            return (
+                self.keys.as_deref().map(OsStr::new),
+                self.operands.as_slice(),
+            );
         }
         match self.operands.split_first() {
-            Some((keys, files)) => (Some(keys.as_str()), files),
+            Some((keys, files)) => (Some(keys.as_os_str()), files),
             None => (None, &[]),
         }
     }
@@ -162,7 +172,7 @@ fn main() -> ExitCode {
         ok = process(&cli, keys.as_deref(), None);
     } else {
         for file in files {
-            let path = (file != "-").then(|| PathBuf::from(file));
+            let path = (file.as_os_str() != "-").then(|| PathBuf::from(file));
             ok &= process(&cli, keys.as_deref(), path.as_deref());
         }
     }
@@ -175,7 +185,7 @@ fn main() -> ExitCode {
 
 /// Reads the key sequences and the file list before any file is touched, so that a typo in a
 /// macro is reported instead of half applied.
-fn check(cli: &Cli, keys: Option<&str>, files: &[String]) -> Option<Vec<KeyEvent>> {
+fn check(cli: &Cli, keys: Option<&OsStr>, files: &[OsString]) -> Option<Vec<KeyEvent>> {
     if keys.is_none() && cli.global.is_none() && cli.ex.is_none() {
         usage_error("there is nothing to run: give a key sequence, --global or --ex");
     }
@@ -189,7 +199,7 @@ fn check(cli: &Cli, keys: Option<&str>, files: &[String]) -> Option<Vec<KeyEvent
             "--global was given keys that do not parse: {error}"
         ));
     }
-    let reads_stdin = files.is_empty() || files.iter().any(|file| file == "-");
+    let reads_stdin = files.is_empty() || files.iter().any(|file| file.as_os_str() == "-");
     if cli.in_place && reads_stdin {
         usage_error("--in-place writes the result back to a file, and standard input is not one");
     }
@@ -200,6 +210,15 @@ fn check(cli: &Cli, keys: Option<&str>, files: &[String]) -> Option<Vec<KeyEvent
         );
     }
     let keys = keys?;
+    // A file is named in whatever bytes the operating system holds, but a key sequence is a
+    // program written in the key notation, and there is nothing to read in bytes that are not
+    // text.
+    let Some(keys) = keys.to_str() else {
+        usage_error(format!(
+            "the key sequence is not text: {}",
+            keys.to_string_lossy()
+        ));
+    };
     match parse_keys(keys) {
         Ok(keys) => Some(keys),
         Err(error) => usage_error(format!("the key sequence does not parse: {error}")),
@@ -230,8 +249,16 @@ fn process(cli: &Cli, keys: Option<&[KeyEvent]>, path: Option<&Path>) -> bool {
         }
     };
     // The core edits LF text, so a CRLF file is read as LF and written back as it came.
-    let crlf = text.contains("\r\n");
-    let applied = apply(cli, keys, &text.replace("\r\n", "\n"));
+    let crlf = is_crlf(&text);
+    let applied = apply(
+        cli,
+        keys,
+        &if crlf {
+            text.replace("\r\n", "\n")
+        } else {
+            text
+        },
+    );
     for message in &applied.errors {
         eprintln!("{PROGRAM}: {name}: {message}");
     }
@@ -240,27 +267,78 @@ fn process(cli: &Cli, keys: Option<&[KeyEvent]>, path: Option<&Path>) -> bool {
     } else {
         applied.text
     };
-    if !cli.in_place {
+    // The buffer goes to standard output when nothing is being written back, and also when a
+    // run under --in-place was rejected: the file then keeps the text it had, since a
+    // half-applied macro is worse than none, while the pipe keeps carrying the text.
+    if !cli.in_place || !applied.errors.is_empty() {
         if let Err(error) = io::stdout().write_all(result.as_bytes()) {
             eprintln!("{PROGRAM}: {STDIN_NAME}: {error}");
             return false;
         }
         return applied.errors.is_empty();
     }
-    if !applied.errors.is_empty() {
-        // A half-applied macro is worse than none, so a file whose run was rejected keeps the
-        // text it had.
-        return false;
-    }
     let path = path.expect("--in-place is refused for standard input");
     let mut ok = true;
     for target in std::iter::once(path).chain(applied.extra_paths.iter().map(Path::new)) {
-        if let Err(error) = std::fs::write(target, &result) {
+        if let Err(error) = write_all_at_once(target, &result) {
             eprintln!("{PROGRAM}: {}: {error}", target.display());
             ok = false;
         }
     }
     ok
+}
+
+/// Whether every line of `text` ends in CRLF, which is what makes it a CRLF file rather than
+/// one that happens to hold a carriage return.
+///
+/// A file that mixes the two endings is neither: rewriting its LF lines as CRLF would change
+/// lines the run never touched, so it is edited as it stands and each stray carriage return
+/// stays where it is, the last character of its line — what Vim shows as a `^M` on a buffer
+/// read with a unix fileformat.
+fn is_crlf(text: &str) -> bool {
+    let lines = text.matches('\n').count();
+    lines > 0 && text.matches("\r\n").count() == lines
+}
+
+/// Tells one temporary file from the next within a run, as the process id tells one run from
+/// another. Two `:w path` writes to the same directory would otherwise pick the same name.
+static WRITES: AtomicUsize = AtomicUsize::new(0);
+
+/// Writes `text` to `path` by way of a temporary file next to it, so that a write which fails
+/// partway leaves the file with the text it had rather than with half of the new text.
+///
+/// The rename is what makes the new text appear all at once, and it replaces the old file only
+/// when the two are on one file system, which a sibling of the target is. A file being replaced
+/// keeps the permissions it had, so that a script stays as runnable as it was.
+fn write_all_at_once(path: &Path, text: &str) -> io::Result<()> {
+    let name = path.file_name().unwrap_or_else(|| OsStr::new("vimacro"));
+    let mut temporary_name = OsString::from(".");
+    temporary_name.push(name);
+    temporary_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temporary = path.with_file_name(temporary_name);
+    match write_then_rename(&temporary, path, text) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // The temporary file holds nothing anyone asked for, and a directory left with one
+            // is worse than the write that failed.
+            let _ = std::fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+/// The write itself, split out so that a failure anywhere along it is one place to clean up
+/// after.
+fn write_then_rename(temporary: &Path, path: &Path, text: &str) -> io::Result<()> {
+    std::fs::write(temporary, text)?;
+    if let Ok(existing) = std::fs::metadata(path) {
+        std::fs::set_permissions(temporary, existing.permissions())?;
+    }
+    std::fs::rename(temporary, path)
 }
 
 /// Runs the whole program over `text`: the Ex command first, then the `:g` or the key
@@ -295,27 +373,24 @@ fn apply(cli: &Cli, keys: Option<&[KeyEvent]>, text: &str) -> Applied {
 }
 
 /// Runs `keys` at the start of every line, first to last.
+///
+/// The lines are the ones the input came with: the editor carries them through whatever the
+/// keys do, so a line the keys took away is not run over and a line they wrote is not either,
+/// which is what keeps a macro that adds a line from feeding itself.
 fn repeat_to_eof(editor: &mut Editor, keys: &[KeyEvent], applied: &mut Applied) {
-    let mut line = 0;
-    while line < editor.buffer().line_count() {
-        let before = editor.buffer().line_count();
+    let lines = 0..editor.buffer().line_count();
+    editor.begin_line_walk(lines);
+    while let Some(line) = editor.next_walked_line() {
         if go_to_line_start(editor, line, applied) != Stop::Ran {
-            return;
+            break;
         }
         let stop = feed(editor, keys, applied);
         leave_pending(editor);
         if stop == Stop::Quit {
-            return;
+            break;
         }
-        let after = editor.buffer().line_count();
-        // Lines that went away moved the next line onto the index that just ran; lines that
-        // were added are stepped over, so that a macro which adds one cannot feed itself.
-        line = if after < before {
-            line
-        } else {
-            line + 1 + (after - before)
-        };
     }
+    editor.end_line_walk();
 }
 
 /// Puts the cursor at the start of `line`, counted from 0, with the `:{line}` of Ex and the
@@ -400,7 +475,7 @@ mod tests {
     fn the_first_operand_is_the_key_sequence_when_nothing_else_names_one() {
         let cli = cli(&["ciwfoo<Esc>", "a.txt"]);
         let (keys, files) = cli.keys_and_files();
-        assert_eq!(keys, Some("ciwfoo<Esc>"));
+        assert_eq!(keys, Some(OsStr::new("ciwfoo<Esc>")));
         assert_eq!(files, ["a.txt"]);
     }
 
@@ -420,7 +495,7 @@ mod tests {
     fn a_key_sequence_can_be_named_alongside_an_ex_command() {
         let cli = cli(&["--ex", "%s/foo/bar/g", "--keys", "A;<Esc>", "a.txt"]);
         let (keys, files) = cli.keys_and_files();
-        assert_eq!(keys, Some("A;<Esc>"));
+        assert_eq!(keys, Some(OsStr::new("A;<Esc>")));
         assert_eq!(files, ["a.txt"]);
     }
 
@@ -447,6 +522,16 @@ mod tests {
             "the angle bracket of <Esc> is a character the command line keeps"
         );
         assert!(!keys.contains(&KeyEvent::key(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn a_file_is_a_crlf_file_only_when_every_line_of_it_ends_in_one() {
+        assert!(is_crlf("alpha\r\nbravo\r\n"));
+        assert!(is_crlf("alpha\r\n"));
+        assert!(!is_crlf("alpha\r\nbravo\n"), "a mixture is neither");
+        assert!(!is_crlf("alpha\nbravo\n"));
+        assert!(!is_crlf("alpha"), "a file of one unterminated line is LF");
+        assert!(!is_crlf(""));
     }
 
     #[test]

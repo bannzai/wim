@@ -195,6 +195,18 @@ fn a_repeat_that_adds_lines_steps_over_what_it_added() {
 }
 
 #[test]
+fn a_repeat_that_both_takes_a_line_away_and_adds_one_runs_over_the_lines_it_was_given() {
+    let directory = directory(&[("notes.txt", "alpha\nbravo\ncharlie\n")]);
+    // The line count is where it started after every run of the macro, so nothing but
+    // tracking the lines themselves keeps the walk off the ones the macro wrote.
+    vimacro(&directory)
+        .args(["ddox<Esc>", "--repeat-to-eof", "notes.txt"])
+        .assert()
+        .success()
+        .stdout("x\nx\nx\n");
+}
+
+#[test]
 fn a_global_pattern_that_matches_nothing_is_reported() {
     let directory = directory(&[("notes.txt", "alpha\n")]);
     vimacro(&directory)
@@ -290,6 +302,101 @@ fn crlf_line_endings_are_written_back_as_they_came() {
 }
 
 #[test]
+fn a_file_that_mixes_line_endings_keeps_the_endings_it_came_with() {
+    let directory = directory(&[("notes.txt", "alpha\r\nbravo\ncharlie\r\n")]);
+    vimacro(&directory)
+        .args(["-i", "--ex", "w", "notes.txt"])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read(directory.path().join("notes.txt")).expect("the file should be readable"),
+        b"alpha\r\nbravo\ncharlie\r\n",
+        "a run that edited nothing rewrites nothing, byte for byte"
+    );
+}
+
+#[test]
+fn in_place_sends_the_buffer_to_standard_output_when_the_run_was_rejected() {
+    let directory = directory(&[("notes.txt", "alpha\n")]);
+    vimacro(&directory)
+        .args(["-i", "--global", "^import", "A;<Esc>", "notes.txt"])
+        .assert()
+        .failure()
+        // The file keeps the text it had, and the pipe keeps carrying it.
+        .stdout("alpha\n");
+    assert_eq!(read(&directory, "notes.txt"), "alpha\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn in_place_leaves_a_file_the_permissions_it_had() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = directory(&[("run.sh", "echo alpha\n")]);
+    let path = directory.path().join("run.sh");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("the permissions should be settable");
+    vimacro(&directory)
+        .args(["-i", "A!<Esc>", "run.sh"])
+        .assert()
+        .success();
+    assert_eq!(read(&directory, "run.sh"), "echo alpha!\n");
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("the file should be there")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755,
+        "a script that was runnable before the run still is"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_file_named_in_bytes_that_are_not_text_is_read_and_written() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = directory(&[]);
+    let name = OsStr::from_bytes(b"notes-\xff.txt");
+    let path = directory.path().join(name);
+    if std::fs::write(&path, "alpha\n").is_err() {
+        // Linux holds a file name as bytes, and clap is what would refuse this one; macOS
+        // holds it as text and refuses it itself, which leaves nothing here to test.
+        return;
+    }
+    vimacro(&directory)
+        .args([
+            OsStr::new("-i"),
+            OsStr::new("--keys"),
+            OsStr::new("A!<Esc>"),
+        ])
+        .arg(name)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file should be readable"),
+        "alpha!\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_key_sequence_that_is_not_text_is_refused() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let directory = directory(&[("notes.txt", "alpha\n")]);
+    vimacro(&directory)
+        .arg(OsStr::from_bytes(b"A\xff<Esc>"))
+        .arg("notes.txt")
+        .assert()
+        .failure()
+        .stderr(contains("the key sequence is not text"));
+}
+
+#[test]
 fn a_key_sequence_that_does_not_parse_is_reported_before_a_file_is_touched() {
     let directory = directory(&[("notes.txt", "alpha\n")]);
     vimacro(&directory)
@@ -375,5 +482,5 @@ fn the_help_describes_how_a_repeat_walks_the_buffer() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(contains("found by its index").and(contains("no trailing 'j'")));
+        .stdout(contains("taken before anything runs").and(contains("no trailing 'j'")));
 }
