@@ -7,7 +7,9 @@
 // (`crates/wim-plugin-host/src/lib.rs`); here jco has already turned those names into the names
 // of an ES module's exports, so the same version is read off `wim:plugin/commands@0.1.0` in
 // `Object.keys`. A module built against another ABI exports another name and is refused, the way
-// wasmtime refuses to find the export the native bindings look up.
+// wasmtime refuses to find the export the native bindings look up. A module that carries some of
+// the world's interfaces and not the rest is refused there too, so all three are asked for here
+// while the plugin is loaded rather than when one of them is first called.
 //
 // The sandbox needs nothing at run time. The world's one import carries types and no functions,
 // so jco writes a module that imports nothing — no WASI shim, no host functions — and that is
@@ -23,12 +25,16 @@ const MANIFEST = "./plugins/manifest.json";
 /**
  * The interface the commands live on, whose versioned export name carries the ABI. The other two
  * of the world (`events`, `ui`) are exported alongside it, and `events` is what an autocmd of
- * kind `plugin` reaches (`documents/CONFIG.md`).
+ * kind `plugin` reaches (`documents/CONFIG.md`). All three are looked up while the plugin is
+ * loaded, so the ABI a module is held to is the whole of the world and not the commands alone.
  */
 const COMMANDS = "wim:plugin/commands";
 
 /** The interface an event is delivered over. */
 const EVENTS = "wim:plugin/events";
+
+/** The interface a panel is rendered over. */
+const UI = "wim:plugin/ui";
 
 /**
  * Loads every plugin the build transpiled: the commands keyed by the name `:name` runs them
@@ -70,11 +76,9 @@ export async function loadPlugins() {
 /** What one plugin publishes, once it has been held to `abi`. */
 async function loadPlugin(declared, abi) {
   const module = await import(declared.module);
-  const commands = module[`${COMMANDS}@${abi}`];
-  if (commands === undefined) {
-    throw new Error(abiComplaint(module, abi));
-  }
-  const events = module[`${EVENTS}@${abi}`];
+  const commands = exportedInterface(module, COMMANDS, abi);
+  const events = exportedInterface(module, EVENTS, abi);
+  const ui = exportedInterface(module, UI, abi);
   const published = commands.listCommands().map((command) => ({
     name: command.name,
     description: command.description,
@@ -94,18 +98,42 @@ async function loadPlugin(declared, abi) {
       subscriptions: events.subscriptions(),
       /** Delivers one of those events, answering with an edit the way a command does. */
       onEvent: (event, buffer) => events.onEvent(event, buffer),
+      /**
+       * The panel to show over `buffer`, `undefined` when the plugin has none — which is the
+       * `none` of the ABI's `option<panel>`, and the host's cue to close the panel
+       * (`wit/plugin.wit`). What comes back is HTML this host does not trust; where it may be
+       * drawn is decided in `web/main.js`.
+       */
+      render: (buffer) => ui.render(buffer),
     },
   };
 }
 
 /**
- * Why a module the manifest named is not a plugin this host can load, in the two shapes the
- * native host reports: an ABI other than this one, or nothing of `wim:plugin` at all.
+ * The `interface` a module exports at this ABI, refusing the module that exports no such thing.
+ *
+ * Every interface of the world is asked for while the plugin is loaded rather than where it is
+ * first called, because a module that is missing one is not a plugin either host can run: natively
+ * the bindings look up all three exports as the component is instantiated, so an incomplete
+ * component never loads at all (`crates/wim-plugin-host/src/lib.rs`). Deferring the lookup would
+ * leave the commands of such a plugin registered and its panel failing on every refresh.
  */
-function abiComplaint(module, abi) {
-  const found = Object.keys(module).find((name) => name.startsWith(`${COMMANDS}@`));
-  if (found === undefined) {
-    return `no ${COMMANDS} interface is exported`;
+function exportedInterface(module, interfaceName, abi) {
+  const exported = module[`${interfaceName}@${abi}`];
+  if (exported === undefined) {
+    throw new Error(abiComplaint(module, interfaceName, abi));
   }
-  return `built against ${found.slice(COMMANDS.length + 1)}, and this host speaks ${abi}`;
+  return exported;
+}
+
+/**
+ * Why a module the manifest named is not a plugin this host can load, in the two shapes the
+ * native host reports: an ABI other than this one, or nothing of that interface at all.
+ */
+function abiComplaint(module, interfaceName, abi) {
+  const found = Object.keys(module).find((name) => name.startsWith(`${interfaceName}@`));
+  if (found === undefined) {
+    return `no ${interfaceName} interface is exported`;
+  }
+  return `built against ${found.slice(interfaceName.length + 1)}, and this host speaks ${abi}`;
 }

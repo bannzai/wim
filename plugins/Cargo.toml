@@ -3,7 +3,7 @@
 # from pulling a wasm-only crate into the native build.
 [workspace]
 resolver = "3"
-members = ["hello-wim"]
+members = ["hello-wim", "markdown-preview"]
 
 [workspace.package]
 edition = "2024"
@@ -14,6 +14,12 @@ repository = "https://github.com/bannzai/wim"
 # Pinned rather than left to a caret range: what this generates is the ABI surface itself, so a
 # plugin has to be reproducible from the committed Cargo.lock.
 wit-bindgen = "=0.61.1"
+# The Markdown reader `markdown-preview` renders with, pinned for the same reason the plugins are
+# built from a committed lock: what a plugin turns a buffer into is checked against fixed HTML in
+# its own tests, and a reader that changed under it would move that output without the tree
+# changing. `html` is the only feature the plugin uses; the default set also pulls in `getopts`,
+# which is there for the crate's own binary and has no place in a wasm component.
+pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
 
 [profile.release]
 # Plugins ship as .wasm, where the size of the artifact matters more than the last bit of speed.

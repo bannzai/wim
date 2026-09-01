@@ -85,9 +85,13 @@ fuel (wasm 命令数相当) を与え直し、guest の linear memory の上限�
 ない `memory.grow` は上限に当たって trap し、ホストにはエラーとして返る。上限値と選定根拠は
 `crates/wim-plugin-host/src/lib.rs` の `CALL_FUEL` / `MEMORY_LIMIT` に書いてある。
 
-エディタに組み込まずに動かす入口が `wim plugin run <wasm> <command> [--input TEXT]` で、
-標準入力 (または `--input`) のテキストを snapshot として渡し、返ってきた edit を適用した結果を
-標準出力へ書く。Ex コマンドへの配線は Phase 4-4 の autocmd・設定と合わせて行う。
+エディタに組み込まずに動かす入口が 2 つある。`wim plugin run <wasm> <command> [--input TEXT]`
+は標準入力 (または `--input`) のテキストを snapshot として渡し、返ってきた edit を適用した
+結果を標準出力へ書く。`wim plugin render <wasm> [--input TEXT] [--name NAME]` は同じ snapshot を
+`ui.render` に渡し、返ったパネルの HTML を標準出力へ、見出しを標準エラーへ書く。`--name` が
+要るのは、どのバッファにパネルを出すかをプラグインがバッファ名で決められるため
+(`markdown-preview` は `.md` / `.markdown` だけに出す)。パネルを持たないという答え (`none`) は
+失敗ではないので、標準出力には何も書かずに終了ステータス 0 で終わる。
 
 ```sh
 make build-plugins      # component をビルドする (要 wasm32-unknown-unknown)
@@ -135,8 +139,40 @@ make e2e                # 同じ component をネイティブとブラウザの�
 同じ入力を `wim plugin run` とデモの両方に通し、返るバッファとエラーメッセージが一致することを
 確かめる。component のパスは `make test-plugin-host` と同じ `WIM_PLUGIN_WASM` で渡す。
 
+## パネルの HTML をどう描くか
+
+`ui.render` が返す HTML は、ホストが信頼しないものとして扱う。サニタイズ (タグの除去) では
+なく隔離で扱うのが wim の方針で、理由は Markdown Preview そのものにある。CommonMark は生の
+HTML をそのまま通すと定めているため、`<script>` を書いた `.md` を素直に描くプラグインの出力に
+はスクリプトが混ざる。ここでタグを剥がすと「Markdown を Markdown として描く」ことをやめる
+ことになり、剥がし漏れが 1 つでもあればそのまま実行されてしまう。隔離は逆で、何が入っていても
+実行できる場所に置かないという 1 つの判断で閉じる。
+
+ブラウザ側 (`web/main.js`) は、パネルごとに `sandbox` 属性を空文字列で付けた iframe を作り、
+HTML を `srcdoc` に入れる。空の `sandbox` はブラウザの制限をすべて有効にした状態で、
+`allow-scripts` を与えていないため中のスクリプトは実行されず、`allow-same-origin` も無いため
+不透明なオリジンに置かれてページの DOM・Cookie・ストレージには触れられない。加えて、ホストが
+被せる文書側で `default-src 'none'` の CSP を宣言し、画像 (`img-src`) 以外のサブリソース取得を
+止める。DOMPurify のようなサニタイザを足さないのは、隔離で閉じている問題に依存を 1 つ増やす
+ことになるため。
+
+ネイティブ側でパネルを描く GUI はまだ無く、入口は `wim plugin render` (下記) だけになる。
+描く側が増えた時も、同じ「実行できない場所に置く」を満たすこと。
+
+## エディタへの配線
+
+デモがパネルを描き直すのは、コアが `text-changed` を報告した時と、バッファ自体が入れ替わった
+時 (ファイルを開いた・サンプルを読み込んだ・プラグインがバッファを書き換えた) で、これは
+`render` を「パネルを開く時とバッファが変わって描き直す時に呼ぶ」と定めた wit の記述どおりの
+タイミングになる。wim.jsonc の autocmd には束ねない: autocmd のハンドラが呼ぶのは `on-event`
+で、返るのは `edit` であってパネルではないため、パネルの更新は autocmd の仕事ではない。
+`markdown-preview` が `subscriptions` で何も購読していないのはそのためで、これを autocmd に
+束ねた設定は「配送されない autocmd」としてホストが弾く。
+
 ## 新しいプラグインを足す
 
 `plugins/hello-wim` が最小の実装例で、コマンド 1 つ (`:upcase`)・イベントフック 1 つ・パネル
-1 つを持つ。新しいプラグインは同じ形でディレクトリを作り、`plugins/Cargo.toml` の `members`
-に足す。
+1 つを持つ。`plugins/markdown-preview` は `ui` だけを実装した実用例で、`.md` / `.markdown` の
+バッファを HTML にして返し、それ以外のバッファでは `none` を返してパネルを閉じさせる
+(Markdown → HTML は pulldown-cmark)。新しいプラグインは同じ形でディレクトリを作り、
+`plugins/Cargo.toml` の `members`・`Makefile` の `build-plugins` / `build-web-plugins` に足す。

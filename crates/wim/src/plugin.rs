@@ -25,6 +25,8 @@ pub struct Plugin {
 enum Command {
     /// Run one of a plugin's commands over a buffer.
     Run(Run),
+    /// Render a plugin's panel over a buffer.
+    Render(Render),
 }
 
 #[derive(Debug, Args)]
@@ -56,11 +58,49 @@ struct Run {
     input: Option<String>,
 }
 
+#[derive(Debug, Args)]
+#[command(long_about = "\
+Renders a plugin's panel over a buffer and writes the HTML.
+
+The buffer is --input, or standard input when --input is not given, and it stands in for the one
+an editor would be holding. The panel's HTML goes to standard output and its heading to standard
+error, so that redirecting standard output leaves the HTML on its own.
+
+A plugin decides which buffers it has a panel for, and the name of the buffer is what it decides
+by, so --name is what a run gives it: markdown-preview answers with a panel for a name ending in
+.md and with nothing for any other. Nothing is not a failure — it is the answer the ABI has a
+host close the panel on — so a run that gets it writes nothing to standard output and says so on
+standard error, and ends successfully.
+
+The HTML is not trusted: the browser host draws it in an isolated frame where nothing in it can
+run (wit/README.md), and this command writes it to standard output so that it can be redirected
+and verified.
+
+The plugin runs with nothing of this machine reachable from inside it: no files, no network, no
+clock. A component asking for any of that is refused rather than loaded.")]
+struct Render {
+    /// The .wasm component to load.
+    #[arg(value_name = "WASM")]
+    wasm: PathBuf,
+
+    /// Buffer to render. Read from standard input when not given.
+    #[arg(long, value_name = "TEXT")]
+    input: Option<String>,
+
+    /// The name the buffer is under, which is what a plugin reads the language off. Empty, which
+    /// is what a buffer backed by no file has, when it is not given.
+    #[arg(long, value_name = "NAME", default_value = "")]
+    name: String,
+}
+
 /// Runs the subcommand and reports what went wrong under the program's name, the way the rest of
 /// the binary does.
 pub fn main(plugin: Plugin) -> ExitCode {
-    let Command::Run(run) = plugin.command;
-    match execute(run) {
+    let done = match plugin.command {
+        Command::Run(run) => execute(run),
+        Command::Render(render) => render_panel(render),
+    };
+    match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{PROGRAM}: {error}");
@@ -93,6 +133,45 @@ fn execute(run: Run) -> Result<(), String> {
     io::stdout()
         .write_all(text.as_bytes())
         .map_err(|error| format!("cannot write the buffer: {error}"))
+}
+
+/// Renders the plugin's panel over the buffer and writes what it answered with.
+fn render_panel(render: Render) -> Result<(), String> {
+    let text = match render.input {
+        Some(text) => text,
+        None => read_input()?,
+    };
+    let mut host = Host::from_file(&render.wasm)
+        .map_err(|error| format!("cannot load {}: {error}", render.wasm.display()))?;
+    // No one has moved a cursor through this buffer, which is what a cursor at the start says to
+    // the plugin. The name is the run's to give, because it is what a plugin decides by.
+    let buffer = Snapshot {
+        name: render.name,
+        text,
+        cursor: Position { line: 0, column: 0 },
+    };
+    let Some(panel) = host
+        .render(&buffer)
+        .map_err(|error| format!("the panel failed to render: {error}"))?
+    else {
+        // The answer a host closes the panel on. Nothing goes to standard output, so a run that
+        // is redirected into a file leaves an empty one rather than a stale panel.
+        eprintln!("no panel for {}", display_name(&buffer.name));
+        return Ok(());
+    };
+    eprintln!("{}", panel.title);
+    io::stdout()
+        .write_all(panel.html.as_bytes())
+        .map_err(|error| format!("cannot write the panel: {error}"))
+}
+
+/// A buffer that is backed by no file has an empty name, which reads as a gap in a report.
+fn display_name(name: &str) -> String {
+    if name.is_empty() {
+        "a buffer with no name".to_string()
+    } else {
+        name.to_string()
+    }
 }
 
 /// The buffer read from standard input, which is where it comes from when --input is not given.

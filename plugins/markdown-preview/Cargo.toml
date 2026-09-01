@@ -1,0 +1,16 @@
+[package]
+name = "markdown-preview"
+version = "0.0.0"
+description = "First-party Markdown Preview plugin. Renders the buffer as the panel of the UI ABI."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# cdylib is the wasm module wasm-tools turns into a component; rlib keeps the crate
+# testable on a native target, where the generated bindings are never called.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen.workspace = true
+pulldown-cmark.workspace = true

@@ -152,6 +152,54 @@
         margin-bottom: 0;
       }
 
+      /* The panels the loaded plugins rendered, under the editor rather than beside it: the
+         canvas is as wide as the page and a column next to it would take that width away from
+         the buffer, which is the thing being edited. */
+      #panels {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin-top: 16px;
+      }
+
+      /* A demo whose plugins render no panel — every buffer that is not Markdown — leaves this
+         empty, and an empty flex box would still take its gap and margin. */
+      #panels:empty {
+        display: none;
+      }
+
+      /* One panel fills the row and two share it, which is what keeps a second plugin's panel
+         from pushing the first one a screen further down. 360px is the width under which a
+         preview stops being one — the fences and tables in a README wrap — so a narrow page
+         stacks them instead. */
+      .panel {
+        flex: 1 1 360px;
+        min-width: 0;
+        border: 1px solid #2b303b;
+        border-radius: 6px;
+        overflow: hidden;
+      }
+
+      .panel h2 {
+        margin: 0;
+        padding: 8px 12px;
+        border-bottom: 1px solid #2b303b;
+        background: #171a21;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      /* What a plugin returned, drawn in a frame of its own. The height is fixed rather than
+         fitted to the content: measuring the content would take reaching into the frame, which
+         is the very thing the sandbox is there to stop (`web/main.js`). */
+      .panel iframe {
+        display: block;
+        width: 100%;
+        height: 260px;
+        border: 0;
+      }
+
       /* The commands the transpiled plugins published and the autocmds wim.jsonc declared,
          with a line each for what running one last did. */
       #plugins {
@@ -170,7 +218,8 @@
         キーボードで直接編集できます。<code>i</code> / <code>a</code> / <code>o</code> で Insert、<code>Esc</code> で Normal、
         <code>hjkl</code> <code>w</code> <code>b</code> <code>0</code> <code>$</code> <code>gg</code> <code>G</code> で移動、<code>x</code> <code>dd</code>
         <code>yy</code> <code>p</code> <code>u</code> と <code>:</code> の Ex コマンドが使えます。Insert と Ex コマンドラインでは日本語入力 (IME) が使えます。
-        <code>.rs</code> と <code>.md</code> のファイルは tree-sitter でシンタックスハイライトされます。
+        <code>.rs</code> と <code>.md</code> のファイルは tree-sitter でシンタックスハイライトされます。<code>.md</code>
+        のファイルには Markdown Preview プラグインがプレビューパネルを開き、編集するたびに描き直します。
       </p>
       <div class="screen">
         <canvas id="screen" width="880" height="440"></canvas>
@@ -188,6 +237,8 @@
         <button type="button" id="sample-rust">Rust</button>
         <button type="button" id="sample-markdown">Markdown</button>
       </p>
+      <!-- One panel per loaded plugin that has one, filled in by main.js. -->
+      <section id="panels" aria-label="プラグインのパネル"></section>
       <section id="plugins">
         <p id="plugin-commands">プラグインを読み込んでいます</p>
         <p id="plugin-status" role="status">プラグインのコマンドはまだ実行していません</p>
