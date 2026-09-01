@@ -82,18 +82,52 @@ function stubPicker(page, name, text, { gateFirstWrite = false } = {}) {
  * can drive an answer the built sample plugin never gives.
  *
  * `edit` is what it answers every command and every event with, written as the ABI's `edit`
- * variant (`wit/plugin.wit`). The manifest and the module are both served by the route, so
- * nothing of the real transpile step is needed.
+ * variant (`wit/plugin.wit`).
+ */
+function stubPlugin(page, name, edit) {
+  return servePlugin(
+    page,
+    name,
+    `
+    const EDIT = ${JSON.stringify(edit)};
+    const answer = () => EDIT;
+  `,
+  );
+}
+
+/**
+ * A plugin module that answers with the cursor of the snapshot it was given, written into the
+ * buffer as `line,column`, which is how a run reads the position the host handed over.
+ */
+function stubCursorPlugin(page, name) {
+  return servePlugin(
+    page,
+    name,
+    `
+    const answer = (buf) => ({
+      tag: "replace-all",
+      val: buf.cursor.line + "," + buf.cursor.column + "\\n",
+    });
+  `,
+  );
+}
+
+/**
+ * Serves a plugin under `name` as the only one in the manifest, built out of `answer`: the
+ * function of the snapshot that every command and every event of it answers with.
+ *
+ * The manifest and the module are both served by the route, so nothing of the real transpile
+ * step is needed.
  *
  * It has no panel: the world's third interface is exported the way a component has to export it,
  * and answers `undefined`, which is the `none` of `option<panel>`. A panel is checked where a
  * plugin that has one is (`web/e2e/markdown-preview.spec.js`).
  */
-function stubPlugin(page, name, edit) {
+function servePlugin(page, name, answer) {
   const module = `
-    const EDIT = ${JSON.stringify(edit)};
-    const commands = { listCommands: () => [], run: () => EDIT };
-    const events = { subscriptions: () => ["buffer-write"], onEvent: () => EDIT };
+    ${answer}
+    const commands = { listCommands: () => [], run: (name, args, buf) => answer(buf) };
+    const events = { subscriptions: () => ["buffer-write"], onEvent: (ev, buf) => answer(buf) };
     const ui = { render: () => undefined };
     export {
       commands as "wim:plugin/commands@0.1.0",
@@ -347,6 +381,69 @@ test("a write that lands after another buffer was opened raises no post event", 
   const state = await page.evaluate(() => window.wimDemo.state());
   expect(state.lines[0]).toBe("// Rust, highlighted by tree-sitter.");
   expect(state.autocmd.ran).toEqual([]);
+});
+
+test("a plugin's edit is one change of the session rather than a new editor", async ({ page }) => {
+  // The edit is applied to the editor that is open (`crates/wim-wasm/src/lib.rs`): loading the
+  // text into a new one would put the cursor back at the start of the buffer and take the undo
+  // history of everything typed before the plugin ran with it.
+  await stubPlugin(page, "rewriter", { tag: "replace-all", val: "PLUGIN\nEDIT\n" });
+  await serveConfig(page, {
+    body: `{
+      "autocmds": [
+        { "event": "buffer-write", "handler": { "kind": "plugin", "plugin": "rewriter" } }
+      ]
+    }`,
+  });
+  await open(page);
+
+  await page.evaluate((text) => window.wimDemo.load(text), "alpha\nbravo\n");
+  await page.evaluate(() => window.wimDemo.sendKeys("jx"));
+  const rewritten = await page
+    .evaluate(() => window.wimDemo.sendKeys(":w<CR>"))
+    .then(() => page.evaluate(() => window.wimDemo.state()));
+  expect(rewritten.text).toBe("PLUGIN\nEDIT\n");
+  expect(rewritten.cursor).toEqual({ line: 1, col: 0 });
+
+  const undone = await page
+    .evaluate(() => window.wimDemo.sendKeys("u"))
+    .then(() => page.evaluate(() => window.wimDemo.state()));
+  expect(undone.text).toBe("alpha\nravo\n");
+  expect(undone.cursor).toEqual({ line: 1, col: 0 });
+
+  const before = await page
+    .evaluate(() => window.wimDemo.sendKeys("u"))
+    .then(() => page.evaluate(() => window.wimDemo.state()));
+  expect(before.text).toBe("alpha\nbravo\n");
+});
+
+test("the column a plugin is given counts scalars rather than graphemes", async ({ page }) => {
+  // `wit/plugin.wit` counts a column in Unicode scalars, while a column in the core is one
+  // grapheme cluster: on a line whose first cluster is an `e` and a combining acute, the cursor
+  // one column in is two scalars in.
+  await stubCursorPlugin(page, "cursor-echo");
+  await serveConfig(page, {
+    body: `{
+      "autocmds": [
+        { "event": "buffer-write", "handler": { "kind": "plugin", "plugin": "cursor-echo" } }
+      ]
+    }`,
+  });
+  await open(page);
+
+  // Written as the two scalars it is rather than as the one composed é the source would
+  // otherwise hold, which is a cluster of one scalar and no conversion to make.
+  await page.evaluate((text) => window.wimDemo.load(text), "e\u0301x\ny\n");
+  const typed = await page
+    .evaluate(() => window.wimDemo.sendKeys("l"))
+    .then(() => page.evaluate(() => window.wimDemo.state()));
+  expect(typed.cursor).toEqual({ line: 0, col: 1 });
+
+  const state = await page
+    .evaluate(() => window.wimDemo.sendKeys(":w<CR>"))
+    .then(() => page.evaluate(() => window.wimDemo.state()));
+  // One column in, which the host hands over as the two scalars in front of it.
+  expect(state.text).toBe("0,2\n");
 });
 
 test("an edit naming lines the buffer does not have fails its handler", async ({ page }) => {

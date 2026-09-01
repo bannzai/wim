@@ -91,6 +91,29 @@ impl WimEditor {
         self.editor.cursor().col
     }
 
+    /// The cursor's column counted in Unicode scalars, which is the column a plugin is handed
+    /// in the snapshot the host builds (`wit/plugin.wit`).
+    ///
+    /// A column here is a grapheme, and the two differ on every cluster made of more than one
+    /// scalar: the cursor after `é` written as `e` and a combining acute is at column 1 and at
+    /// scalar 2.
+    pub fn cursor_scalar_col(&self) -> usize {
+        self.editor.buffer().scalar_col(self.editor.cursor())
+    }
+
+    /// Puts `text` in place of the buffer as one change `u` walks back through, which is how
+    /// the edit a plugin answered with is applied.
+    ///
+    /// Building a `WimEditor` over the text instead would be a new editor: the cursor would go
+    /// back to the start of the buffer and the undo history, the registers and the marks of
+    /// everything typed before the plugin ran would be gone with the old one.
+    ///
+    /// Nothing comes back to draw from: an edit that came from no key may have changed any of
+    /// the buffer, so a host redraws every row rather than the range a batch of keys reports.
+    pub fn replace_text(&mut self, text: &str) {
+        self.editor.replace_text(text);
+    }
+
     /// Name of the current mode, as a mode line shows it.
     pub fn mode(&self) -> String {
         self.editor.mode().label().to_owned()
@@ -317,6 +340,51 @@ mod tests {
         assert_eq!(editor.line_count(), 1);
         // Not the empty range `(1, 1)` an unchanged buffer gives: row 1 still holds `bravo`.
         assert_eq!((outcome.damage_start(), outcome.damage_end()), (1, 2));
+    }
+
+    #[test]
+    fn a_plugins_edit_keeps_the_cursor_the_history_and_the_registers() {
+        let mut editor = WimEditor::new("alpha\nbravo");
+        // Into a register of its own: the `x` that follows fills the unnamed one.
+        editor.handle_keys("\"ayyjx").expect("keys should parse");
+        editor.replace_text("PLUGIN\nEDIT");
+        assert_eq!(editor.text(), "PLUGIN\nEDIT");
+        assert_eq!(
+            (editor.cursor_line(), editor.cursor_col()),
+            (1, 0),
+            "the cursor is where it was, not at the start of a new editor"
+        );
+
+        editor.handle_keys("\"ap").expect("keys should parse");
+        assert_eq!(
+            editor.text(),
+            "PLUGIN\nEDIT\nalpha",
+            "the yank from before the plugin ran is still in the register"
+        );
+        editor.handle_keys("uu").expect("keys should parse");
+        assert_eq!(editor.text(), "alpha\nravo", "the plugin's edit is undone");
+        editor.handle_keys("u").expect("keys should parse");
+        assert_eq!(
+            editor.text(),
+            "alpha\nbravo",
+            "and so is the key typed before it"
+        );
+    }
+
+    #[test]
+    fn the_column_a_plugin_is_given_counts_scalars_rather_than_graphemes() {
+        let mut editor = WimEditor::new("e\u{301}x");
+        assert_eq!(editor.cursor_scalar_col(), 0);
+        editor.handle_keys("l").expect("keys should parse");
+        assert_eq!(
+            (editor.cursor_col(), editor.cursor_scalar_col()),
+            (1, 2),
+            "one grapheme in is two scalars in, the `e` and the combining acute"
+        );
+
+        let mut editor = WimEditor::new("👨‍👩‍👦y");
+        editor.handle_keys("l").expect("keys should parse");
+        assert_eq!((editor.cursor_col(), editor.cursor_scalar_col()), (1, 5));
     }
 
     #[test]

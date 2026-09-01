@@ -77,6 +77,20 @@ impl Buffer {
         self.rope.line_to_char(line) + offset
     }
 
+    /// Unicode scalars in `pos`'s line in front of the grapheme `pos.col` names.
+    ///
+    /// Columns are graphemes here, while a plugin is handed a column counted in scalars
+    /// (`wit/plugin.wit`), so this is what a host converts a cursor with before it hands one
+    /// over. A column past the end of the line counts the whole line, which is the end of it
+    /// that [`Buffer::char_index`] maps such a column to.
+    pub fn scalar_col(&self, pos: Position) -> usize {
+        self.line_text(pos.line)
+            .graphemes(true)
+            .take(pos.col)
+            .map(|grapheme| grapheme.chars().count())
+            .sum()
+    }
+
     pub fn position_at_char(&self, char_index: usize) -> Position {
         let char_index = char_index.min(self.rope.len_chars());
         let line = self
@@ -276,6 +290,19 @@ mod tests {
             let pos = buffer.position_at_char(index);
             assert_eq!(buffer.char_index(pos), index, "round trip of {index}");
         }
+    }
+
+    #[test]
+    fn a_column_counts_more_scalars_than_graphemes_where_a_cluster_is_made_of_several() {
+        // `e` plus a combining acute is one column and two scalars, and a joined family is one
+        // column and five: two columns into either line is not two scalars into it.
+        let buffer = Buffer::new("e\u{301}x\n👨‍👩‍👦y");
+        assert_eq!(buffer.scalar_col(Position::new(0, 0)), 0);
+        assert_eq!(buffer.scalar_col(Position::new(0, 1)), 2);
+        assert_eq!(buffer.scalar_col(Position::new(0, 2)), 3);
+        assert_eq!(buffer.scalar_col(Position::new(1, 1)), 5);
+        // A column past the end of the line counts the line, as appending to it lands there.
+        assert_eq!(buffer.scalar_col(Position::new(0, 9)), 3);
     }
 
     #[test]
