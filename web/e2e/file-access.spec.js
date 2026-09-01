@@ -190,6 +190,89 @@ async function stubPicker(page, name, text, { gateFirstWrite = false, gatePick =
   );
 }
 
+/**
+ * Stands in for a picker that is closed without choosing anything, which is what the File System
+ * Access API reports by rejecting with an `AbortError`.
+ *
+ * `window.wimPickerCalls` counts how many times it was opened, so that a run can tell a pick that
+ * was canceled from one that never happened at all.
+ */
+async function stubCanceledPicker(page) {
+  await page.addInitScript(() => {
+    window.wimPickerCalls = 0;
+    window.showOpenFilePicker = async () => {
+      window.wimPickerCalls += 1;
+      throw new DOMException("The user aborted a request.", "AbortError");
+    };
+  });
+}
+
+/**
+ * Wraps the WebSocket the page opens so that a daemon exchange can be held where the run wants it.
+ *
+ * The daemon these tests talk to is a real one on the same machine and answers at once, which
+ * leaves no window in which a second thing can happen while an open or a save is in the air.
+ * Holding the exchange on this side of the wire opens that window without a slow daemon to stand
+ * in for.
+ *
+ * `holdOpen` keeps every connection from reporting itself open until `window.wimReleaseConnect()`,
+ * which is how an open is left connecting. `holdWrites` keeps `fs.write` requests from going out
+ * until `window.wimReleaseDaemonWrites()`, which is how saves are left queued. Nothing else is
+ * held either way, so a second file can still be connected to and read while the saves of the
+ * first are waiting.
+ */
+async function gateDaemonSocket(page, { holdOpen = false, holdWrites = false } = {}) {
+  await page.addInitScript(
+    ([gateOpen, gateWrites]) => {
+      const Native = window.WebSocket;
+      let openReleased = !gateOpen;
+      let writesReleased = !gateWrites;
+      const heldOpens = [];
+      const heldWrites = [];
+      window.wimReleaseConnect = () => {
+        openReleased = true;
+        for (const announce of heldOpens.splice(0)) {
+          announce();
+        }
+      };
+      window.wimReleaseDaemonWrites = () => {
+        writesReleased = true;
+        for (const send of heldWrites.splice(0)) {
+          send();
+        }
+      };
+      window.WebSocket = class GatedSocket extends Native {
+        addEventListener(type, listener, options) {
+          if (type !== "open" || openReleased) {
+            super.addEventListener(type, listener, options);
+            return;
+          }
+          super.addEventListener(
+            type,
+            (event) => {
+              if (openReleased) {
+                listener(event);
+                return;
+              }
+              heldOpens.push(() => listener(event));
+            },
+            options,
+          );
+        }
+        send(data) {
+          // The requests are wim-protocol's JSON, so the method a frame carries is in its text.
+          if (writesReleased || typeof data !== "string" || !data.includes('"fs.write"')) {
+            super.send(data);
+            return;
+          }
+          heldWrites.push(() => super.send(data));
+        }
+      };
+    },
+    [holdOpen, holdWrites],
+  );
+}
+
 test.describe("through a daemon", () => {
   /** The directory the daemon serves, which is where the files these tests read and write are. */
   let root;
@@ -298,6 +381,55 @@ test.describe("through a daemon", () => {
     await expect(statusOf(page)).toHaveText("newer.md を保存しました");
     expect(await readFile(join(root, "newer.md"), "utf8")).toBe("wim newer\n");
     expect(await page.evaluate(() => window.wimFile.written)).toBeNull();
+  });
+
+  test("finishes the saves queued for a file before closing its connection", async ({ page }) => {
+    await writeFile(join(root, "queued.md"), "hello\n");
+    await writeFile(join(root, "next.md"), "next\n");
+    await gateDaemonSocket(page, { holdWrites: true });
+    await openDemo(page);
+
+    await openThroughDaemon(page, daemon, "queued.md");
+    await expect(statusOf(page)).toHaveText("queued.md を開きました");
+
+    await insert(page, "A");
+    await write(page);
+    await insert(page, "B");
+    await write(page);
+
+    // The first save is held on its way out and the second one is queued behind it, so neither
+    // has reached the file when the next one is opened.
+    expect(await readFile(join(root, "queued.md"), "utf8")).toBe("hello\n");
+
+    await openThroughDaemon(page, daemon, "next.md");
+    await expect(statusOf(page)).toHaveText("next.md を開きました");
+
+    await page.evaluate(() => window.wimReleaseDaemonWrites());
+
+    // Both saves land, in the order they were typed, over the connection they were typed for:
+    // the file that was open when they were queued holds the text of the second `:w`.
+    await expect.poll(() => readFile(join(root, "queued.md"), "utf8")).toBe("BAhello\n");
+    await expect(statusOf(page)).toHaveText("queued.md を保存しました");
+  });
+
+  test("keeps an open that is still connecting when a picker is canceled", async ({ page }) => {
+    await writeFile(join(root, "connecting.md"), "connecting\n");
+    await gateDaemonSocket(page, { holdOpen: true });
+    await stubCanceledPicker(page);
+    await openDemo(page);
+
+    await openThroughDaemon(page, daemon, "connecting.md");
+    await expect(statusOf(page)).toHaveText("デーモンに接続しています");
+
+    // Opening the picker and closing it again asks for no file at all, so the open still in the
+    // air is still the one being waited for.
+    await page.click("#local-open");
+    expect(await page.evaluate(() => window.wimPickerCalls)).toBe(1);
+
+    await page.evaluate(() => window.wimReleaseConnect());
+
+    await expect(statusOf(page)).toHaveText("connecting.md を開きました");
+    expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe("connecting");
   });
 
   test("leaves the keys typed into the file controls to them", async ({ page }) => {
