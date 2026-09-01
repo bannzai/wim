@@ -52,6 +52,10 @@ pub struct DirEntry {
     /// name alone when the directory listed was `.` or `""`. That path is what the client passes
     /// back to `fs.read`, `fs.write` and `fs.watch`, and it is composed the same way whichever
     /// platform the daemon runs on ([`FsListParams::path`]).
+    ///
+    /// The name is UTF-8, and a child whose name on disk is not is left out of the listing rather
+    /// than named by something that would not find it again. That is the line [`FsReadResult`]
+    /// draws around content, drawn around names: what crosses this wire is text.
     pub name: String,
     /// What the name points at.
     pub kind: EntryKind,
