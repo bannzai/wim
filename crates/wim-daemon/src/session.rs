@@ -1,16 +1,18 @@
 //! One connection: the token it opens with, the requests that follow it, and the watches it holds.
 
 use std::io;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::fs::{Dir, File, OpenOptions};
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, Sender};
@@ -23,7 +25,7 @@ use wim_protocol::{
     PROTOCOL_VERSION, Request, Response, ResponseError, is_supported_version,
 };
 
-use crate::root::{RESERVED_PREFIX, is_reserved};
+use crate::root::{RESERVED_PREFIX, confined_error, is_reserved};
 use crate::watch::Watches;
 use crate::{Shared, io_error};
 
@@ -269,45 +271,49 @@ impl Session {
 /// The daemon's own working files are not among them: a listing taken while another connection is
 /// writing would otherwise name a staged file that is gone by the time the client asks about it.
 async fn list(shared: &Shared, params: FsListParams) -> Result<Value, ResponseError> {
-    let path = shared.root.resolve(&params.path).await?;
-    let mut reader = fs::read_dir(&path)
+    let path = shared.root.relative(&params.path)?;
+    let entries = shared
+        .root
+        .blocking(move |dir| {
+            let mut entries = Vec::new();
+            for entry in dir.read_dir(&path)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                if is_reserved(&name) {
+                    continue;
+                }
+                let kind = entry.file_type()?;
+                entries.push(DirEntry {
+                    name: name.to_string_lossy().into_owned(),
+                    kind: if kind.is_symlink() {
+                        EntryKind::Symlink
+                    } else if kind.is_dir() {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    },
+                });
+            }
+            Ok(entries)
+        })
         .await
-        .map_err(|error| io_error(&params.path, error))?;
-    let mut entries = Vec::new();
-    while let Some(entry) = reader
-        .next_entry()
-        .await
-        .map_err(|error| io_error(&params.path, error))?
-    {
-        let name = entry.file_name();
-        if is_reserved(&name) {
-            continue;
-        }
-        let kind = entry
-            .file_type()
-            .await
-            .map_err(|error| io_error(&params.path, error))?;
-        entries.push(DirEntry {
-            name: name.to_string_lossy().into_owned(),
-            kind: if kind.is_symlink() {
-                EntryKind::Symlink
-            } else if kind.is_dir() {
-                EntryKind::Directory
-            } else {
-                EntryKind::File
-            },
-        });
-    }
+        .map_err(|error| confined_error(&params.path, error))?;
     serialized(&FsListResult { entries })
 }
 
 /// Reads a whole file. A file that is not UTF-8 is an error rather than bytes, because the
 /// editing core on the other side works on text.
 async fn read(shared: &Shared, params: FsReadParams) -> Result<Value, ResponseError> {
-    let path = shared.root.resolve(&params.path).await?;
-    let content = fs::read_to_string(&path)
+    let path = shared.root.relative(&params.path)?;
+    let content = shared
+        .root
+        .blocking(move |dir| {
+            let mut content = String::new();
+            dir.open(&path)?.read_to_string(&mut content)?;
+            Ok(content)
+        })
         .await
-        .map_err(|error| io_error(&params.path, error))?;
+        .map_err(|error| confined_error(&params.path, error))?;
     serialized(&FsReadResult { content })
 }
 
@@ -325,43 +331,61 @@ async fn read(shared: &Shared, params: FsReadParams) -> Result<Value, ResponseEr
 /// case falls back to writing in place
 /// (`documents/adr/0002-daemon-watch-and-staging-robustness.md`).
 async fn write(shared: &Shared, params: FsWriteParams) -> Result<Value, ResponseError> {
-    let path = shared.root.resolve(&params.path).await?;
-    if path == shared.root.path() {
+    let FsWriteParams {
+        path: requested,
+        content,
+    } = params;
+    let path = shared.root.relative(&requested)?;
+    if path == Path::new(".") {
         // The root is a directory and no file to write, and staging beside it would put the
         // staged file outside the directory this daemon serves.
         return Err(ResponseError::new(
             ErrorCode::Io,
-            format!("{}: is the directory this daemon serves", params.path),
+            format!("{requested}: is the directory this daemon serves"),
         ));
     }
-    let staged = match stage(&path, &params.content).await {
+    shared
+        .root
+        .blocking(move |dir| replace(dir, &path, &content))
+        .await
+        .map_err(|error| confined_error(&requested, error))?;
+    serialized(&Ack {})
+}
+
+/// Puts `content` at `path` under `dir`, staged and renamed over where that can be done and
+/// written over where it cannot.
+///
+/// What the rename replaces is the name the request gave rather than what that name points at, so
+/// a link under the root becomes the file that was written through it. Following it instead would
+/// mean resolving the last component here, and a link out of the root would then be a write
+/// outside the directory this daemon serves
+/// (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+fn replace(dir: &Dir, path: &Path, content: &str) -> io::Result<()> {
+    let staged = match stage(dir, path, content) {
         Ok(staged) => staged,
         Err(error) => {
             // A directory that cannot be staged in is the only reason to write any other way, and
             // a file that is already there the only thing to write that way: a destination that is
-            // not there has to be created, which is the permission the directory just refused.
+            // not there has to be created, which is the permission the directory just refused. A
+            // path that left the root is refused the same way, and answers this the same way a
+            // path that is not there does: there is nothing to fall back to.
             if error.kind() != io::ErrorKind::PermissionDenied
-                || !fs::metadata(&path)
-                    .await
-                    .is_ok_and(|metadata| metadata.is_file())
+                || !dir.metadata(path).is_ok_and(|metadata| metadata.is_file())
             {
-                return Err(io_error(&params.path, error));
+                return Err(error);
             }
             // The error worth reporting is the one the write actually ended on, so the fallback's
             // own failure replaces the refusal that led here.
-            write_in_place(&path, &params.content)
-                .await
-                .map_err(|error| io_error(&params.path, error))?;
-            return serialized(&Ack {});
+            return write_in_place(dir, path, content);
         }
     };
-    if let Err(error) = fs::rename(&staged, &path).await {
+    if let Err(error) = dir.rename(&staged, dir, path) {
         // The staged file is not something to leave behind; if it cannot be taken away either, the
         // error worth reporting is still the first one.
-        let _ = fs::remove_file(&staged).await;
-        return Err(io_error(&params.path, error));
+        let _ = dir.remove_file(&staged);
+        return Err(error);
     }
-    serialized(&Ack {})
+    Ok(())
 }
 
 /// Writes `content` into the file that is already at `path`, over the bytes that are there.
@@ -375,14 +399,50 @@ async fn write(shared: &Shared, params: FsWriteParams) -> Result<Value, Response
 /// No `create`: the directory this runs for is one that refused a new file, so a destination that
 /// is not there is not something this could make: the fallback replaces content and never widens
 /// what a write may bring into existence.
-async fn write_in_place(path: &Path, content: &str) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await?;
-    file.write_all(content.as_bytes()).await?;
-    file.flush().await
+///
+/// No following of a link at the destination either. This is the one place a write opens the
+/// destination rather than a file of its own, and what it does to it is truncate it: a link left
+/// at the name between the staging that failed and this open would otherwise be a write emptying
+/// whatever it points at. `create_new` is what keeps the staged file from being a link; this is
+/// what keeps the destination from being one
+/// (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+fn write_in_place(dir: &Dir, path: &Path, content: &str) -> io::Result<()> {
+    let mut file = dir
+        .open_with(
+            path,
+            OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .follow(FollowSymlinks::No),
+        )
+        .map_err(|error| refused_a_link(dir, path, error))?;
+    file.write_all(content.as_bytes())?;
+    file.flush()
+}
+
+/// A link refused at the destination, said as what it is; anything else as it came.
+///
+/// An open that will not follow a link reports one the way the operating system does — on Unix
+/// `ELOOP`, whose message is that too many links were followed, when none was. Which of the two
+/// happened is worked out by looking at the name afterwards rather than at the error, because the
+/// error says the same thing on one link as on a hundred and what it is called is not the same on
+/// every platform. Looking afterwards is safe where looking beforehand would not be: the write has
+/// already not happened, and what is at the name now cannot make this open have followed a link.
+///
+/// `AlreadyExists` is what a link at a staging name comes back as, and this is the same thing at
+/// the other end of the same write: something that is not this daemon's to write through is at the
+/// name it was going to write.
+fn refused_a_link(dir: &Dir, path: &Path, error: io::Error) -> io::Error {
+    if !dir
+        .symlink_metadata(path)
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return error;
+    }
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "is a link, and a write that cannot be staged does not write through one",
+    )
 }
 
 /// Stages `content` in a file of its own beside `destination`, and names that file for the rename
@@ -392,17 +452,17 @@ async fn write_in_place(path: &Path, content: &str) -> io::Result<()> {
 /// name that is already taken is a name to try again under rather than a name to open: opening it
 /// would be following whatever is there — a symlink another process on the machine left, pointing
 /// at a file outside the root — and truncating what it points at.
-async fn stage(destination: &Path, content: &str) -> io::Result<PathBuf> {
+fn stage(dir: &Dir, destination: &Path, content: &str) -> io::Result<PathBuf> {
     for _ in 0..STAGING_ATTEMPTS {
         let staged = destination.with_file_name(staging_name());
-        let mut file = match create_staged(&staged).await {
+        let mut file = match create_staged(dir, &staged) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         };
-        if let Err(error) = fill(&mut file, destination, content).await {
+        if let Err(error) = fill(dir, &mut file, destination, content) {
             drop(file);
-            let _ = fs::remove_file(&staged).await;
+            let _ = dir.remove_file(&staged);
             return Err(error);
         }
         return Ok(staged);
@@ -418,12 +478,8 @@ async fn stage(destination: &Path, content: &str) -> io::Result<PathBuf> {
 /// `create_new` is what makes it that file rather than whatever the name already holds: it fails
 /// on a path that is there, symlinks included, so a link left at the name is a write that fails
 /// instead of a write through it.
-async fn create_staged(staged: &Path) -> io::Result<fs::File> {
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(staged)
-        .await
+fn create_staged(dir: &Dir, staged: &Path) -> io::Result<File> {
+    dir.open_with(staged, OpenOptions::new().write(true).create_new(true))
 }
 
 /// Puts the content of a write in the staged file, as the file that is about to be `destination`.
@@ -432,11 +488,11 @@ async fn create_staged(staged: &Path) -> io::Result<fs::File> {
 /// that is already there are carried over: without them a `0755` script saved through the daemon
 /// would come back `0644`, which is what the process umask made the staged file. A destination
 /// that is not there yet is a file being created, and keeps the permissions the umask gave it.
-async fn fill(file: &mut fs::File, destination: &Path, content: &str) -> io::Result<()> {
-    file.write_all(content.as_bytes()).await?;
-    file.flush().await?;
-    if let Ok(metadata) = fs::metadata(destination).await {
-        file.set_permissions(metadata.permissions()).await?;
+fn fill(dir: &Dir, file: &mut File, destination: &Path, content: &str) -> io::Result<()> {
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    if let Ok(metadata) = dir.metadata(destination) {
+        file.set_permissions(metadata.permissions())?;
     }
     Ok(())
 }
@@ -536,7 +592,9 @@ mod tests {
         let staged = shared.root.path().join(".wim-0123456789abcdef");
         std::os::unix::fs::symlink(&outside, &staged).expect("the link should be created");
 
-        let error = create_staged(&staged)
+        let error = shared
+            .root
+            .blocking(|dir| create_staged(dir, Path::new(".wim-0123456789abcdef")))
             .await
             .expect_err("a name that is already taken should not open");
 
@@ -648,6 +706,89 @@ mod tests {
         assert!(!path.exists(), "the file is not brought into existence");
     }
 
+    /// The one open a write makes on the destination itself is the fallback's, and it truncates
+    /// what it opens. A link planted at the name after the staging that failed would empty what it
+    /// points at if that open followed it, and this is what fixes that it does not
+    /// (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_that_falls_back_does_not_write_through_a_link_left_at_the_destination() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (directory, shared) = shared().await;
+        let outside = directory.path().join("secret.md");
+        // The link stands where the write is headed, and what it points at is outside the root:
+        // the file a fallback that followed it would truncate.
+        std::os::unix::fs::symlink(&outside, shared.root.path().join("notes.md"))
+            .expect("the link should be created");
+        std::fs::set_permissions(shared.root.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("the permissions of the directory should be set");
+
+        let outcome = if refuses_creation(shared.root.path()) {
+            Some(write_through(&shared, "notes.md", "planted\n").await)
+        } else {
+            None
+        };
+
+        std::fs::set_permissions(shared.root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("the permissions of the directory should be put back");
+        let Some(outcome) = outcome else {
+            return;
+        };
+        outcome.expect_err("a write should not go through a link at the destination");
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("the file should be readable"),
+            "secret\n",
+            "what the link points at is left as it was"
+        );
+        assert!(
+            std::fs::symlink_metadata(shared.root.path().join("notes.md"))
+                .expect("the link should be there")
+                .file_type()
+                .is_symlink(),
+            "the link itself is left as it was"
+        );
+    }
+
+    /// The same refusal where the link points back into the root: what is refused is writing
+    /// through a link, not leaving the root, so this does not depend on where the link goes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_write_that_falls_back_does_not_write_through_a_link_into_the_root_either() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_directory, shared) = shared().await;
+        let target = shared.root.path().join("target.md");
+        std::fs::write(&target, "target\n").expect("the file should be written");
+        std::os::unix::fs::symlink("target.md", shared.root.path().join("notes.md"))
+            .expect("the link should be created");
+        std::fs::set_permissions(shared.root.path(), std::fs::Permissions::from_mode(0o555))
+            .expect("the permissions of the directory should be set");
+
+        let outcome = if refuses_creation(shared.root.path()) {
+            Some(write_through(&shared, "notes.md", "planted\n").await)
+        } else {
+            None
+        };
+
+        std::fs::set_permissions(shared.root.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("the permissions of the directory should be put back");
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let error = outcome.expect_err("a write should not go through a link at the destination");
+        assert!(
+            error.message.contains("does not write through one"),
+            "the refusal says what was refused rather than reporting a loop: {}",
+            error.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("the file should be readable"),
+            "target\n",
+            "what the link points at is left as it was"
+        );
+    }
+
     #[tokio::test]
     async fn a_write_to_a_name_as_long_as_the_file_system_allows_goes_through() {
         let (_directory, shared) = shared().await;
@@ -664,6 +805,107 @@ mod tests {
                 .expect("the file should be readable"),
             "hello\n"
         );
+    }
+
+    /// A listing reports a link as the entry it is, whether or not what it points at is something
+    /// this daemon serves: what the entry is has to come from the directory rather than from
+    /// following the name, which is the one thing a directory handle's entries could have changed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listing_reports_a_link_as_a_link_wherever_it_points() {
+        let (directory, shared) = shared().await;
+        std::fs::write(shared.root.path().join("notes.md"), "hello\n")
+            .expect("the file should be written");
+        std::os::unix::fs::symlink("notes.md", shared.root.path().join("inside.md"))
+            .expect("the link should be created");
+        std::os::unix::fs::symlink(
+            directory.path().join("secret.md"),
+            shared.root.path().join("outside.md"),
+        )
+        .expect("the link should be created");
+
+        let result = list(
+            &shared,
+            FsListParams {
+                path: ".".to_owned(),
+            },
+        )
+        .await
+        .expect("the root should be listed");
+
+        let listed: FsListResult =
+            serde_json::from_value(result).expect("the result should be a listing");
+        let mut kinds: Vec<(String, EntryKind)> = listed
+            .entries
+            .into_iter()
+            .map(|entry| (entry.name, entry.kind))
+            .collect();
+        kinds.sort_by(|one, other| one.0.cmp(&other.0));
+        assert_eq!(
+            kinds,
+            vec![
+                ("inside.md".to_owned(), EntryKind::Symlink),
+                ("notes.md".to_owned(), EntryKind::File),
+                ("outside.md".to_owned(), EntryKind::Symlink),
+            ]
+        );
+    }
+
+    /// The read of `path`, as the method a client's request reaches.
+    async fn read_through(shared: &Shared, path: &str) -> Result<String, ResponseError> {
+        let result = read(
+            shared,
+            FsReadParams {
+                path: path.to_owned(),
+            },
+        )
+        .await?;
+        let read: FsReadResult =
+            serde_json::from_value(result).expect("the result should be a read");
+        Ok(read.content)
+    }
+
+    /// A link out of the root is refused where it is followed rather than before it is: nothing
+    /// resolves the path ahead of the open any more, so this is what fixes that the client is told
+    /// the same thing it was told when something did
+    /// (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_through_a_link_that_leaves_the_root_is_refused() {
+        let (directory, shared) = shared().await;
+        std::os::unix::fs::symlink(
+            directory.path().join("secret.md"),
+            shared.root.path().join("link.md"),
+        )
+        .expect("the link should be created");
+
+        let error = read_through(&shared, "link.md")
+            .await
+            .expect_err("reading through a link out of the root should be refused");
+
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
+        assert_eq!(
+            error.message,
+            "link.md: outside the directory this daemon serves"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_read_through_a_link_that_stays_in_the_root_goes_through() {
+        let (_directory, shared) = shared().await;
+        std::fs::write(shared.root.path().join("notes.md"), "hello\n")
+            .expect("the file should be written");
+        // Relative, because what an absolute link target names is a path in the file system the
+        // daemon was started in rather than one under the root.
+        std::os::unix::fs::symlink("notes.md", shared.root.path().join("link.md"))
+            .expect("the link should be created");
+
+        let content = read_through(&shared, "link.md")
+            .await
+            .expect("a link under the root should be read through");
+
+        assert_eq!(content, "hello\n");
     }
 
     #[test]

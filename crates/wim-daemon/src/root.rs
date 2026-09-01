@@ -3,7 +3,10 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use tokio::fs;
 use wim_protocol::{ErrorCode, ResponseError};
 
@@ -29,11 +32,16 @@ pub(crate) fn is_reserved(name: &OsStr) -> bool {
         .starts_with(RESERVED_PREFIX.as_bytes())
 }
 
-/// The directory a daemon serves, resolved once so that everything it is compared against holds
-/// no symlink and no `..`.
+/// The directory a daemon serves: the one name this process looks up in the file system it was
+/// started in, and the handle everything a request names is reached through.
 #[derive(Debug)]
 pub struct Root {
     path: PathBuf,
+    /// The open directory a request's path is opened relative to.
+    ///
+    /// Shared rather than borrowed because the calls it is used for block and are run on the
+    /// blocking pool, which keeps what it is handed for as long as the call takes.
+    dir: Arc<Dir>,
 }
 
 impl Root {
@@ -50,7 +58,16 @@ impl Root {
                 format!("{}: a daemon serves a directory", path.display()),
             ));
         }
-        Ok(Self { path })
+        // The one place this process reaches into the file system it was started in by name.
+        // Every path a request names afterwards is opened relative to the handle this returns, so
+        // the authority a connection has is this directory and nothing above it
+        // (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+        let opened = path.clone();
+        let dir = blocking(move || Dir::open_ambient_dir(&opened, ambient_authority())).await?;
+        Ok(Self {
+            path,
+            dir: Arc::new(dir),
+        })
     }
 
     /// The directory itself.
@@ -58,38 +75,27 @@ impl Root {
         &self.path
     }
 
-    /// The path a request names, as a path under the root.
+    /// The path a request names, as a path to be opened under the root's directory.
     ///
-    /// A relative path is read from the root, and an absolute one is taken as it is; either way
-    /// what comes back is inside the root, so a `..` that climbs out of it and a symlink that
-    /// points out of it are both refused here rather than in each method.
-    pub async fn resolve(&self, requested: &str) -> Result<PathBuf, ResponseError> {
-        refuse_reserved(requested)?;
-        let asked = Path::new(requested);
-        let candidate = if asked.is_absolute() {
-            asked.to_path_buf()
+    /// Worked out without asking the file system what any name along it points at: a relative path
+    /// is read from the root, an absolute one has the root taken off its front, and a path that is
+    /// not under the root that way is refused. What the names along it point at is settled by the
+    /// open itself, at every component of it, which is what leaves no moment between deciding a
+    /// path is inside the root and using it for another process to change the answer
+    /// (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+    ///
+    /// The root itself comes back as `.`, which is the path a directory is asked for itself by; an
+    /// empty path is not one an open takes.
+    pub(crate) fn relative(&self, requested: &str) -> Result<PathBuf, ResponseError> {
+        let confined = self.resolve_lexically(requested)?;
+        let relative = confined
+            .strip_prefix(&self.path)
+            .expect("a confined path begins with the root");
+        Ok(if relative.as_os_str().is_empty() {
+            PathBuf::from(".")
         } else {
-            self.path.join(asked)
-        };
-        // `..` is taken out before the file system is asked anything, so that a path that does not
-        // exist yet still has a parent worth resolving.
-        let candidate = without_relative_components(&candidate);
-        match fs::canonicalize(&candidate).await {
-            Ok(resolved) => self.confine(requested, resolved),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                // `fs.write` names a file that need not exist yet, so the directory that would
-                // hold it is what has to be inside the root.
-                let (parent, name) = candidate
-                    .parent()
-                    .zip(candidate.file_name())
-                    .ok_or_else(|| escaped(requested))?;
-                let parent = fs::canonicalize(parent)
-                    .await
-                    .map_err(|error| io_error(requested, error))?;
-                Ok(self.confine(requested, parent)?.join(name))
-            }
-            Err(error) => Err(io_error(requested, error)),
-        }
+            relative.to_path_buf()
+        })
     }
 
     /// The path a watch names, worked out without asking the file system what the names on it
@@ -111,6 +117,22 @@ impl Root {
         self.confine(requested, without_relative_components(&candidate))
     }
 
+    /// Runs `operation` on the root's directory, off the threads the runtime answers requests on.
+    ///
+    /// The calls a directory handle takes block, the way `std::fs`'s do and unlike `tokio::fs`'s,
+    /// which puts each of them on the blocking pool by itself. A whole request goes there at once
+    /// instead, which is the grain the daemon already works at: one connection's requests are
+    /// answered one after another, so a write's staging, filling and renaming have nothing to
+    /// interleave with.
+    pub(crate) async fn blocking<T, F>(&self, operation: F) -> io::Result<T>
+    where
+        F: FnOnce(&Dir) -> io::Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let dir = Arc::clone(&self.dir);
+        blocking(move || operation(&dir)).await
+    }
+
     /// `resolved` itself when it is under the root, and an error when it is not.
     fn confine(&self, requested: &str, resolved: PathBuf) -> Result<PathBuf, ResponseError> {
         if resolved.starts_with(&self.path) {
@@ -119,6 +141,42 @@ impl Root {
             Err(escaped(requested))
         }
     }
+}
+
+/// A file system error from an operation under the root, as the response the client reads.
+///
+/// A path that led out of the root while it was being opened is answered the same way a path that
+/// leaves it lexically is, so a client cannot tell a symlink out of the root from a `..`: both are
+/// paths this daemon does not serve.
+pub(crate) fn confined_error(requested: &str, error: io::Error) -> ResponseError {
+    if led_outside(&error) {
+        escaped(requested)
+    } else {
+        io_error(requested, error)
+    }
+}
+
+/// Whether `error` is the refusal of a path that resolved out of the root.
+///
+/// There is no error kind of its own to match on: cap-std reports it as `PermissionDenied`, which
+/// is also what a directory the operating system refuses comes back as. What tells the two apart
+/// is that cap-std builds this one itself and no `errno` is behind it, while a refusal from the
+/// operating system carries `EACCES` (cap-std 4.0, `cap_primitives::fs::errors::escape_attempt`).
+fn led_outside(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::PermissionDenied && error.raw_os_error().is_none()
+}
+
+/// Runs a blocking file system call on the pool the runtime keeps for them.
+async fn blocking<T, F>(operation: F) -> io::Result<T>
+where
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    // A blocking task is not cancelled once it has started, so the only thing that ends one
+    // without a result is a panic inside it, which belongs to the connection that asked for it.
+    tokio::task::spawn_blocking(operation)
+        .await
+        .unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()))
 }
 
 /// What a request that reaches outside the root is answered with.
@@ -170,6 +228,8 @@ fn without_relative_components(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
+    use std::io::Read;
+
     use tempfile::TempDir;
 
     /// A root directory holding `notes.md`, with `secret.md` next to it, outside the root.
@@ -184,14 +244,25 @@ mod tests {
         (directory, root)
     }
 
+    /// What reading `path` through the root's directory comes back as, as a client would see it.
+    async fn read_through(root: &Root, requested: &str) -> Result<String, ResponseError> {
+        let path = root.relative(requested)?;
+        root.blocking(move |dir| {
+            let mut content = String::new();
+            dir.open(&path)?.read_to_string(&mut content)?;
+            Ok(content)
+        })
+        .await
+        .map_err(|error| confined_error(requested, error))
+    }
+
     #[tokio::test]
     async fn a_relative_path_is_read_from_the_root() {
         let (_directory, root) = root().await;
         let resolved = root
-            .resolve("notes.md")
-            .await
+            .relative("notes.md")
             .expect("a file in the root should resolve");
-        assert_eq!(resolved, root.path().join("notes.md"));
+        assert_eq!(resolved, Path::new("notes.md"));
     }
 
     #[tokio::test]
@@ -199,24 +270,21 @@ mod tests {
         let (_directory, root) = root().await;
         for requested in [".", ""] {
             assert_eq!(
-                root.resolve(requested)
-                    .await
-                    .expect("the root should resolve"),
-                root.path(),
+                root.relative(requested).expect("the root should resolve"),
+                Path::new("."),
                 "{requested:?}"
             );
         }
     }
 
     #[tokio::test]
-    async fn an_absolute_path_inside_the_root_resolves_to_itself() {
+    async fn an_absolute_path_inside_the_root_resolves_to_what_it_names_under_it() {
         let (_directory, root) = root().await;
         let inside = root.path().join("notes.md");
         let resolved = root
-            .resolve(&inside.display().to_string())
-            .await
+            .relative(&inside.display().to_string())
             .expect("a file in the root should resolve");
-        assert_eq!(resolved, inside);
+        assert_eq!(resolved, Path::new("notes.md"));
     }
 
     #[tokio::test]
@@ -230,28 +298,42 @@ mod tests {
             &outside,
         ] {
             let error = root
-                .resolve(requested)
-                .await
+                .relative(requested)
                 .expect_err("a path outside the root should be refused");
             assert_eq!(error.code, ErrorCode::PermissionDenied, "{requested}");
         }
+    }
+
+    /// An absolute path is confined by the root's name rather than by what it resolves to, so one
+    /// that reaches the same directory by another name is not a path this daemon serves
+    /// (`documents/adr/0003-daemon-beneath-semantics-with-cap-std.md`).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_absolute_path_that_reaches_the_root_under_another_name_is_refused() {
+        let (directory, root) = root().await;
+        let link = directory.path().join("another-name");
+        std::os::unix::fs::symlink(root.path(), &link).expect("the link should be created");
+
+        let error = root
+            .relative(&link.join("notes.md").display().to_string())
+            .expect_err("a path that does not begin with the root should be refused");
+
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
     }
 
     #[tokio::test]
     async fn a_path_that_does_not_exist_yet_resolves_so_that_it_can_be_written() {
         let (_directory, root) = root().await;
         let resolved = root
-            .resolve("new.md")
-            .await
+            .relative("new.md")
             .expect("a file to be created should resolve");
-        assert_eq!(resolved, root.path().join("new.md"));
+        assert_eq!(resolved, Path::new("new.md"));
     }
 
     #[tokio::test]
     async fn a_path_under_a_directory_that_is_not_there_is_reported_as_missing() {
         let (_directory, root) = root().await;
-        let error = root
-            .resolve("nowhere/new.md")
+        let error = read_through(&root, "nowhere/new.md")
             .await
             .expect_err("a file under a missing directory should be refused");
         assert_eq!(error.code, ErrorCode::NotFound);
@@ -282,8 +364,7 @@ mod tests {
             &inside,
         ] {
             let error = root
-                .resolve(requested)
-                .await
+                .relative(requested)
                 .expect_err("a name this daemon keeps for itself should be refused");
             assert_eq!(error.code, ErrorCode::PermissionDenied, "{requested}");
             let error = root
@@ -308,13 +389,55 @@ mod tests {
             "the link is watched, not the file outside the root it points at"
         );
         assert_eq!(
-            root.resolve("link.md")
+            read_through(&root, "link.md")
                 .await
                 .expect_err("reading through a link out of the root should be refused")
                 .code,
             ErrorCode::PermissionDenied,
             "what may be read is still what is under the root"
         );
+    }
+
+    /// The refusal a link out of the root is answered with is the one a `..` out of it gets: the
+    /// path is refused at the open rather than before it, and the client is told the same thing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_that_leads_out_of_the_root_is_refused_the_way_a_path_that_leaves_it_is() {
+        let (directory, root) = root().await;
+        std::os::unix::fs::symlink(
+            directory.path().join("secret.md"),
+            root.path().join("link.md"),
+        )
+        .expect("the link should be created");
+
+        let error = read_through(&root, "link.md")
+            .await
+            .expect_err("reading through a link out of the root should be refused");
+
+        assert_eq!(error.code, ErrorCode::PermissionDenied);
+        assert_eq!(
+            error.message,
+            "link.md: outside the directory this daemon serves"
+        );
+    }
+
+    /// A link is followed for as long as it stays under the root: what is refused is leaving, not
+    /// links.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_that_stays_in_the_root_is_read_through() {
+        let (_directory, root) = root().await;
+        // Relative, because a link whose target is written as an absolute path names a file in the
+        // file system the daemon was started in rather than one under the root, and is refused
+        // however that path reads.
+        std::os::unix::fs::symlink("notes.md", root.path().join("link.md"))
+            .expect("the link should be created");
+
+        let content = read_through(&root, "link.md")
+            .await
+            .expect("a link under the root should be read through");
+
+        assert_eq!(content, "hello\n");
     }
 
     #[tokio::test]
@@ -327,6 +450,20 @@ mod tests {
                 .expect_err("a path outside the root should be refused");
             assert_eq!(error.code, ErrorCode::PermissionDenied, "{requested}");
         }
+    }
+
+    #[test]
+    fn a_refusal_the_operating_system_made_is_not_read_as_a_path_that_left_the_root() {
+        let refused = io::Error::from_raw_os_error(
+            // EACCES, which is what a directory the process may not enter comes back as.
+            13,
+        );
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!led_outside(&refused));
+        assert_eq!(
+            confined_error("locked/notes.md", refused).message,
+            format!("locked/notes.md: {}", io::Error::from_raw_os_error(13))
+        );
     }
 
     #[test]
