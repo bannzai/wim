@@ -69,6 +69,47 @@ function dispatchKey(page, init) {
   );
 }
 
+/**
+ * Drives an IME the way the platform's own does, through Chrome's input protocol.
+ *
+ * `Input.imeSetComposition` is the composition a real IME puts up — it raises
+ * `compositionstart` and `compositionupdate` on whatever is focused, and nothing at all when
+ * that is not something text can be composed into — and `Input.insertText` is the confirmation,
+ * which ends the composition and hands over the text. Synthesising `CompositionEvent`s by hand
+ * would test the demo's handlers against events it wrote itself; this way the browser decides
+ * what the demo hears, the same as with a keyboard.
+ */
+async function ime(page) {
+  const session = await page.context().newCDPSession(page);
+  return {
+    /** Puts `text` up as the unconfirmed composition, with the caret at its end. */
+    compose: (text) =>
+      session.send("Input.imeSetComposition", {
+        text,
+        selectionStart: text.length,
+        selectionEnd: text.length,
+      }),
+    /** Drops the composition, which is what an IME does when it is cancelled. */
+    cancel: () =>
+      session.send("Input.imeSetComposition", { text: "", selectionStart: 0, selectionEnd: 0 }),
+    /** Confirms the composition as `text`. */
+    commit: (text) => session.send("Input.insertText", { text }),
+  };
+}
+
+/** The overlay the composition is drawn in, as `{ text, visible, left, top }`. */
+function overlayOf(page) {
+  return page.evaluate(() => {
+    const preedit = document.querySelector("#preedit");
+    return {
+      text: preedit.textContent,
+      visible: !preedit.hidden,
+      left: Number.parseFloat(preedit.style.left),
+      top: Number.parseFloat(preedit.style.top),
+    };
+  });
+}
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/index.html");
   await page.waitForFunction(() => window.wimDemo !== undefined);
@@ -172,6 +213,142 @@ test("AltGr and Option type their character rather than a shortcut", async ({ pa
   expect(await dispatchKey(page, { key: "e", isComposing: true })).toBe(false);
 
   expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe(`@€${FIRST_LINE}`);
+});
+
+test("a composition is an overlay until the IME confirms it", async ({ page }) => {
+  await page.keyboard.press("i");
+  expect(await page.evaluate(() => window.wimDemo.state().ime.focused)).toBe(true);
+
+  const composer = await ime(page);
+  await composer.compose("にほんご");
+
+  const composing = await page.evaluate(() => window.wimDemo.state());
+  expect(composing.ime.composition).toBe("にほんご");
+  // Nothing is confirmed yet, so the core has not been told about any of it.
+  expect(composing.lines[0]).toBe(FIRST_LINE);
+  expect(composing.cursor).toEqual({ line: 0, col: 0 });
+
+  const overlay = await overlayOf(page);
+  expect(overlay).toMatchObject({ text: "にほんご", visible: true });
+  // Drawn where the cursor is, which on the first column of the first line is the top left of
+  // the text area.
+  expect(overlay.left).toBeCloseTo(composing.layout.textLeft);
+  expect(overlay.top).toBe(composing.layout.padding);
+
+  await composer.commit("日本語");
+
+  const committed = await page.evaluate(() => window.wimDemo.state());
+  expect(committed.lines[0]).toBe(`日本語${FIRST_LINE}`);
+  // Three graphemes typed, each of them two cells wide, so the cursor is three columns and six
+  // cells along.
+  expect(committed.cursor).toEqual({ line: 0, col: 3 });
+  expect(committed.damage).toEqual({ start: 0, end: 1 });
+  expect(committed.ime.cursor.x).toBeCloseTo(
+    committed.layout.textLeft + 6 * committed.layout.cellWidth,
+  );
+  expect(committed.ime.composition).toBe("");
+  expect(await overlayOf(page)).toMatchObject({ visible: false });
+});
+
+test("Normal mode has nothing for an IME to compose into", async ({ page }) => {
+  const composer = await ime(page);
+  expect(await page.evaluate(() => window.wimDemo.state().ime.focused)).toBe(false);
+
+  await composer.compose("にほん");
+  await composer.commit("日本");
+
+  const state = await page.evaluate(() => window.wimDemo.state());
+  expect(state.lines[0]).toBe(FIRST_LINE);
+  expect(state.mode).toBe("NORMAL");
+  expect(state.ime.composition).toBe("");
+  expect(await overlayOf(page)).toMatchObject({ visible: false });
+
+  // Keys are still read as commands rather than as text to compose.
+  await page.keyboard.press("x");
+  expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe(FIRST_LINE.slice(1));
+});
+
+test("Esc belongs to the IME while it is composing", async ({ page }) => {
+  await page.keyboard.press("i");
+
+  // Every key of a composition is the IME's, the named ones included: Enter confirms, Esc
+  // abandons and Backspace edits what is being composed.
+  for (const key of ["Escape", "Enter", "Backspace", "Tab"]) {
+    expect(await dispatchKey(page, { key, isComposing: true })).toBe(false);
+  }
+
+  const composer = await ime(page);
+  await composer.compose("にほん");
+  await page.keyboard.press("Escape");
+
+  const composing = await page.evaluate(() => window.wimDemo.state());
+  // The Esc went to the IME, so the editor is still where it was, with the composition up.
+  expect(composing.mode).toBe("INSERT");
+  expect(composing.ime.composition).toBe("にほん");
+  expect(composing.lines[0]).toBe(FIRST_LINE);
+
+  // A real IME answers that Esc by dropping the composition, which is what the protocol's empty
+  // composition stands for here.
+  await composer.cancel();
+  const dropped = await page.evaluate(() => window.wimDemo.state());
+  expect(dropped.mode).toBe("INSERT");
+  expect(dropped.ime.composition).toBe("");
+  expect(dropped.lines[0]).toBe(FIRST_LINE);
+  expect(await overlayOf(page)).toMatchObject({ visible: false });
+
+  // With the composition gone the next Esc is the editor's again, and the mode it leaves behind
+  // takes keys as commands.
+  await page.keyboard.press("Escape");
+  const normal = await page.evaluate(() => window.wimDemo.state());
+  expect(normal.mode).toBe("NORMAL");
+  expect(normal.ime.focused).toBe(false);
+
+  await page.keyboard.press("x");
+  expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe(FIRST_LINE.slice(1));
+});
+
+test("the command line takes composed text too", async ({ page }) => {
+  await page.keyboard.type(":w ");
+  const opened = await page.evaluate(() => window.wimDemo.state());
+  expect(opened.mode).toBe("COMMAND");
+  expect(opened.ime.focused).toBe(true);
+
+  const composer = await ime(page);
+  await composer.compose("めも");
+
+  const composing = await page.evaluate(() => window.wimDemo.state());
+  expect(composing.ime.composition).toBe("めも");
+  expect(composing.commandLine).toBe(":w ");
+  // The command line is typed into the status line, so that is where the composition is drawn:
+  // under every row of the buffer, three cells along for the `:w ` already typed.
+  const overlay = await overlayOf(page);
+  expect(overlay).toMatchObject({ text: "めも", visible: true });
+  expect(overlay.left).toBeCloseTo(composing.layout.padding + 3 * composing.layout.cellWidth);
+  expect(overlay.top).toBeGreaterThanOrEqual(
+    composing.layout.padding + composing.viewport.rows * composing.layout.lineHeight,
+  );
+
+  await composer.commit("メモ.txt");
+  expect(await page.evaluate(() => window.wimDemo.state().commandLine)).toBe(":w メモ.txt");
+
+  await page.keyboard.press("Enter");
+  const state = await page.evaluate(() => window.wimDemo.state());
+  expect(state.mode).toBe("NORMAL");
+  expect(state.effects).toEqual([{ kind: "save", path: "メモ.txt" }]);
+  expect(state.ime.focused).toBe(false);
+});
+
+test("composed text that reads as key notation is typed rather than run", async ({ page }) => {
+  await page.keyboard.press("i");
+
+  const composer = await ime(page);
+  await composer.compose("<");
+  await composer.commit("<Esc>x");
+
+  const state = await page.evaluate(() => window.wimDemo.state());
+  expect(state.lines[0]).toBe(`<Esc>x${FIRST_LINE}`);
+  // The `<Esc>` went in as the six characters it is, so the editor never left Insert mode.
+  expect(state.mode).toBe("INSERT");
 });
 
 test("an Ex command hands its effect back to the host", async ({ page }) => {

@@ -44,6 +44,46 @@
         border-radius: 6px;
       }
 
+      /* The box the IME's two elements are positioned inside, so that the pixel offsets
+         `main.js` measures on the canvas are the ones they are placed at. */
+      .screen {
+        position: relative;
+        max-width: 880px;
+      }
+
+      /* Where an IME composes. It stays in the layout and stays focusable — `display: none` and
+         `visibility: hidden` both take an element out of the focus order, and an unfocused
+         element composes nothing — so it is made invisible instead, and moved under the cursor
+         so that the candidate window opens there. */
+      #ime {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        margin: 0;
+        padding: 0;
+        border: 0;
+        outline: none;
+        resize: none;
+        overflow: hidden;
+        opacity: 0;
+        /* What is being composed is drawn by #preedit, so the textarea's own copy of it is
+           never seen even where the element itself shows through. */
+        color: transparent;
+        background: transparent;
+      }
+
+      /* The composed text, drawn over the canvas at the cursor until the IME confirms it. The
+         font is set from `main.js`, which owns the size the canvas is drawn at. */
+      #preedit {
+        position: absolute;
+        white-space: pre;
+        pointer-events: none;
+        background: var(--background);
+        color: var(--foreground);
+        /* Vim, and every IME's own inline mode, underlines what is not confirmed yet. */
+        text-decoration: underline;
+      }
+
       a {
         color: inherit;
       }
@@ -55,9 +95,20 @@
       <p>
         キーボードで直接編集できます。<code>i</code> / <code>a</code> / <code>o</code> で Insert、<code>Esc</code> で Normal、
         <code>hjkl</code> <code>w</code> <code>b</code> <code>0</code> <code>$</code> <code>gg</code> <code>G</code> で移動、<code>x</code> <code>dd</code>
-        <code>yy</code> <code>p</code> <code>u</code> と <code>:</code> の Ex コマンドが使えます。日本語入力 (IME) とファイル操作はまだ入っていません。
+        <code>yy</code> <code>p</code> <code>u</code> と <code>:</code> の Ex コマンドが使えます。Insert と Ex コマンドラインでは日本語入力 (IME) が使えます。ファイル操作はまだ入っていません。
       </p>
-      <canvas id="screen" width="880" height="440"></canvas>
+      <div class="screen">
+        <canvas id="screen" width="880" height="440"></canvas>
+        <textarea
+          id="ime"
+          aria-label="エディタの入力欄"
+          autocomplete="off"
+          autocapitalize="off"
+          autocorrect="off"
+          spellcheck="false"
+        ></textarea>
+        <div id="preedit" hidden></div>
+      </div>
       <p><a href="https://github.com/bannzai/wim">github.com/bannzai/wim</a></p>
     </main>
     <script type="module" src="./main.js"></script>
