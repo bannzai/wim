@@ -33,5 +33,14 @@ mkdir -p "$DESTINATION"
 curl --fail --location --silent --show-error \
     "https://github.com/bytecodealliance/wasm-tools/releases/download/v$VERSION/$ARCHIVE" |
     tar -xz -C "$DESTINATION"
+# The extracted directory is renamed to a platform-free name so that $BINARY reads the same
+# everywhere; a destination left behind by a broken earlier run would make `mv` nest instead of
+# rename, so it is cleared first.
+rm -rf "$DESTINATION/wasm-tools-$VERSION"
 mv "$DESTINATION/wasm-tools-$VERSION-$TARGET" "$DESTINATION/wasm-tools-$VERSION"
+if [ ! -x "$BINARY" ]; then
+    echo "wasm-tools did not land at $BINARY; $DESTINATION holds:" >&2
+    ls -laR "$DESTINATION" >&2
+    exit 1
+fi
 echo "$BINARY"

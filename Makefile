@@ -36,6 +36,7 @@ install-wasm-bindgen:
 # turned into a component by a pinned wasm-tools binary.
 build-plugins:
 	cargo build --manifest-path $(PLUGINS) --target wasm32-unknown-unknown --release --locked
+	bash scripts/install-wasm-tools.sh > /dev/null
 	"$$(bash scripts/install-wasm-tools.sh)" component new $(HELLO_WIM_CORE) -o $(HELLO_WIM)
 	bash scripts/check-wasm-component.sh $(HELLO_WIM)
 
