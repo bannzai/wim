@@ -1,0 +1,5 @@
+name = "text an IME confirms goes in as characters even where it reads as key notation"
+input = "です"
+keys = "i<lt>Esc>と<lt>C-r>メモ<Esc>"
+expected = "<Esc>と<C-r>メモです"
+expected_cursor = [0, 12]
