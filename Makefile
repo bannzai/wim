@@ -23,7 +23,7 @@ build-web-plugins: build-plugins
 		markdown-preview="$(CURDIR)/$(MARKDOWN_PREVIEW)"
 
 # Builds the demo and serves it at http://127.0.0.1:4173/.
-web: build-web
+web: build-web build-web-plugins
 	node web/serve.mjs
 
 # Runs the browser E2E against a freshly built demo. The daemon is built too: the file-access

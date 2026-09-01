@@ -72,8 +72,9 @@ by, so --name is what a run gives it: markdown-preview answers with a panel for 
 host close the panel on — so a run that gets it writes nothing to standard output and says so on
 standard error, and ends successfully.
 
-What a host does with the HTML it gets back is not print it: it is not trusted, and both hosts
-put it somewhere nothing in it can run (wit/README.md).
+The HTML is not trusted: the browser host draws it in an isolated frame where nothing in it can
+run (wit/README.md), and this command writes it to standard output so that it can be redirected
+and verified.
 
 The plugin runs with nothing of this machine reachable from inside it: no files, no network, no
 clock. A component asking for any of that is refused rather than loaded.")]

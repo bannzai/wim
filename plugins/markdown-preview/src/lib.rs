@@ -103,15 +103,17 @@ fn to_html(text: &str) -> String {
 
 /// The Markdown dialect the preview reads.
 ///
-/// CommonMark plus the four extensions GitHub adds to it, because the files this previews are
-/// written to be read there: a table, a `~~strikethrough~~`, a `- [ ]` task list or a footnote
-/// would otherwise render as the punctuation it is written with. Nothing here changes what plain
-/// CommonMark means, so a file using none of them renders the same either way.
+/// CommonMark plus the extensions GitHub adds to it, because the files this previews are
+/// written to be read there: a table, a `~~strikethrough~~`, a `- [ ]` task list, a footnote or
+/// a `> [!NOTE]` alert would otherwise render as the punctuation it is written with. Nothing
+/// here changes what plain CommonMark means, so a file using none of them renders the same
+/// either way.
 fn options() -> Options {
     Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_GFM
 }
 
 #[cfg(test)]
@@ -124,6 +126,12 @@ mod tests {
             text: text.to_string(),
             cursor: wim::plugin::buffer::Position { line: 0, column: 0 },
         }
+    }
+
+    #[test]
+    fn a_github_alert_renders_as_an_alert_rather_than_a_quote() {
+        let html = to_html("> [!NOTE]\n> Read this.\n");
+        assert!(html.contains("markdown-alert-note"), "{html}");
     }
 
     #[test]
