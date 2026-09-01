@@ -62,7 +62,7 @@ FSEvents はストリーム開始直後の変更を取りこぼす window があ
 
 - `.wim-*` はクライアントから見えず・触れない名前になる (ワイヤ上のメソッドは不変。`fs.list` / `fs.changed` の結果からの除外とパス拒否はサーバー側の意味論)
 - 読まないクライアントは watch のバーストで切断され得る。再接続 + 再読み込みが回復手順
-- `fs.watch` の成功応答は「以降の変更は報告される」を (best effort で) 意味するようになり、E2E のリトライ回避策は不要になる
+- `fs.watch` の成功応答は「以降の変更は報告される」を (best effort で) 意味するようになる。ただし実測で FSEvents のストリーム開始が 2 秒の予算を超えることがあり (約 4 秒の観測例)、その場合は best effort に倒れるため、E2E の変更リトライは保険として残す (`crates/wim-daemon/tests/e2e.rs` の `CHANGE_RETRY` に測定値を記録)
 - symlink への watch は名前の監視になり、実体追跡が欲しいクライアントは実体パスを watch する
 - issue #31 (cap-std) はこの ADR の 4 を前提に、read/write/list の閉じ込めだけを置き換える
 
