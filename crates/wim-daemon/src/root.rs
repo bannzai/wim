@@ -454,15 +454,19 @@ mod tests {
 
     #[test]
     fn a_refusal_the_operating_system_made_is_not_read_as_a_path_that_left_the_root() {
-        let refused = io::Error::from_raw_os_error(
-            // EACCES, which is what a directory the process may not enter comes back as.
-            13,
-        );
+        // What a directory the process may not enter comes back as: EACCES on unix, and
+        // ERROR_ACCESS_DENIED on Windows, where 13 would be ERROR_INVALID_DATA and carry
+        // another kind entirely.
+        #[cfg(unix)]
+        let denied = 13;
+        #[cfg(windows)]
+        let denied = 5;
+        let refused = io::Error::from_raw_os_error(denied);
         assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
         assert!(!led_outside(&refused));
         assert_eq!(
             confined_error("locked/notes.md", refused).message,
-            format!("locked/notes.md: {}", io::Error::from_raw_os_error(13))
+            format!("locked/notes.md: {}", io::Error::from_raw_os_error(denied))
         );
     }
 
