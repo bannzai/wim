@@ -168,6 +168,8 @@ test("AltGr and Option type their character rather than a shortcut", async ({ pa
   expect(await dispatchKey(page, { key: "f", altKey: true })).toBe(false);
   // Alt+Space is the window's system menu; the space AltGr types is U+00A0, not this one.
   expect(await dispatchKey(page, { key: " ", altKey: true })).toBe(false);
+  // A key inside a dead-key or IME composition is the browser's until the character is done.
+  expect(await dispatchKey(page, { key: "e", isComposing: true })).toBe(false);
 
   expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe(`@€${FIRST_LINE}`);
 });

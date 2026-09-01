@@ -108,6 +108,12 @@ function keyNotation(event) {
     default:
       break;
   }
+  // A key that is part of a dead-key or IME composition is the browser's until the composed
+  // character is done; taking it here would type the raw key instead of what is being
+  // composed. Proper composition input, IME included, is issue #36's.
+  if (event.isComposing) {
+    return null;
+  }
   // Anything longer than one character is a named key the core does not know.
   if (event.key.length !== 1 || event.metaKey) {
     return null;
