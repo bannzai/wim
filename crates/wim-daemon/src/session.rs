@@ -306,7 +306,10 @@ async fn list(shared: &Shared, params: FsListParams) -> Result<Value, ResponseEr
                 let kind = entry.file_type()?;
                 entries.push(DirEntry {
                     name: name.to_string_lossy().into_owned(),
-                    path: base.join(&name).to_string_lossy().into_owned(),
+                    // No path for a child whose path is not UTF-8: JSON cannot carry the bytes as
+                    // they are, and a path with them papered over would address some other file
+                    // or none. The child is still listed, under its lossy name.
+                    path: base.join(&name).into_os_string().into_string().ok(),
                     kind: if kind.is_symlink() {
                         EntryKind::Symlink
                     } else if kind.is_dir() {
@@ -888,11 +891,49 @@ mod tests {
         );
         for entry in &entries {
             assert_eq!(
-                entry.path,
-                shared.root.path().join(&entry.name).to_string_lossy(),
+                entry.path.as_deref(),
+                shared.root.path().join(&entry.name).to_str(),
                 "the listing hands back a path the client sends straight back"
             );
         }
+    }
+
+    /// A child whose name is not valid UTF-8 is listed — it is a child all the same — but given
+    /// no path: JSON cannot carry the bytes as they are, and a path with them papered over would
+    /// address some other file or none.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listing_gives_no_path_to_a_child_whose_name_is_not_utf8() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let (_directory, shared) = shared().await;
+        // é as the lone latin-1 byte, which no UTF-8 sequence spells. A file system that takes
+        // only UTF-8 names (macOS) refuses to create it, and then has no such child to list.
+        let name = OsStr::from_bytes(b"caf\xe9.md");
+        if std::fs::write(shared.root.path().join(name), "hello\n").is_err() {
+            return;
+        }
+
+        let result = list(
+            &shared,
+            FsListParams {
+                path: ".".to_owned(),
+            },
+        )
+        .await
+        .expect("the root should be listed");
+
+        let listed: FsListResult =
+            serde_json::from_value(result).expect("the result should be a listing");
+        assert_eq!(
+            listed
+                .entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.path.as_deref(), entry.kind))
+                .collect::<Vec<_>>(),
+            vec![("caf\u{fffd}.md", None, EntryKind::File)]
+        );
     }
 
     /// A child that is none of file, directory or link is reported as what it is rather than as a

@@ -392,7 +392,7 @@ mod tests {
                 &FsListResult {
                     entries: vec![DirEntry {
                         name: "notes.md".to_owned(),
-                        path: "/tmp/notes.md".to_owned(),
+                        path: Some("/tmp/notes.md".to_owned()),
                         kind: EntryKind::File,
                     }],
                 },

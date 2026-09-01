@@ -47,7 +47,13 @@ pub struct DirEntry {
     /// `fs.read`, `fs.list` or `fs.watch` without anything being joined to it. A client that never
     /// looks inside it needs to know nothing about how the daemon's file system spells a path
     /// (`documents/adr/0004-protocol-envelope-and-listing-contract.md`).
-    pub path: String,
+    ///
+    /// Absent when the child's path is not valid UTF-8, which a JSON string cannot carry without
+    /// changing it: a path with the bad bytes papered over would name some other file or no file
+    /// at all, so the child is listed — it is a child all the same — but not addressed. The same
+    /// stance `fs.read` takes on content that is not UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
     /// What the name points at.
     pub kind: EntryKind,
 }
@@ -152,25 +158,32 @@ mod tests {
             entries: vec![
                 DirEntry {
                     name: "src".to_owned(),
-                    path: "/tmp/src".to_owned(),
+                    path: Some("/tmp/src".to_owned()),
                     kind: EntryKind::Directory,
                 },
                 DirEntry {
                     name: "Cargo.toml".to_owned(),
-                    path: "/tmp/Cargo.toml".to_owned(),
+                    path: Some("/tmp/Cargo.toml".to_owned()),
                     kind: EntryKind::File,
                 },
                 DirEntry {
                     name: "wim.sock".to_owned(),
-                    path: "/tmp/wim.sock".to_owned(),
+                    path: Some("/tmp/wim.sock".to_owned()),
                     kind: EntryKind::Other,
+                },
+                // A child whose path is not valid UTF-8 is listed without one: no `path` key at
+                // all, rather than a path with the bad bytes papered over.
+                DirEntry {
+                    name: "caf\u{fffd}.md".to_owned(),
+                    path: None,
+                    kind: EntryKind::File,
                 },
             ],
         };
         let json = serde_json::to_string(&result).expect("listing should serialize");
         assert_eq!(
             json,
-            r#"{"entries":[{"name":"src","path":"/tmp/src","kind":"directory"},{"name":"Cargo.toml","path":"/tmp/Cargo.toml","kind":"file"},{"name":"wim.sock","path":"/tmp/wim.sock","kind":"other"}]}"#
+            r#"{"entries":[{"name":"src","path":"/tmp/src","kind":"directory"},{"name":"Cargo.toml","path":"/tmp/Cargo.toml","kind":"file"},{"name":"wim.sock","path":"/tmp/wim.sock","kind":"other"},{"name":"caf�.md","kind":"file"}]}"#
         );
         assert_eq!(
             serde_json::from_str::<FsListResult>(&json).expect("listing should parse"),

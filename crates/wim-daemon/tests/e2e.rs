@@ -474,16 +474,18 @@ async fn a_listing_names_what_is_directly_under_the_directory() {
         [
             DirEntry {
                 name: "notes.txt".to_owned(),
-                path: fixture
-                    .root
-                    .join("notes.txt")
-                    .to_string_lossy()
-                    .into_owned(),
+                path: Some(
+                    fixture
+                        .root
+                        .join("notes.txt")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 kind: EntryKind::File,
             },
             DirEntry {
                 name: "src".to_owned(),
-                path: fixture.root.join("src").to_string_lossy().into_owned(),
+                path: Some(fixture.root.join("src").to_string_lossy().into_owned()),
                 kind: EntryKind::Directory,
             },
         ]
@@ -511,7 +513,10 @@ async fn a_listed_child_is_named_by_a_path_the_next_request_takes_as_it_is() {
 
     let read: FsReadResult = client
         .ok(Method::FsRead(FsReadParams {
-            path: entry.path.clone(),
+            path: entry
+                .path
+                .clone()
+                .expect("a UTF-8 child is handed back with its path"),
         }))
         .await;
     assert_eq!(read.content, "fn main() {}\n");
@@ -897,11 +902,13 @@ async fn a_name_the_daemon_keeps_for_itself_is_neither_listed_nor_served() {
         listing.entries,
         [DirEntry {
             name: "notes.txt".to_owned(),
-            path: fixture
-                .root
-                .join("notes.txt")
-                .to_string_lossy()
-                .into_owned(),
+            path: Some(
+                fixture
+                    .root
+                    .join("notes.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             kind: EntryKind::File,
         }],
         "what this daemon stages under is not part of the directory it serves"
