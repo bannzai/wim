@@ -365,17 +365,47 @@ function handleKeys(keys) {
     pendingKeys.push(keys);
     return lastOutcome;
   }
-  const outcome = editor.handle_keys(keys);
-  lastOutcome = {
-    damageStart: outcome.damage_start,
-    damageEnd: outcome.damage_end,
-    effects: JSON.parse(outcome.effects),
-  };
-  reparse();
-  draw();
-  // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
-  syncImeFocus();
-  carryOut(lastOutcome.effects);
+  // The core stops a batch at a `:` line naming a command it has none of, and what it hands back
+  // is the keys it did not type: running that command is this host's, and the keys behind it are
+  // typed into whatever it leaves behind. So the batch goes in a piece at a time, each piece
+  // carried out before the next one is typed, the way `wim edit` types the same keys natively
+  // (`crates/wim/src/edit.rs`).
+  let typing = keys;
+  // One batch is one report, however many pieces the core hands it back in: the effects and the
+  // damage a test or the status line reads belong to everything that was submitted, not to the
+  // piece that happened to come last.
+  const batch = { damageStart: 0, damageEnd: 0, effects: [] };
+  while (typing !== "") {
+    const outcome = editor.handle_keys(typing);
+    typing = outcome.pending_keys;
+    lastOutcome = {
+      damageStart: outcome.damage_start,
+      damageEnd: outcome.damage_end,
+      effects: JSON.parse(outcome.effects),
+    };
+    reparse();
+    draw();
+    // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
+    syncImeFocus();
+    const refused = carryOut(lastOutcome.effects);
+    if (lastOutcome.damageEnd > lastOutcome.damageStart) {
+      // An empty range says nothing about where the piece's damage was, so it merges as nothing.
+      if (batch.damageEnd > batch.damageStart) {
+        batch.damageStart = Math.min(batch.damageStart, lastOutcome.damageStart);
+        batch.damageEnd = Math.max(batch.damageEnd, lastOutcome.damageEnd);
+      } else {
+        batch.damageStart = lastOutcome.damageStart;
+        batch.damageEnd = lastOutcome.damageEnd;
+      }
+    }
+    batch.effects.push(...lastOutcome.effects);
+    if (refused) {
+      // A line nothing ran ends the batch where it stands, the way a refused `:` line ends a
+      // native run rather than letting the keys behind it edit the buffer.
+      break;
+    }
+  }
+  lastOutcome = batch;
   return lastOutcome;
 }
 
@@ -402,6 +432,8 @@ function reparse() {
  * The order is what puts a `buffer-write` handler in front of the write it belongs to: the core
  * reports the event ahead of the request, so whatever the handler edits is in the buffer by the
  * time the text to write is read out of it (`crates/wim-core/src/effect.rs`).
+ *
+ * Says whether a `:` line was refused, which is what ends the batch of keys it came from.
  */
 function carryOut(effects) {
   lastAutocmds = [];
@@ -414,12 +446,17 @@ function carryOut(effects) {
   let refusal = null;
   for (const effect of effects) {
     if (effect.kind === "unknown-ex-command") {
+      // A name nothing has a command for is refused from here; a command that refused the line
+      // has said so on the plugin's status line already. Either way the line did not do what it
+      // asked, and that is what ends the batch it came from, the way it ends a native run.
+      let failure = null;
       try {
-        // A line typed at the demo answers for itself: what the command it named refused is on
-        // the plugin's status line, and only a name no plugin published is refused from here.
-        runUnknownEx(effect);
+        failure = runUnknownEx(effect);
       } catch (error) {
-        refusal = { kind: "error", message: error.message };
+        failure = error.message;
+      }
+      if (failure !== null) {
+        refusal = { kind: "error", message: failure };
         continue;
       }
       // A plugin may rewrite the whole buffer, and what it did is not in the core's damage. Nor
@@ -448,10 +485,12 @@ function carryOut(effects) {
   lastOutcome = outcome;
   if (refusal !== null) {
     // The status line is drawn from what the batch of keys left behind, and this is the rest of
-    // what the line the core handed over came to: it named a command, and nothing here has one.
+    // what the line the core handed over came to: a name nothing has a command for, or a command
+    // that refused the line.
     lastOutcome.effects.push(refusal);
     draw();
   }
+  return refusal !== null;
 }
 
 /** Runs every autocmd bound to the event `name`, and redraws what they changed. */
@@ -508,27 +547,37 @@ function runHandler(name, payload, handler) {
  * the keys of a line; without them the keys typed next would be read as the rest of it.
  */
 function typeAtEditor(keys) {
-  const outcome = editor.handle_keys(`${keys}<Esc><Esc>`);
-  const effects = JSON.parse(outcome.effects);
-  const failed = effects.find((effect) => effect.kind === "error");
-  if (failed !== undefined) {
-    throw new Error(failed.message);
-  }
-  // The events these raise are the handler's own doing, and `inHandler` is what stops them from
-  // running it again; a `:w` inside a handler still writes, and a `:` line naming a plugin's
-  // command runs it — a handler reaches the same commands a typed line does, as it does natively
-  // (`crates/wim/src/edit.rs`).
-  for (const effect of effects) {
-    if (effect.kind === "save") {
-      void save(effect.path ?? null);
+  // The core hands the keys back at the `:` line it has no command for, and the command it named
+  // is run before the rest of them are typed. That is the order the same handler runs in
+  // natively, where each key is carried out before the next one is typed: a `:` line halfway
+  // through a handler edits the buffer the keys in front of it left, and the keys behind it are
+  // typed into what it wrote (`crates/wim/src/edit.rs`).
+  let typing = `${keys}<Esc><Esc>`;
+  while (typing !== "") {
+    const outcome = editor.handle_keys(typing);
+    typing = outcome.pending_keys;
+    const effects = JSON.parse(outcome.effects);
+    const failed = effects.find((effect) => effect.kind === "error");
+    if (failed !== undefined) {
+      throw new Error(failed.message);
     }
-    if (effect.kind === "unknown-ex-command") {
-      // A command that refused the line is the handler's failure, the same as a key the core
-      // refused: the native host ends its run over one just as it does over an error
-      // (`crates/wim/src/edit.rs`), so the handler must not be reported as having run.
-      const failure = runUnknownEx(effect);
-      if (failure !== null) {
-        throw new Error(failure);
+    // The events these raise are the handler's own doing, and `inHandler` is what stops them from
+    // running it again; a `:w` inside a handler still writes, and a `:` line naming a plugin's
+    // command runs it — a handler reaches the same commands a typed line does, as it does
+    // natively (`crates/wim/src/edit.rs`).
+    for (const effect of effects) {
+      if (effect.kind === "save") {
+        void save(effect.path ?? null);
+      }
+      if (effect.kind === "unknown-ex-command") {
+        // A command that refused the line is the handler's failure, the same as a key the core
+        // refused: the native host ends its run over one just as it does over an error
+        // (`crates/wim/src/edit.rs`), so the handler must not be reported as having run and the
+        // keys behind the line are never typed.
+        const failure = runUnknownEx(effect);
+        if (failure !== null) {
+          throw new Error(failure);
+        }
       }
     }
   }

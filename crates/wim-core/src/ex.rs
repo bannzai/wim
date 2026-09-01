@@ -500,14 +500,20 @@ fn parse_address(line: &str) -> Option<(Address, &str)> {
 }
 
 fn parse_kind(rest: &str) -> Result<ExKind, ExError> {
+    // A line that is nothing but a range moves the cursor to where the range ends.
+    if rest.is_empty() {
+        return Ok(ExKind::Goto);
+    }
     let name: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
     let typed = &rest[name.len()..];
+    if !names_a_builtin(&name, typed) {
+        return Ok(unknown(rest));
+    }
     let (force, args) = match typed.strip_prefix('!') {
         Some(args) => (true, args),
         None => (false, typed),
     };
     match name.as_str() {
-        "" => Ok(ExKind::Goto),
         "w" | "write" => Ok(ExKind::Write { path: path(args) }),
         "q" | "quit" => Ok(ExKind::Quit { force }),
         "wq" => Ok(ExKind::WriteQuit {
@@ -524,23 +530,43 @@ fn parse_kind(rest: &str) -> Result<ExKind, ExError> {
         "norm" | "normal" => Ok(ExKind::Normal {
             keys: args.strip_prefix(' ').unwrap_or(args).to_owned(),
         }),
-        // A name the core has none of is a command the host may have, and the letters the core
-        // reads its own names off are not where such a name ends: the ABI puts no shape on what
-        // a plugin publishes (`wit/plugin.wit`), so `sort-lines`, `format_json` and `tool2` are
-        // names as much as `upcase` is and the whole blank-delimited token is handed over. Its
-        // arguments are whatever the host's command makes of them: the `!` is theirs as much as
-        // the rest, so what crosses is the line as it was typed less the one blank after the
-        // name.
-        _ => {
-            let (name, typed) = split_name(rest);
-            Ok(ExKind::Unknown {
-                name: name.to_owned(),
-                args: typed
-                    .strip_prefix(char::is_whitespace)
-                    .unwrap_or(typed)
-                    .to_owned(),
-            })
-        }
+        _ => Ok(unknown(rest)),
+    }
+}
+
+/// Whether the letters a line opens with name a command of the core's.
+///
+/// They do only when the rest of the line — `typed` — goes on the way that command's own syntax
+/// does: the name is the whole of it, a blank separates its arguments, or it opens with the `!`
+/// of a force or the delimiter a `:s` or `:g` pattern is written between. `write-json` and `x2`
+/// go on in none of those ways, so the letters they open with are not `:w` and `:x` with an
+/// argument stuck to them; they are names of their own, and it is [`unknown`] that reads them.
+fn names_a_builtin(name: &str, typed: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    match typed.chars().next() {
+        None => true,
+        Some(character) => character.is_whitespace() || matches!(character, '!' | '/' | '?'),
+    }
+}
+
+/// The line as a command the host may have: the whole blank-delimited token it opens with, and
+/// the rest of it as the arguments.
+///
+/// The ABI puts no shape on what a plugin publishes (`wit/plugin.wit`), so `sort-lines`,
+/// `format_json` and `tool2` are names as much as `upcase` is, and so is a name the core reads
+/// one of its own out of the front of. What an argument is belongs to the host's command: the
+/// `!` is theirs as much as the rest, so what crosses is the line as it was typed less the one
+/// blank after the name.
+fn unknown(rest: &str) -> ExKind {
+    let (name, typed) = split_name(rest);
+    ExKind::Unknown {
+        name: name.to_owned(),
+        args: typed
+            .strip_prefix(char::is_whitespace)
+            .unwrap_or(typed)
+            .to_owned(),
     }
 }
 
@@ -904,6 +930,85 @@ mod tests {
             ExKind::Unknown {
                 name: "sort-lines".to_owned(),
                 args: "--numeric".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_name_that_opens_with_the_letters_of_a_core_command_is_still_the_hosts() {
+        // The core's own name has to be the whole token: `write-json` is not `:w` writing to a
+        // file called `-json`, and `x2` is not `:x` with `2` after it.
+        for typed in ["write-json", "x2", "normal-mode", "d3", "gg-open", "s_case"] {
+            assert_eq!(
+                kind(typed),
+                ExKind::Unknown {
+                    name: typed.to_owned(),
+                    args: String::new()
+                },
+                "{typed} names a command of the host's"
+            );
+        }
+        assert_eq!(
+            kind("write-json --pretty out.json"),
+            ExKind::Unknown {
+                name: "write-json".to_owned(),
+                args: "--pretty out.json".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_name_that_opens_with_punctuation_is_the_hosts_rather_than_a_line_number() {
+        assert_eq!(
+            kind("!ls"),
+            ExKind::Unknown {
+                name: "!ls".to_owned(),
+                args: String::new()
+            },
+            "the empty name is the one a line that is only a range has"
+        );
+        assert_eq!(
+            kind("@macro one"),
+            ExKind::Unknown {
+                name: "@macro".to_owned(),
+                args: "one".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn the_core_still_reads_its_own_commands_off_the_way_they_are_written() {
+        // The ways a core command goes on: nothing after the name, a blank in front of an
+        // argument, the `!` of a force, and the `/` a pattern is written between.
+        assert_eq!(kind("q"), ExKind::Quit { force: false });
+        assert_eq!(kind("q!"), ExKind::Quit { force: true });
+        assert_eq!(
+            kind("w out.txt"),
+            ExKind::Write {
+                path: Some("out.txt".to_owned())
+            }
+        );
+        assert_eq!(
+            kind("s/a/b/"),
+            ExKind::Substitute {
+                pattern: "a".to_owned(),
+                replacement: "b".to_owned(),
+                all: false,
+                ignore_case: false
+            }
+        );
+        assert_eq!(
+            kind("g/x/d"),
+            ExKind::Global {
+                pattern: "x".to_owned(),
+                invert: false,
+                command: Box::new(ExKind::Delete)
+            }
+        );
+        assert_eq!(
+            kind("norm A;"),
+            ExKind::Normal {
+                keys: "A;".to_owned()
             }
         );
     }

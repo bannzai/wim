@@ -131,6 +131,12 @@ fuel とメモリ上限に相当するものはブラウザ側には無い。ネ
 ホストがその名前でプラグインのコマンドを解決して実行する。プラグインが返した edit はホストが
 適用する。どのプラグインにも無い名前はホストが `not an editor command` として拒否する。
 
+2 つのプラグインが同じコマンド名を公開した場合、どちらの component が `:<name>` を実行するかは
+ホストが決められない (ネイティブは alias 順、ブラウザは manifest 順にプラグインを見る) ため、
+どちらのホストもロード時に拒否する。ネイティブ (`crates/wim/src/edit.rs`) は実行そのものを中止し、
+ブラウザ (`web/plugins.js`) は後から読み込んだ側を読み込み失敗として報告する。どちらのメッセージ
+にも衝突した 2 つのプラグイン名が入る。
+
 ```sh
 make build-web-plugins  # component をビルドして transpile する (要 wasm32-unknown-unknown)
 make e2e                # 同じ component をネイティブとブラウザの両方に通して突き合わせる

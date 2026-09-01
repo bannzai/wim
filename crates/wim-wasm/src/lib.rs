@@ -8,7 +8,7 @@
 use serde_json::json;
 use unicode_segmentation::UnicodeSegmentation;
 use wasm_bindgen::prelude::*;
-use wim_core::{Editor, Effect};
+use wim_core::{Editor, Effect, format_keys, parse_keys};
 
 /// An editor a browser owns.
 #[wasm_bindgen]
@@ -22,6 +22,7 @@ pub struct KeyOutcome {
     damage_start: usize,
     damage_end: usize,
     effects: String,
+    pending_keys: String,
 }
 
 #[wasm_bindgen]
@@ -57,6 +58,19 @@ impl KeyOutcome {
     #[wasm_bindgen(getter)]
     pub fn effects(&self) -> String {
         self.effects.clone()
+    }
+
+    /// The keys of the batch that were not typed, in the notation they were handed over in, and
+    /// empty when the whole batch went in.
+    ///
+    /// A batch stops at the key that asked for a command the core has none of, because what such
+    /// a command does to the buffer is the host's to carry out and the keys behind it are typed
+    /// into whatever it leaves behind. A host feeds these back once it has carried the effects
+    /// out, which is what makes a batch read the way the same keys do natively, where each key is
+    /// carried out before the next one is typed (`crates/wim/src/edit.rs`).
+    #[wasm_bindgen(getter)]
+    pub fn pending_keys(&self) -> String {
+        self.pending_keys.clone()
     }
 }
 
@@ -128,19 +142,38 @@ impl WimEditor {
 
     /// Feeds a key string such as `ihello<Esc>`, throwing when it does not parse.
     ///
-    /// A key string that fails to parse changes nothing: the core reads the whole of it
-    /// before it runs any of it.
+    /// A key string that fails to parse changes nothing: the whole of it is read before any of
+    /// it is run.
+    ///
+    /// The batch ends early at a key that asked for a command the core has none of, and what was
+    /// left untyped comes back as [`KeyOutcome::pending_keys`] for the host to feed back once it
+    /// has run that command. Typing the rest first would put the keys behind the command into a
+    /// buffer the command had not touched yet and hand it a snapshot holding their edits, which
+    /// is not what those keys do natively: there each key is carried out before the next one is
+    /// typed, and a command that refuses ends the run where it stands
+    /// (`crates/wim/src/edit.rs`).
     pub fn handle_keys(&mut self, keys: &str) -> Result<KeyOutcome, JsError> {
+        let typed = parse_keys(keys).map_err(|error| JsError::new(&error.to_string()))?;
         let before = self.lines();
-        let effects = self
-            .editor
-            .handle_keys(keys)
-            .map_err(|error| JsError::new(&error.to_string()))?;
+        let mut effects = Vec::new();
+        let mut pending_keys = String::new();
+        for (index, key) in typed.iter().enumerate() {
+            let asked = self.editor.handle_key(*key);
+            let hands_over = asked
+                .iter()
+                .any(|effect| matches!(effect, Effect::UnknownExCommand { .. }));
+            effects.extend(asked);
+            if hands_over {
+                pending_keys = format_keys(&typed[index + 1..]);
+                break;
+            }
+        }
         let (damage_start, damage_end) = damaged_lines(&before, &self.lines());
         Ok(KeyOutcome {
             damage_start,
             damage_end,
             effects: effects_json(&effects),
+            pending_keys,
         })
     }
 }
@@ -472,6 +505,59 @@ mod tests {
             serde_json::json!({ "kind": "unknown-ex-command", "name": "upcase", "args": "all" }),
             "the host is the one holding the plugin commands, so the line goes over unsplit"
         );
+    }
+
+    #[test]
+    fn a_batch_stops_at_the_command_the_core_has_none_of_and_hands_back_the_rest_of_the_keys() {
+        let mut editor = WimEditor::new("alpha");
+        let outcome = editor
+            .handle_keys(":refuse<CR>x")
+            .expect("keys should parse");
+        assert!(
+            effect_kinds(&outcome)
+                .iter()
+                .any(|kind| kind == "unknown-ex-command"),
+            "{:?}",
+            effect_kinds(&outcome)
+        );
+        assert_eq!(
+            outcome.pending_keys(),
+            "x",
+            "the key behind the command is the host's to feed back once it has run it"
+        );
+        assert_eq!(
+            editor.text(),
+            "alpha",
+            "and until then it has not touched the buffer the command is handed"
+        );
+
+        let outcome = editor
+            .handle_keys(&outcome.pending_keys())
+            .expect("keys should parse");
+        assert_eq!(editor.text(), "lpha");
+        assert_eq!(outcome.pending_keys(), "");
+    }
+
+    #[test]
+    fn keys_that_ask_for_nothing_of_the_hosts_are_a_batch_that_goes_in_whole() {
+        let mut editor = WimEditor::new("alpha");
+        let outcome = editor.handle_keys("xdd").expect("keys should parse");
+        assert_eq!(outcome.pending_keys(), "");
+        assert_eq!(editor.line_count(), 1);
+    }
+
+    #[test]
+    fn the_keys_handed_back_are_written_the_way_they_were_handed_over() {
+        let mut editor = WimEditor::new("alpha");
+        let outcome = editor
+            .handle_keys(":refuse<CR>i<lt><Esc>")
+            .expect("keys should parse");
+        assert_eq!(outcome.pending_keys(), "i<lt><Esc>");
+        // What comes back parses, which is what lets a host feed it straight back in.
+        editor
+            .handle_keys(&outcome.pending_keys())
+            .expect("what came back should parse");
+        assert_eq!(editor.text(), "<alpha");
     }
 
     #[test]

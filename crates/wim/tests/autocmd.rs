@@ -374,6 +374,33 @@ fn a_command_named_with_more_than_letters_is_looked_up_under_the_whole_name() {
 }
 
 #[test]
+fn two_plugins_publishing_one_command_name_are_refused_while_they_load() {
+    let Some(wasm) = hello_wim() else {
+        return;
+    };
+    // The one component under two names publishes `upcase` twice. Which of them `:upcase` would
+    // run is nothing either host can decide, so the run is refused before a key is typed rather
+    // than the name going to whichever plugin an ordering put first (`web/plugins.js`).
+    let workspace = Workspace::new("hello\n", r#"{"autocmds": []}"#);
+    let output = edit(
+        &workspace,
+        ":upcase<CR>",
+        &[
+            "--plugin",
+            &declare(&wasm),
+            "--plugin",
+            &format!("other={}", wasm.display()),
+        ],
+    );
+    assert!(!output.status.success());
+    let complaint = stderr(&output);
+    assert!(complaint.contains(":upcase"), "{complaint}");
+    assert!(complaint.contains("hello-wim"), "{complaint}");
+    assert!(complaint.contains("other"), "{complaint}");
+    assert_eq!(workspace.text(), "hello\n", "no key of the run was typed");
+}
+
+#[test]
 fn a_plugin_handler_that_was_never_loaded_is_refused() {
     let workspace = Workspace::new(
         "hello\n",
