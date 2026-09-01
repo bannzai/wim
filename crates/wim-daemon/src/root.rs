@@ -108,8 +108,11 @@ impl Root {
     /// — a path that climbs out of the root lexically is refused — and no link can widen it,
     /// because watching reads nothing: what a watch reports are names under the root.
     pub fn resolve_lexically(&self, requested: &str) -> Result<PathBuf, ResponseError> {
-        refuse_reserved(requested)?;
+        // The separators go in before anything reads the path, the reserved-name check included:
+        // checked with the `/` still in it, a name like `sub/.wim-x` would read as one component
+        // on Windows, pass the check, and be turned into a reachable `.wim-*` path only after.
         let written = with_platform_separators(requested);
+        refuse_reserved(requested, written.as_ref())?;
         let asked = Path::new(written.as_ref());
         let candidate = if asked.is_absolute() {
             asked.to_path_buf()
@@ -198,8 +201,11 @@ fn escaped(requested: &str) -> ResponseError {
 /// Hiding those files from `fs.list` and from what a watch pushes is not enough on its own: a
 /// client that could read and write them could plant something at the name the next write stages
 /// under, so the names are made untouchable rather than only invisible.
-fn refuse_reserved(requested: &str) -> Result<(), ResponseError> {
-    if names_reserved(&without_relative_components(Path::new(requested))) {
+/// `requested` is the path as the client wrote it, for the message; `written` is the same path
+/// with the platform's separators in it, which is the spelling whose components mean what the
+/// check reads them as.
+fn refuse_reserved(requested: &str, written: &str) -> Result<(), ResponseError> {
+    if names_reserved(&without_relative_components(Path::new(written))) {
         return Err(ResponseError::new(
             ErrorCode::PermissionDenied,
             format!("{requested}: a name beginning with {RESERVED_PREFIX} is this daemon's own"),
@@ -396,10 +402,14 @@ mod tests {
             .join(".wim-0123456789abcdef")
             .display()
             .to_string();
+        // `sub/.wim-…` pins the check running on the platform's own separators: read with the
+        // `/` still in it, Windows would take the whole of it for one component whose name does
+        // not open with the prefix, and refuse nothing.
         for requested in [
             ".wim-0123456789abcdef",
             "./.wim-0123456789abcdef",
             "src/../.wim-probe-0123456789abcdef",
+            "sub/.wim-0123456789abcdef",
             &inside,
         ] {
             let error = root
