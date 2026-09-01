@@ -303,6 +303,28 @@ test.describe("through a daemon", () => {
     expect(await readFile(join(root, "notes.md"), "utf8")).toBe("wim hello\n");
   });
 
+  test("highlights the file it opened as the language its extension names", async ({ page }) => {
+    await writeFile(join(root, "main.rs"), "fn main() {}\n");
+    await writeFile(join(root, "plain.txt"), "fn main() {}\n");
+    await openDemo(page);
+
+    await openThroughDaemon(page, daemon, "main.rs");
+    await expect(statusOf(page)).toHaveText("main.rs を開きました");
+    await page.waitForFunction(() => window.wimDemo.state().highlight.language === "rust");
+    expect(await page.evaluate(() => window.wimDemo.highlightRuns(0))).toContainEqual({
+      start: 0,
+      end: 2,
+      color: "#c792ea",
+    });
+
+    // The same text under a name no grammar is loaded for is drawn as plain text, which is what
+    // the demo did with every file before it could highlight any of them.
+    await openThroughDaemon(page, daemon, "plain.txt");
+    await expect(statusOf(page)).toHaveText("plain.txt を開きました");
+    expect(await page.evaluate(() => window.wimDemo.state().highlight.language)).toBeNull();
+    expect(await page.evaluate(() => window.wimDemo.highlightRuns(0))).toBeNull();
+  });
+
   test("writes to the path :w names rather than the one that was opened", async ({ page }) => {
     await writeFile(join(root, "source.md"), "hello\n");
     await openDemo(page);

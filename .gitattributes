@@ -1,0 +1,4 @@
+# The tree-sitter runtime and grammars are fetched by scripts/vendor-tree-sitter.sh rather than
+# written here, so they are kept out of the language statistics and folded away in review.
+web/vendor/** linguist-vendored
+web/vendor/**/*.wasm binary
