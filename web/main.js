@@ -9,6 +9,7 @@
 import init, { WimEditor, display_cells } from "./pkg/wim_wasm.js";
 import { connect } from "./daemon.js";
 import { createHighlighter, languageOf } from "./highlight.js";
+import { loadPlugins } from "./plugins.js";
 
 const INITIAL_TEXT = `wim is a Vim-grammar editor, not a Vim clone.
 The core is one pure Rust crate, compiled to Wasm for this page.
@@ -122,6 +123,10 @@ const sampleButtons = {
 /** Where opening and saving report what they did, under the file controls. */
 const fileStatus = document.querySelector("#file-status");
 
+/** The line listing the commands the loaded plugins published, and the one a run reports on. */
+const pluginCommandList = document.querySelector("#plugin-commands");
+const pluginStatus = document.querySelector("#plugin-status");
+
 /**
  * The modes whose keys are text rather than commands, which are the ones text may be composed
  * into. In every other mode a key is a command the moment it is pressed.
@@ -130,6 +135,19 @@ const TEXT_MODES = new Set(["INSERT", "COMMAND"]);
 
 /** The editor, which cannot be built before the wasm module is initialised. */
 let editor;
+
+/**
+ * The name the buffer is under, which is what a plugin is given as the name of the snapshot and
+ * what the language is picked from. Empty for a buffer that came from no file, which is what the
+ * demo starts on.
+ */
+let bufferName = "";
+
+/**
+ * The commands the loaded plugins published, keyed by the name `:name` runs them under. Empty
+ * until the modules have been fetched, and on a demo served without any.
+ */
+let pluginCommands = new Map();
 
 /** What the last batch of keys did, which the demo shows in its status line. */
 let lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
@@ -286,6 +304,19 @@ function keyNotation(event) {
 }
 
 function handleKeys(keys) {
+  const invocation = pluginInvocation(keys);
+  if (invocation !== null) {
+    // The core has no `:upcase`, and letting it read the line would answer with its own "not an
+    // editor command". `<Esc>` drops the line instead, leaving the editor where a command that
+    // ran would have left it — in Normal mode with the line gone.
+    editor.handle_keys("<Esc>");
+    lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
+    runPlugin(invocation);
+    // A plugin may rewrite the whole buffer, and what it did is not in the core's damage.
+    draw({ full: true });
+    syncImeFocus();
+    return lastOutcome;
+  }
   const outcome = editor.handle_keys(keys);
   lastOutcome = {
     damageStart: outcome.damage_start,
@@ -320,6 +351,110 @@ function report(message) {
   fileStatus.textContent = message;
 }
 
+/** Shows what running a plugin command did, on the line under the list of them. */
+function reportPlugin(message) {
+  pluginStatus.textContent = message;
+}
+
+/**
+ * The plugin command the batch `keys` submits, `null` when it submits none.
+ *
+ * A plugin's command is taken before the core sees it rather than after: the core has no such
+ * command and would answer with an error whose message carries the name but not the arguments
+ * that followed it, and `:upcase x` has to reach the plugin as an argument for the plugin to
+ * refuse it the way it does natively.
+ *
+ * A command line is only ever submitted by one `<CR>` on its own here — a key press is handled as
+ * it arrives, and what an IME confirms goes in as text — so that is the one batch to look at.
+ */
+function pluginInvocation(keys) {
+  if (keys !== "<CR>") {
+    return null;
+  }
+  const line = editor.command_line();
+  if (line === undefined || !line.startsWith(":")) {
+    return null;
+  }
+  const [name, ...args] = line.slice(1).trim().split(/\s+/);
+  const command = pluginCommands.get(name);
+  return command === undefined ? null : { command, args };
+}
+
+/**
+ * Runs a plugin command over the buffer as it stands and applies what comes back.
+ *
+ * The buffer goes over by value and the answer comes back by value, which is the whole of what
+ * the ABI lets a plugin touch (`wit/README.md`): the edit is applied here, by the host.
+ */
+function runPlugin({ command, args }) {
+  let edit;
+  try {
+    edit = command.run(args, {
+      name: bufferName,
+      text: editor.text(),
+      cursor: { line: editor.cursor_line(), column: editor.cursor_col() },
+    });
+  } catch (error) {
+    // What the plugin refuses arrives as the `result<edit, string>` error half, in its wording.
+    reportPlugin(`:${command.name} が失敗しました: ${error.message}`);
+    return;
+  }
+  reportPlugin(`:${command.name}: ${applyEdit(edit)}`);
+}
+
+/** Carries out one `edit` of the ABI and says what it did (`wit/plugin.wit`). */
+function applyEdit(edit) {
+  switch (edit.tag) {
+    case "replace-all":
+      void loadText(edit.val, bufferName);
+      return "バッファを書き換えました";
+    case "replace-lines": {
+      // Each line keeps its own newline, so a buffer whose last line has none stays that way
+      // unless the replacement is the piece that lands at the end. An empty buffer is the one
+      // empty line the editor shows, which is the line a `{ start: 0, end: 1 }` edit means.
+      // `wim plugin run` splices the same way (`crates/wim/src/plugin.rs`).
+      const text = editor.text();
+      const lines = text === "" ? [""] : text.split(/(?<=\n)/);
+      const { start, end } = edit.val;
+      if (start > end || end > lines.length) {
+        return `${start}..${end} 行は ${lines.length} 行のバッファにありません`;
+      }
+      void loadText(
+        lines.slice(0, start).join("") + edit.val.text + lines.slice(end).join(""),
+        bufferName,
+      );
+      // Counted from 1, the way the gutter numbers the row this landed on.
+      return `${start + 1} 行目からを書き換えました`;
+    }
+    case "message":
+      return edit.val;
+    case "noop":
+      return "何も変えませんでした";
+    default:
+      // A tag from an ABI this host does not know, which the version check should have stopped.
+      return `知らない edit が返りました: ${edit.tag}`;
+  }
+}
+
+/**
+ * Fetches the transpiled plugins and registers what they publish, which is the browser's half of
+ * what `Plugin::from_file` and `list_commands` do natively.
+ */
+async function startPlugins() {
+  const { commands, failures } = await loadPlugins();
+  pluginCommands = commands;
+  const published = [...commands.values()].map(
+    (command) => `:${command.name} — ${command.description}`,
+  );
+  pluginCommandList.textContent =
+    published.length === 0
+      ? "プラグインは読み込まれていません"
+      : `プラグインのコマンド ${published.join(" / ")}`;
+  if (failures.length > 0) {
+    reportPlugin(`読み込めないプラグインがあります: ${failures.join(" / ")}`);
+  }
+}
+
 /**
  * Replaces the buffer with `text`, which is what opening a file leaves behind, and starts
  * highlighting it as the language `name` is written in.
@@ -330,6 +465,7 @@ function report(message) {
  */
 function loadText(text, name = "") {
   editor = new WimEditor(text);
+  bufferName = name;
   lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
   view = { ...view, scrollTop: 0 };
   const highlighted = setLanguage(name);
@@ -967,6 +1103,10 @@ await init();
 editor = new WimEditor(INITIAL_TEXT);
 draw({ full: true });
 
+// The plugins are fetched over the network and the editor is usable while that is in the air, the
+// way a grammar is. The answer is what the E2E run waits on before it types a plugin's command.
+const pluginsStarted = startPlugins();
+
 // Listening only once the editor exists is what keeps a key typed during the wasm fetch from
 // reaching a demo that has nothing to type into.
 window.addEventListener("keydown", (event) => {
@@ -1072,6 +1212,19 @@ window.wimDemo = {
   load: loadText,
   /** Redraws every row, which the E2E run compares the damage-driven redraw against. */
   redraw: () => draw({ full: true }),
+  /**
+   * Settles once the transpiled plugins have been loaded and their commands registered, with the
+   * commands there are. Nothing rejects: a plugin that could not be loaded is in `failures`.
+   */
+  plugins: () =>
+    pluginsStarted.then(() => ({
+      commands: [...pluginCommands.values()].map((command) => ({
+        name: command.name,
+        description: command.description,
+        plugin: command.plugin,
+      })),
+      status: pluginStatus.textContent,
+    })),
   /** The runs row `line` is coloured by, `null` for a buffer in no language the demo highlights. */
   highlightRuns: (line) => (highlighter === null ? null : highlighter.rowRuns(line)),
   state: () => ({
@@ -1088,6 +1241,10 @@ window.wimDemo = {
       language: highlighter?.language ?? null,
       /** The rows the last batch of keys changed the colours of, which were redrawn for it. */
       damage: [...highlightDamage].sort((left, right) => left - right),
+    },
+    plugin: {
+      /** What running a plugin command last did, which is where its message or its error lands. */
+      status: pluginStatus.textContent,
     },
     ime: {
       /** What an IME is composing, which the row is drawn with and the buffer does not hold. */

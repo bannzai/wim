@@ -98,20 +98,34 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          # The plugin the demo loads is built out of its own workspace, the way the `plugins`
+          # job builds it.
+          workspaces: |
+            .
+            plugins
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --version "$(bash scripts/wasm-bindgen-version.sh)" --locked
       - run: make build-web
       # The file-access run starts this binary over a directory of its own and drives the demo
-      # against it, so the daemon has to be built before the browser is.
+      # against it, and the plugin run loads the component through it, so the binary has to be
+      # built before the browser is.
       - run: cargo build -p wim
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: npm ci
-        working-directory: web
+      # Installs the node packages, builds the sample plugin and transpiles it into the module
+      # the demo imports. Nothing it writes is committed, so the demo gets a plugin here rather
+      # than out of the tree.
+      - run: make build-web-plugins
       - run: npx playwright install --with-deps chromium
         working-directory: web
       - run: npx playwright test
         working-directory: web
+        env:
+          # The very component the step above transpiled, so that the run puts one `.wasm`
+          # through both hosts. The path is `HELLO_WIM` in the Makefile; the run fails rather
+          # than skipping when it names no file.
+          WIM_PLUGIN_WASM: ${{ github.workspace }}/plugins/target/wasm32-unknown-unknown/release/hello_wim.component.wasm

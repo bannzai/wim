@@ -151,6 +151,15 @@
       #file-status {
         margin-bottom: 0;
       }
+
+      /* The commands the transpiled plugins published, and what running one last did. */
+      #plugins {
+        margin-top: 12px;
+      }
+
+      #plugins p {
+        margin: 4px 0;
+      }
     </style>
   </head>
   <body>
@@ -178,6 +187,10 @@
         <button type="button" id="sample-rust">Rust</button>
         <button type="button" id="sample-markdown">Markdown</button>
       </p>
+      <section id="plugins">
+        <p id="plugin-commands">プラグインを読み込んでいます</p>
+        <p id="plugin-status" role="status">プラグインのコマンドはまだ実行していません</p>
+      </section>
       <section id="file-access">
         <p>
           ファイルを開くと <code>:w</code> で書き戻せます。デーモン経由で開くには手元で

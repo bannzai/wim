@@ -94,6 +94,43 @@ make test-plugin-host   # ビルドした component をホストで実際にロ�
 `cargo test --workspace` ではこの変数が無いため、component を要するテストは skip される
 (component をビルドできない環境でも workspace のテストが通るようにするため)。
 
+## ブラウザホスト
+
+ブラウザ側のホストは `web/plugins.js` で、wasmtime の代わりに
+[jco](https://github.com/bytecodealliance/jco) が同じ component を ES module へ transpile した
+ものをロードする。`scripts/transpile-plugins.sh` が transpile とマニフェストの生成を行い、
+`make build-web-plugins` がビルドの一部として呼ぶ。生成物 (`web/plugins/`) はコミットしない:
+ソースは同じリポジトリの `plugins/` にあり、`.wasm` から機械的に再生成できるため、ソースが
+リポジトリに無い `web/vendor/` の tree-sitter とは扱いが違う。
+
+ロード時に行うことはネイティブと同じ 3 つで、どこで判定するかだけが違う。
+
+- component かどうかは transpile の入力を `scripts/check-wasm-component.sh` が先頭 8 バイトで
+  見る。ブラウザに届くのは transpile 済みの JS なので、この判定はビルド時に済んでいる
+- export 名が持つ ABI バージョンを見て、ホストのものと完全に一致しない module を拒否する。
+  jco は `wim:plugin/commands@0.1.0` をそのまま ES module の export 名にするため、ネイティブが
+  component の export 名を読むのと同じものを `Object.keys` で読むことになる。ホスト側の
+  バージョンは transpile 時に `wit/plugin.wit` の package 行から読んでマニフェストへ書く
+- 何も import させない。world が import する `wim:plugin/buffer` は型だけの interface で、jco は
+  それに対して import を一切生成しない。生成された JS に `import` 文が無いことを
+  `scripts/transpile-plugins.sh` が検査するので、WASI シムが混ざれば transpile の時点で失敗する
+
+fuel とメモリ上限に相当するものはブラウザ側には無い。ネイティブの上限はホストのスレッドを
+止めないためのもので、ブラウザではページのタブがその役割を負う。
+
+エディタへの配線はデモ (`web/main.js`) にある。ロード時に `list-commands` で公開コマンドを
+登録し、`:<name>` が Ex コマンドとして入力されたら、コアがそれを未知のコマンドとして扱う前に
+ホストが横取りしてプラグインへ渡す。プラグインが返した edit はホストが適用する。
+
+```sh
+make build-web-plugins  # component をビルドして transpile する (要 wasm32-unknown-unknown)
+make e2e                # 同じ component をネイティブとブラウザの両方に通して突き合わせる
+```
+
+`web/e2e/plugin.spec.js` が「同一の .wasm がネイティブとブラウザの両方で動く」ことの機械検証で、
+同じ入力を `wim plugin run` とデモの両方に通し、返るバッファとエラーメッセージが一致することを
+確かめる。component のパスは `make test-plugin-host` と同じ `WIM_PLUGIN_WASM` で渡す。
+
 ## 新しいプラグインを足す
 
 `plugins/hello-wim` が最小の実装例で、コマンド 1 つ (`:upcase`)・イベントフック 1 つ・パネル

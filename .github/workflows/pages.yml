@@ -33,9 +33,24 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            plugins
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --version "$(bash scripts/wasm-bindgen-version.sh)" --locked
       - run: make build-web
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # The published demo carries the sample plugin, transpiled here the way the E2E job
+      # transpiles it: the deploy serves what the build wrote, since none of it is committed.
+      - run: make build-web-plugins
+      # The whole of web/ goes up as the site, and the packages that did the transpiling are not
+      # part of it — jco and Playwright are tens of megabytes that no visitor would ever fetch.
+      - run: rm -rf web/node_modules
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
