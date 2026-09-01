@@ -360,6 +360,20 @@ fn an_ex_line_naming_a_command_no_plugin_published_is_refused() {
 }
 
 #[test]
+fn a_command_named_with_more_than_letters_is_looked_up_under_the_whole_name() {
+    // The ABI puts no shape on the names a plugin publishes, so the name the host looks up — and
+    // refuses with — is the whole token rather than the letters it opens with (`wit/plugin.wit`).
+    let workspace = Workspace::new("hello\n", r#"{"autocmds": []}"#);
+    let output = edit(&workspace, ":sort-lines --numeric<CR>", &[]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not an editor command: sort-lines"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn a_plugin_handler_that_was_never_loaded_is_refused() {
     let workspace = Workspace::new(
         "hello\n",

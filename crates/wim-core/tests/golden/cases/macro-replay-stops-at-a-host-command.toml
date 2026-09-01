@@ -1,0 +1,6 @@
+name = "a replayed : line the host runs is the last key of the macro, because the host has not run it yet"
+input = "alpha"
+keys = "qa:upcase<CR>xq@a"
+expected = "lpha"
+expected_cursor = [0, 0]
+expected_effects = ['unknown-ex-command upcase ""', 'unknown-ex-command upcase ""']

@@ -96,6 +96,21 @@ function stubPlugin(page, name, edit) {
 }
 
 /**
+ * A plugin module that publishes `command` and refuses every call of it in `complaint`, which is
+ * the `Err(String)` half of the ABI's `result<edit, string>` (`wit/plugin.wit`).
+ */
+function stubRefusingPlugin(page, name, command, complaint) {
+  return servePlugin(
+    page,
+    name,
+    `
+    const answer = () => { throw new Error(${JSON.stringify(complaint)}); };
+  `,
+    [{ name: command, description: "Refuses whatever it is given." }],
+  );
+}
+
+/**
  * A plugin module that answers with the cursor of the snapshot it was given, written into the
  * buffer as `line,column`, which is how a run reads the position the host handed over.
  */
@@ -122,11 +137,17 @@ function stubCursorPlugin(page, name) {
  * It has no panel: the world's third interface is exported the way a component has to export it,
  * and answers `undefined`, which is the `none` of `option<panel>`. A panel is checked where a
  * plugin that has one is (`web/e2e/markdown-preview.spec.js`).
+ *
+ * `published` is what its `list-commands` answers with, which is empty for a plugin a run reaches
+ * through an event rather than through a `:` line.
  */
-function servePlugin(page, name, answer) {
+function servePlugin(page, name, answer, published = []) {
   const module = `
     ${answer}
-    const commands = { listCommands: () => [], run: (name, args, buf) => answer(buf) };
+    const commands = {
+      listCommands: () => ${JSON.stringify(published)},
+      run: (name, args, buf) => answer(buf),
+    };
     const events = { subscriptions: () => ["buffer-write"], onEvent: (ev, buf) => answer(buf) };
     const ui = { render: () => undefined };
     export {
@@ -472,6 +493,30 @@ test("an edit naming lines the buffer does not have fails its handler", async ({
   expect(state.autocmd.ran[0]).toContain("plugin が失敗しました");
   expect(state.autocmd.ran[0]).toContain("行のバッファにありません");
   expect(state.text).toBe(before);
+});
+
+test("an ex handler the plugin command it ran refused is reported as failed", async ({ page }) => {
+  // The command is reached from inside the handler's own keys, so its refusal has to come back
+  // out to the handler rather than stopping at the plugin's status line: the native host ends the
+  // run over a refused command the way it does over a key the core refused
+  // (`crates/wim/src/edit.rs`).
+  await stubRefusingPlugin(page, "refuser", "refuse", "refuse takes no arguments");
+  await serveConfig(page, {
+    body: `{
+      "autocmds": [
+        { "event": "buffer-write", "handler": { "kind": "ex", "command": "refuse now" } }
+      ]
+    }`,
+  });
+  await open(page);
+
+  const state = await page
+    .evaluate(() => window.wimDemo.sendKeys(":w<CR>"))
+    .then(() => page.evaluate(() => window.wimDemo.state()));
+
+  expect(state.autocmd.ran).toHaveLength(1);
+  expect(state.autocmd.ran[0]).toContain("ex が失敗しました");
+  expect(state.autocmd.ran[0]).toContain("refuse takes no arguments");
 });
 
 test("a key pressed while the config is in the air is typed once it lands", async ({ page }) => {

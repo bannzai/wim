@@ -140,17 +140,53 @@ fn run(edit: Edit) -> Result<Ran, String> {
     })
 }
 
-/// The plugins named on the command line, loaded and keyed by the name a handler names them by.
-fn load_plugins(declared: &[String]) -> Result<BTreeMap<String, Host>, String> {
-    let mut plugins = BTreeMap::new();
+/// The loaded plugins, and which of them publishes each command name.
+struct Plugins {
+    /// The plugins, keyed by the name a handler names them by.
+    hosts: BTreeMap<String, Host>,
+    /// The plugin that publishes each command name, read once when the plugins were loaded.
+    commands: BTreeMap<String, String>,
+}
+
+impl Plugins {
+    /// The loaded plugin that publishes `name`, `None` when none does.
+    fn command_host(&mut self, name: &str) -> Option<&mut Host> {
+        let plugin = self.commands.get(name)?;
+        self.hosts.get_mut(plugin)
+    }
+}
+
+/// The plugins named on the command line, loaded and asked for the commands they publish.
+///
+/// `list-commands` is the ABI's registration step, so it is called once here rather than on every
+/// `:` line the core hands over (`wit/plugin.wit`): a plugin that publishes its commands only
+/// while it is starting up keeps them for the whole run, and one that traps later takes none of
+/// the other plugins' commands down with it. The plugins are asked in the order they are keyed,
+/// and a name two of them publish stays with the first that published it, which is a collision
+/// this host does not arbitrate.
+fn load_plugins(declared: &[String]) -> Result<Plugins, String> {
+    let mut hosts = BTreeMap::new();
     for declaration in declared {
         let (name, path) = declaration.split_once('=').ok_or_else(|| {
             format!("--plugin is written as NAME=WASM, and {declaration} names no wasm")
         })?;
         let host = Host::from_file(path).map_err(|error| format!("cannot load {path}: {error}"))?;
-        plugins.insert(name.to_owned(), host);
+        hosts.insert(name.to_owned(), host);
     }
-    Ok(plugins)
+    let mut commands = BTreeMap::new();
+    for (plugin, host) in &mut hosts {
+        // A plugin that cannot say what it publishes is one that did not load: the run would
+        // otherwise get as far as the `:` line naming a command of its before finding out.
+        let published = host
+            .list_commands()
+            .map_err(|error| format!("{plugin} cannot be asked for its commands: {error}"))?;
+        for command in published {
+            commands
+                .entry(command.name)
+                .or_insert_with(|| plugin.clone());
+        }
+    }
+    Ok(Plugins { hosts, commands })
 }
 
 /// One run: the buffer, the file it came from, and everything the autocmds may reach.
@@ -161,7 +197,7 @@ struct Session {
     /// back when it is written.
     crlf: bool,
     config: Config,
-    plugins: BTreeMap<String, Host>,
+    plugins: Plugins,
     /// What the autocmds that ran did, in the order they ran.
     reports: Vec<String>,
     /// What ended the run, for the caller to report.
@@ -176,7 +212,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(path: &Path, text: &str, config: Config, plugins: BTreeMap<String, Host>) -> Self {
+    fn new(path: &Path, text: &str, config: Config, plugins: Plugins) -> Self {
         Self {
             editor: Editor::new(&text.replace("\r\n", "\n")),
             path: path.to_owned(),
@@ -200,6 +236,7 @@ impl Session {
             };
             let host = self
                 .plugins
+                .hosts
                 .get_mut(plugin)
                 .ok_or_else(|| format!("no plugin was loaded as {plugin}: pass --plugin"))?;
             let subscriptions = host.subscriptions().map_err(|error| {
@@ -271,7 +308,7 @@ impl Session {
     fn run_command(&mut self, name: &str, args: &str) -> Result<String, String> {
         let buffer = self.snapshot();
         let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
-        let Some(host) = self.command_host(name)? else {
+        let Some(host) = self.plugins.command_host(name) else {
             return Err(format!("not an editor command: {name}"));
         };
         let edit = host
@@ -285,24 +322,6 @@ impl Session {
             return Ok("rewrote the buffer".to_owned());
         }
         Ok(message.unwrap_or_else(|| "left the buffer alone".to_owned()))
-    }
-
-    /// The loaded plugin that published `name`, `None` when none did.
-    ///
-    /// The plugins are asked in the order they are keyed, and the first that has the name gets
-    /// the command: two plugins publishing one name is a collision this host does not arbitrate.
-    fn command_host(&mut self, name: &str) -> Result<Option<&mut Host>, String> {
-        for (plugin, host) in &mut self.plugins {
-            let published = host
-                .list_commands()
-                .map_err(|error| format!("{plugin} cannot be asked for its commands: {error}"))?
-                .iter()
-                .any(|command| command.name == name);
-            if published {
-                return Ok(Some(host));
-            }
-        }
-        Ok(None)
     }
 
     /// The buffer as a plugin is given it (`wit/plugin.wit`).
@@ -402,6 +421,7 @@ impl Session {
         let buffer = self.snapshot();
         let host = self
             .plugins
+            .hosts
             .get_mut(plugin)
             .ok_or_else(|| format!("no plugin was loaded as {plugin}"))?;
         let edit = host
@@ -465,7 +485,15 @@ mod tests {
     use super::*;
 
     fn session(text: &str, config: Config) -> Session {
-        Session::new(Path::new("notes.txt"), text, config, BTreeMap::new())
+        Session::new(
+            Path::new("notes.txt"),
+            text,
+            config,
+            Plugins {
+                hosts: BTreeMap::new(),
+                commands: BTreeMap::new(),
+            },
+        )
     }
 
     fn config(autocmds: &str) -> Config {

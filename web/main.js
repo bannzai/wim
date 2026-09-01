@@ -415,6 +415,8 @@ function carryOut(effects) {
   for (const effect of effects) {
     if (effect.kind === "unknown-ex-command") {
       try {
+        // A line typed at the demo answers for itself: what the command it named refused is on
+        // the plugin's status line, and only a name no plugin published is refused from here.
         runUnknownEx(effect);
       } catch (error) {
         refusal = { kind: "error", message: error.message };
@@ -521,7 +523,13 @@ function typeAtEditor(keys) {
       void save(effect.path ?? null);
     }
     if (effect.kind === "unknown-ex-command") {
-      runUnknownEx(effect);
+      // A command that refused the line is the handler's failure, the same as a key the core
+      // refused: the native host ends its run over one just as it does over an error
+      // (`crates/wim/src/edit.rs`), so the handler must not be reported as having run.
+      const failure = runUnknownEx(effect);
+      if (failure !== null) {
+        throw new Error(failure);
+      }
     }
   }
 }
@@ -582,6 +590,10 @@ function reportAutocmd(message) {
  * argument is settled here: the ABI passes them split on blanks, and a line with nothing after
  * the name passes none (`wit/plugin.wit`). A name no loaded plugin published is the host's to
  * refuse, in the words the core refuses a command of its own with, and that is what this throws.
+ *
+ * Returns what the command it did find failed with, `null` when it ran: a caller that has to
+ * answer for the line — an autocmd handler — reports the failure as its own, while a line typed
+ * at the demo has it on the plugin's status line already.
  */
 function runUnknownEx({ name, args }) {
   const command = pluginCommands.get(name);
@@ -589,7 +601,7 @@ function runUnknownEx({ name, args }) {
     throw new Error(`not an editor command: ${name}`);
   }
   const trimmed = args.trim();
-  runPlugin(command, trimmed === "" ? [] : trimmed.split(/\s+/));
+  return runPlugin(command, trimmed === "" ? [] : trimmed.split(/\s+/));
 }
 
 /**
@@ -597,6 +609,10 @@ function runUnknownEx({ name, args }) {
  *
  * The buffer goes over by value and the answer comes back by value, which is the whole of what
  * the ABI lets a plugin touch (`wit/README.md`): the edit is applied here, by the host.
+ *
+ * Says what the command failed with, `null` when it ran. The status line is written either way,
+ * so that a command typed at the demo reads the same as it always did; what the failure is
+ * returned for is the caller that has to answer for the line rather than only show it.
  */
 function runPlugin(command, args) {
   try {
@@ -605,9 +621,12 @@ function runPlugin(command, args) {
     // as a refusal is, and `wim plugin run` reports the two the same way.
     const edit = command.run(args, bufferSnapshot());
     reportPlugin(`:${command.name}: ${applyEdit(edit)}`);
+    return null;
   } catch (error) {
     // What the plugin refuses arrives as the `result<edit, string>` error half, in its wording.
-    reportPlugin(`:${command.name} が失敗しました: ${error.message}`);
+    const failure = `:${command.name} が失敗しました: ${error.message}`;
+    reportPlugin(failure);
+    return failure;
   }
 }
 
