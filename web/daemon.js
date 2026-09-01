@@ -53,7 +53,9 @@ export async function connect(address, token) {
   const socket = await openSocket(socketUrl(address));
   /** The requests waiting for the response that names their id, keyed by that id. */
   const pending = new Map();
-  let nextId = 0;
+  // From 1: the daemon answers a message it could not read an id out of under id 0, which the
+  // protocol keeps for exactly that, so no request of this client's is ever waiting on it.
+  let nextId = 1;
 
   /** Fails every request in flight, which is what a connection that ended leaves behind. */
   function fail(error) {

@@ -20,6 +20,6 @@ pub use fs::{
     FsWriteParams,
 };
 pub use message::{
-    Event, Method, PROTOCOL_VERSION, Request, Response, ResponsePayload, ServerPush,
-    is_supported_version,
+    Envelope, Event, Method, PROTOCOL_VERSION, RESERVED_ID, Rejected, Request, Response,
+    ResponsePayload, ServerPush, is_supported_version, read_request,
 };

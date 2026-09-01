@@ -164,8 +164,10 @@ impl Client {
             .await
             .expect("the daemon should accept a connection");
         Self {
+            // From 1, the way the protocol has clients number their requests: id 0 is what a
+            // message the daemon could read no id out of is answered under.
+            next_id: 1,
             websocket,
-            next_id: 0,
             pushes: VecDeque::new(),
         }
     }
@@ -478,6 +480,83 @@ async fn a_listing_names_what_is_directly_under_the_directory() {
             },
         ]
     );
+}
+
+/// A FIFO under the listed directory is neither a file nor a directory nor a symlink, and is
+/// reported as [`EntryKind::Other`] rather than misclassified as [`EntryKind::File`].
+#[cfg(unix)]
+#[tokio::test]
+async fn a_fifo_is_listed_as_other_rather_than_as_a_file() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    let status = std::process::Command::new("mkfifo")
+        .arg(fixture.root.join("events"))
+        .status()
+        .expect("mkfifo should run");
+    assert!(status.success(), "mkfifo should create the fifo");
+    let mut client = Client::authenticated(&fixture).await;
+
+    let mut listing: FsListResult = client
+        .ok(Method::FsList(FsListParams {
+            path: ".".to_owned(),
+        }))
+        .await;
+    listing
+        .entries
+        .sort_by(|one, other| one.name.cmp(&other.name));
+    assert_eq!(
+        listing.entries,
+        [
+            DirEntry {
+                name: "events".to_owned(),
+                kind: EntryKind::Other,
+            },
+            DirEntry {
+                name: "notes.txt".to_owned(),
+                kind: EntryKind::File,
+            },
+        ]
+    );
+}
+
+/// The path a client composes for a child of a listing — the listed directory's path, `/`, and
+/// the entry's name — is one `fs.read` takes back, which is the contract `fs.list`'s doc comments
+/// make (`crates/wim-protocol/src/fs.rs`).
+#[tokio::test]
+async fn a_child_path_composed_from_a_listing_reads_back_the_child() {
+    let fixture = Fixture::start(&[("src/nested/deep.txt", "found\n")]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let top: FsListResult = client
+        .ok(Method::FsList(FsListParams {
+            path: ".".to_owned(),
+        }))
+        .await;
+    let src = &top.entries[0];
+    assert_eq!(src.name, "src");
+    let src_path = src.name.clone();
+
+    let middle: FsListResult = client
+        .ok(Method::FsList(FsListParams {
+            path: src_path.clone(),
+        }))
+        .await;
+    let nested = &middle.entries[0];
+    assert_eq!(nested.name, "nested");
+    let nested_path = format!("{src_path}/{}", nested.name);
+
+    let bottom: FsListResult = client
+        .ok(Method::FsList(FsListParams {
+            path: nested_path.clone(),
+        }))
+        .await;
+    let deep = &bottom.entries[0];
+    assert_eq!(deep.name, "deep.txt");
+    let deep_path = format!("{nested_path}/{}", deep.name);
+
+    let read: FsReadResult = client
+        .ok(Method::FsRead(FsReadParams { path: deep_path }))
+        .await;
+    assert_eq!(read.content, "found\n");
 }
 
 #[tokio::test]

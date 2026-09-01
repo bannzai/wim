@@ -1,6 +1,8 @@
 //! Parameters and results of the methods the daemon serves.
 //!
-//! Paths are the daemon's own, in its own syntax; the crate neither parses nor normalizes them.
+//! Paths cross the wire with `/` between their components whatever the daemon's own platform
+//! writes its paths with, so that a client composes one the same way wherever the daemon runs
+//! ([`FsListParams::path`]); the crate itself neither parses nor normalizes them.
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +28,11 @@ pub struct Ack {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FsListParams {
     /// Directory to list. Not recursive.
+    ///
+    /// Read from the directory the daemon serves, which is named `.` or `""`, with `/` between the
+    /// components below it — on Windows too, where the daemon takes `/` as well as the `\` its
+    /// own platform writes. That is what lets a client hold a path without knowing which platform
+    /// the daemon runs on, and what [`DirEntry::name`] is composed onto.
     pub path: String,
 }
 
@@ -40,6 +47,11 @@ pub struct FsListResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DirEntry {
     /// File name, not the full path.
+    ///
+    /// The path of this child is the listed directory's own path, a `/`, and this name — or this
+    /// name alone when the directory listed was `.` or `""`. That path is what the client passes
+    /// back to `fs.read`, `fs.write` and `fs.watch`, and it is composed the same way whichever
+    /// platform the daemon runs on ([`FsListParams::path`]).
     pub name: String,
     /// What the name points at.
     pub kind: EntryKind,
@@ -55,6 +67,15 @@ pub enum EntryKind {
     Directory,
     /// A symlink, reported without following it.
     Symlink,
+    /// Anything else a directory may hold: a socket, a FIFO, a device.
+    ///
+    /// Named rather than reported as a file, because what a client does with a file is open it and
+    /// read it whole, and a FIFO answers that with a read that never returns.
+    ///
+    /// Added without raising [`crate::PROTOCOL_VERSION`], which a value old clients cannot parse
+    /// would otherwise call for: before 1.0 the clients of this protocol live in this repository
+    /// and are released with the daemon, so there is no build in the wild to meet `other`.
+    Other,
 }
 
 /// `fs.read` params.

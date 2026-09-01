@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use wim_protocol::{
     Ack, AuthResult, DirEntry, EntryKind, ErrorCode, FsListParams, FsListResult, FsReadParams,
     FsReadResult, FsUnwatchParams, FsWatchParams, FsWatchResult, FsWriteParams, Method,
-    PROTOCOL_VERSION, Request, Response, ResponseError, is_supported_version,
+    PROTOCOL_VERSION, Response, ResponseError, read_request,
 };
 
 use crate::root::{RESERVED_PREFIX, confined_error, is_reserved};
@@ -169,41 +169,15 @@ impl Session {
     /// Carries out what one message asks for.
     ///
     /// The id comes back alongside the outcome because a response carries it even when the message
-    /// it answers did not parse as a request.
+    /// it answers did not parse as a request. Which id that is, and what a message of a version
+    /// this daemon does not speak is answered with, are the protocol's own
+    /// ([`wim_protocol::read_request`]) rather than this daemon's reading of the JSON.
     async fn answer(&mut self, text: &str) -> (u64, Result<Value, ResponseError>) {
-        let raw: Value = match serde_json::from_str(text) {
-            Ok(raw) => raw,
-            Err(error) => {
-                let message = format!("the message is not JSON: {error}");
-                return (
-                    0,
-                    Err(ResponseError::new(ErrorCode::InvalidRequest, message)),
-                );
-            }
-        };
-        // The id is read before the rest, so that a message the daemon cannot make sense of is
-        // still answered under the id the client is waiting on.
-        let id = raw.get("id").and_then(Value::as_u64).unwrap_or(0);
-        if let Some(version) = raw.get("v").and_then(Value::as_u64)
-            && !u32::try_from(version).is_ok_and(is_supported_version)
-        {
-            let message =
-                format!("this daemon speaks protocol version {PROTOCOL_VERSION}, not {version}");
-            return (
-                id,
-                Err(ResponseError::new(ErrorCode::UnsupportedVersion, message)),
-            );
-        }
-        let request: Request = match serde_json::from_value(raw) {
+        let request = match read_request(text) {
             Ok(request) => request,
-            Err(error) => {
-                let message = format!("the message is not a request this daemon serves: {error}");
-                return (
-                    id,
-                    Err(ResponseError::new(ErrorCode::InvalidRequest, message)),
-                );
-            }
+            Err(rejected) => return (rejected.id, Err(rejected.error)),
         };
+        let id = request.id;
         let outcome = match request.method {
             Method::Auth(params) => {
                 self.authenticated = params.token == self.shared.token;
@@ -289,8 +263,12 @@ async fn list(shared: &Shared, params: FsListParams) -> Result<Value, ResponseEr
                         EntryKind::Symlink
                     } else if kind.is_dir() {
                         EntryKind::Directory
-                    } else {
+                    } else if kind.is_file() {
                         EntryKind::File
+                    } else {
+                        // A socket, a FIFO, a device. Named for what it is rather than called a
+                        // file, which would have a client open it and read it whole.
+                        EntryKind::Other
                     },
                 });
             }

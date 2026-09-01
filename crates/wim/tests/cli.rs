@@ -119,9 +119,11 @@ async fn a_client_opens_and_saves_a_file_with_the_address_and_token_the_binary_p
         .await
         .expect("the daemon should accept a connection");
 
+    // Numbered from 1, the way the protocol has clients number their requests: id 0 is what a
+    // message the daemon could read no id out of is answered under.
     let _: AuthResult = call(
         &mut client,
-        0,
+        1,
         Method::Auth(AuthParams {
             token: serve.token.clone(),
         }),
@@ -129,7 +131,7 @@ async fn a_client_opens_and_saves_a_file_with_the_address_and_token_the_binary_p
     .await;
     let read: FsReadResult = call(
         &mut client,
-        1,
+        2,
         Method::FsRead(FsReadParams {
             path: "notes.txt".to_owned(),
         }),
@@ -139,7 +141,7 @@ async fn a_client_opens_and_saves_a_file_with_the_address_and_token_the_binary_p
 
     let _: Ack = call(
         &mut client,
-        2,
+        3,
         Method::FsWrite(FsWriteParams {
             path: "notes.txt".to_owned(),
             content: "hello again\n".to_owned(),
