@@ -641,15 +641,22 @@ function applyEdit(edit) {
  *
  * A plugin that fails to render loses its panel and is reported, rather than taking the panels of
  * the other plugins down with it.
+ *
+ * `carried` is what the report this refresh writes keeps in front of its own complaints, which is
+ * how the plugins that could not be loaded stay on the line the refresh of startup writes over.
+ * Nothing is carried into the refreshes that follow an edit: what those have to say is their own.
  */
-function refreshPanels() {
+function refreshPanels(carried = []) {
+  // Collected rather than reported one at a time: the status line holds one message, so a second
+  // plugin that cannot draw would otherwise be the only one of them the user is left with.
+  const failures = [];
   for (const [name, plugin] of plugins) {
     let panel;
     try {
       panel = plugin.render(bufferSnapshot());
     } catch (error) {
       closePanel(name);
-      reportPlugin(`${name} のパネルを描けません: ${error.message}`);
+      failures.push(`${name} のパネルを描けません: ${error.message}`);
       continue;
     }
     if (panel === undefined) {
@@ -657,6 +664,9 @@ function refreshPanels() {
       continue;
     }
     openPanel(name, panel);
+  }
+  if (carried.length > 0 || failures.length > 0) {
+    reportPlugin([...carried, ...failures].join(" / "));
   }
 }
 
@@ -755,12 +765,14 @@ async function startPlugins() {
     published.length === 0
       ? "プラグインは読み込まれていません"
       : `プラグインのコマンド ${published.join(" / ")}`;
-  if (failures.length > 0) {
-    reportPlugin(`読み込めないプラグインがあります: ${failures.join(" / ")}`);
-  }
+  // What startup has to report: the plugins that could not be loaded and, below, the ones that
+  // loaded and cannot draw. Both are plugins the user cannot use, so the refresh is handed the
+  // first lot to report alongside its own rather than writing over them.
+  const startup =
+    failures.length === 0 ? [] : [`読み込めないプラグインがあります: ${failures.join(" / ")}`];
   // The panels a plugin has for the buffer that is already on screen. This is the "when the host
   // opens the panel" half of what `render` is called for; the other half is the buffer changing.
-  refreshPanels();
+  refreshPanels(startup);
 }
 
 /**
@@ -1135,6 +1147,34 @@ function syncImeFocus() {
   if (document.activeElement === imeInput) {
     imeInput.blur();
   }
+}
+
+/**
+ * Takes the focus back off a panel's frame, so that the keys typed after a panel was clicked are
+ * the editor's again.
+ *
+ * A panel is an iframe, and a click inside one makes its document the focused one: every key from
+ * there on is delivered to it and none of them reach the handler on this window. Nothing in the
+ * frame can hand them back — it is sandboxed with no scripts, so nothing in there runs at all
+ * (`openPanel`) — which is why the frame taking the focus is watched for out here instead.
+ *
+ * Only a panel's frame is taken off: the focus a file control or a sample button was given is
+ * theirs, and the keys typed into one belong to it (`focusEditor`).
+ *
+ * Normal mode has no other way back: the canvas prevents the default focus change of a click so
+ * that one cannot take the textarea away from an IME, and `syncImeFocus` focuses that textarea
+ * only in the modes whose keys are text. So a click on the canvas would leave the frame holding
+ * the keys, and the editor would look dead until something else on the page was clicked. Blurring
+ * the frame puts the focus back on this document, and `syncImeFocus` then leaves it where the mode
+ * it is in says it belongs.
+ */
+function releasePanelFocus() {
+  const focused = document.activeElement;
+  if (!(focused instanceof HTMLIFrameElement) || focused.closest("#panels") === null) {
+    return;
+  }
+  focused.blur();
+  syncImeFocus();
 }
 
 /** Where the cursor is drawn, in CSS pixels from the top left corner of the canvas. */
@@ -1570,6 +1610,17 @@ canvas.addEventListener("pointerdown", (event) => {
   event.preventDefault();
   syncImeFocus();
 });
+
+// A click inside a panel is not an event this page ever sees — the frame holds another document —
+// so what the demo reads instead is this window losing the focus to it. That is the one event a
+// panel's frame raises here: a sandboxed frame is on an opaque origin, and its taking the focus
+// raises no `focusin` on this document at all, only the window's `blur`.
+//
+// The release waits for the task after the blur. The blur is raised while the browser is still
+// moving the focus into the frame, and a frame blurred from inside that handler is focused again
+// by the move that was already under way; by the next task the move has landed and the blur holds.
+// Nothing but a frame is ever acted on, so the blur of switching to another window is left alone.
+window.addEventListener("blur", () => setTimeout(releasePanelFocus));
 
 daemonForm.addEventListener("submit", (event) => {
   // The form is the page's own: it opens a file over a WebSocket rather than navigating.

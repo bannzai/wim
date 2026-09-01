@@ -35,6 +35,34 @@ function panelFrame(page, plugin = "markdown-preview") {
 }
 
 /**
+ * Serves a manifest naming `modules` — the source of each plugin, keyed by the name it is loaded
+ * under — in place of the one the build writes.
+ *
+ * This is what lets a run put the host in front of the shapes a build can produce and a machine
+ * that cannot build one has no way to reach: a module that is not a plugin, a plugin whose panel
+ * fails, and several of them at once.
+ */
+function stubPlugins(page, modules) {
+  return Promise.all([
+    page.route("**/plugins/manifest.json", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json; charset=utf-8",
+        body: JSON.stringify({
+          abi: "0.1.0",
+          plugins: Object.keys(modules).map((name) => ({ name, module: `./plugins/${name}.js` })),
+        }),
+      }),
+    ),
+    ...Object.entries(modules).map(([name, body]) =>
+      page.route(`**/plugins/${name}.js`, (route) =>
+        route.fulfill({ status: 200, contentType: "text/javascript; charset=utf-8", body }),
+      ),
+    ),
+  ]);
+}
+
+/**
  * A plugin module of the shape jco writes, standing in for the transpiled Markdown Preview.
  *
  * It answers the two ways the real one does — a panel for a `.md` buffer, `none` for anything
@@ -73,21 +101,24 @@ function stubPreview(page, name = "markdown-preview") {
       ui as "wim:plugin/ui@0.1.0",
     };
   `;
-  return Promise.all([
-    page.route("**/plugins/manifest.json", (route) =>
-      route.fulfill({
-        status: 200,
-        contentType: "application/json; charset=utf-8",
-        body: JSON.stringify({
-          abi: "0.1.0",
-          plugins: [{ name, module: `./plugins/${name}.js` }],
-        }),
-      }),
-    ),
-    page.route(`**/plugins/${name}.js`, (route) =>
-      route.fulfill({ status: 200, contentType: "text/javascript; charset=utf-8", body: module }),
-    ),
-  ]);
+  return stubPlugins(page, { [name]: module });
+}
+
+/**
+ * A plugin of the same shape whose panel fails with `complaint`, which is what a trap in the guest
+ * comes back to the browser host as.
+ */
+function brokenPanel(complaint) {
+  return `
+    const commands = { listCommands: () => [], run: () => { throw new Error("no"); } };
+    const events = { subscriptions: () => [], onEvent: () => { throw new Error("no"); } };
+    const ui = { render: () => { throw new Error(${JSON.stringify(complaint)}); } };
+    export {
+      commands as "wim:plugin/commands@0.1.0",
+      events as "wim:plugin/events@0.1.0",
+      ui as "wim:plugin/ui@0.1.0",
+    };
+  `;
 }
 
 /** Opens the demo and waits for the plugins and the config to be in. */
@@ -192,32 +223,7 @@ test("nothing in a panel runs, and nothing in it reaches the page", async ({ pag
 test("a plugin whose panel fails is reported and loses its panel alone", async ({ page }) => {
   // A plugin that traps comes back to the browser host as a thrown error, the way a refusal
   // does. The panel it had is closed rather than left holding what it last said.
-  await page.route("**/plugins/manifest.json", (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: "application/json; charset=utf-8",
-      body: JSON.stringify({
-        abi: "0.1.0",
-        plugins: [{ name: "broken-panel", module: "./plugins/broken-panel.js" }],
-      }),
-    }),
-  );
-  await page.route("**/plugins/broken-panel.js", (route) =>
-    route.fulfill({
-      status: 200,
-      contentType: "text/javascript; charset=utf-8",
-      body: `
-        const commands = { listCommands: () => [], run: () => { throw new Error("no"); } };
-        const events = { subscriptions: () => [], onEvent: () => { throw new Error("no"); } };
-        const ui = { render: () => { throw new Error("the panel gave up"); } };
-        export {
-          commands as "wim:plugin/commands@0.1.0",
-          events as "wim:plugin/events@0.1.0",
-          ui as "wim:plugin/ui@0.1.0",
-        };
-      `,
-    }),
-  );
+  await stubPlugins(page, { "broken-panel": brokenPanel("the panel gave up") });
   await open(page);
 
   expect(await panels(page)).toEqual([]);
@@ -225,6 +231,79 @@ test("a plugin whose panel fails is reported and loses its panel alone", async (
   // The demo is still the demo: a panel that could not be drawn does not stop the editing.
   await page.evaluate(() => window.wimDemo.sendKeys("x"));
   expect(await page.evaluate(() => window.wimDemo.state().text)).not.toBe("");
+});
+
+test("every plugin startup could not use is reported, not just the last one", async ({ page }) => {
+  // Startup reports from two places — the load, and the refresh that draws the first panels — and
+  // each of these three plugins is one the user cannot use. Every one of them is something to look
+  // into, so none of them may be dropped for the one reported after it.
+  await stubPlugins(page, {
+    "not-a-plugin": "export const nothing = 0;",
+    "broken-panel": brokenPanel("the panel gave up"),
+    "broken-panel-too": brokenPanel("this one too"),
+  });
+  await open(page);
+
+  const status = page.locator("#plugin-status");
+  await expect(status).toContainText("not-a-plugin: no wim:plugin/commands interface is exported");
+  await expect(status).toContainText("broken-panel のパネルを描けません: the panel gave up");
+  await expect(status).toContainText("broken-panel-too のパネルを描けません: this one too");
+  expect(await panels(page)).toEqual([]);
+});
+
+test("a module missing the ui export is refused as the plugin is loaded", async ({ page }) => {
+  // A manifest and the module it names can go out of sync, and what that leaves is a module of
+  // the world's shape with one of its interfaces missing. The native host refuses such a component
+  // as it instantiates it (`crates/wim-plugin-host/src/lib.rs`), so this one is refused as it is
+  // loaded — rather than having its commands registered and its panel fail on every refresh.
+  await stubPlugins(page, {
+    "no-ui": `
+      const commands = {
+        listCommands: () => [{ name: "upcase", description: "Uppercases the whole buffer." }],
+        run: () => ({ tag: "noop" }),
+      };
+      const events = { subscriptions: () => [], onEvent: () => { throw new Error("no"); } };
+      export {
+        commands as "wim:plugin/commands@0.1.0",
+        events as "wim:plugin/events@0.1.0",
+      };
+    `,
+  });
+  await open(page);
+
+  // The commands of a plugin that is missing an interface are not the half of it that works.
+  const { commands } = await page.evaluate(() => window.wimDemo.plugins());
+  expect(commands).toEqual([]);
+  await expect(page.locator("#plugin-commands")).toHaveText("プラグインは読み込まれていません");
+  await expect(page.locator("#plugin-status")).toHaveText(
+    "読み込めないプラグインがあります: no-ui: no wim:plugin/ui interface is exported",
+  );
+  expect(await panels(page)).toEqual([]);
+});
+
+test("a click in a panel gives the keys back to the editor", async ({ page }) => {
+  await stubPreview(page);
+  await open(page);
+  await page.evaluate((name) => window.wimDemo.load("# Title\n", name), MARKDOWN);
+  await expect(panelFrame(page).locator("h1")).toHaveText("Title");
+
+  // The click lands in the frame's own document, which is where the keys after it would go. Normal
+  // mode is where nothing else would take the focus back: a click on the canvas does not move it,
+  // and the textarea an IME composes into is focused in the text modes alone.
+  await panelFrame(page).locator("body").click();
+  await expect
+    .poll(() => page.evaluate(() => document.activeElement?.tagName ?? null))
+    .not.toBe("IFRAME");
+  await page.keyboard.press("x");
+  expect(await page.evaluate(() => window.wimDemo.state().text)).toBe(" Title\n");
+
+  // In Insert mode the focus goes back to where an IME composes, which is what the mode the editor
+  // is in says rather than what happened to be focused before the click.
+  await page.evaluate(() => window.wimDemo.sendKeys("i"));
+  await panelFrame(page).locator("body").click();
+  await expect.poll(() => page.evaluate(() => window.wimDemo.state().ime.focused)).toBe(true);
+  await page.keyboard.press("a");
+  expect(await page.evaluate(() => window.wimDemo.state().text)).toBe("a Title\n");
 });
 
 test.describe("the built component", () => {
