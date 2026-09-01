@@ -25,6 +25,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The vendored tree-sitter runtime and grammars are committed and served as they are, so
+      # what is in the tree has to be what the script installed.
+      - run: bash scripts/vendor-tree-sitter.sh --check
 
   test:
     strategy:

@@ -1,6 +1,6 @@
 WASM := target/wasm32-unknown-unknown/release/wim_wasm.wasm
 
-.PHONY: build-web web e2e install-wasm-bindgen
+.PHONY: build-web web e2e install-wasm-bindgen vendor-tree-sitter
 
 # Builds the wasm module and the JS glue the demo page imports.
 build-web:
@@ -16,6 +16,11 @@ web: build-web
 e2e: build-web
 	cargo build -p wim
 	cd web && npm ci && npx playwright install --with-deps chromium && npx playwright test
+
+# Refetches the tree-sitter runtime and the grammars the demo highlights with. What it installs is
+# committed under web/vendor/, so this is only run to move a pinned version.
+vendor-tree-sitter:
+	bash scripts/vendor-tree-sitter.sh
 
 # wasm-bindgen-cli has to match the crate version, which Cargo.lock holds.
 install-wasm-bindgen:

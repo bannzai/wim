@@ -118,7 +118,17 @@
         font-size: 13px;
       }
 
-      #file-access button {
+      /* The row of sample buffers, which sits under the canvas and reads as one line of text with
+         the buttons in it. */
+      #samples {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        margin-top: 12px;
+      }
+
+      #file-access button,
+      #samples button {
         padding: 6px 12px;
         border: 1px solid #2b303b;
         border-radius: 4px;
@@ -150,6 +160,7 @@
         キーボードで直接編集できます。<code>i</code> / <code>a</code> / <code>o</code> で Insert、<code>Esc</code> で Normal、
         <code>hjkl</code> <code>w</code> <code>b</code> <code>0</code> <code>$</code> <code>gg</code> <code>G</code> で移動、<code>x</code> <code>dd</code>
         <code>yy</code> <code>p</code> <code>u</code> と <code>:</code> の Ex コマンドが使えます。Insert と Ex コマンドラインでは日本語入力 (IME) が使えます。
+        <code>.rs</code> と <code>.md</code> のファイルは tree-sitter でシンタックスハイライトされます。
       </p>
       <div class="screen">
         <canvas id="screen" width="880" height="440"></canvas>
@@ -162,6 +173,11 @@
           spellcheck="false"
         ></textarea>
       </div>
+      <p id="samples">
+        シンタックスハイライトの例:
+        <button type="button" id="sample-rust">Rust</button>
+        <button type="button" id="sample-markdown">Markdown</button>
+      </p>
       <section id="file-access">
         <p>
           ファイルを開くと <code>:w</code> で書き戻せます。デーモン経由で開くには手元で

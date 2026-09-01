@@ -8,12 +8,56 @@
 
 import init, { WimEditor, display_cells } from "./pkg/wim_wasm.js";
 import { connect } from "./daemon.js";
+import { createHighlighter, languageOf } from "./highlight.js";
 
 const INITIAL_TEXT = `wim is a Vim-grammar editor, not a Vim clone.
 The core is one pure Rust crate, compiled to Wasm for this page.
 
 Type i to insert, Esc to go back, dd to delete this line.
 全角も 1 桁ではなく 2 桁ぶんの幅で描く。`;
+
+/**
+ * Buffers the sample buttons load, under the name that says which language they are in.
+ *
+ * Highlighting is otherwise only seen on a file that was opened, and neither way of opening one
+ * is open to everybody — a daemon has to be running, and the browser's picker is Chromium's — so
+ * the demo carries a buffer of each language it highlights.
+ */
+const SAMPLES = {
+  "sample.rs": `// Rust, highlighted by tree-sitter.
+use std::fmt::Write as _;
+
+#[derive(Debug, Clone)]
+pub struct Buffer {
+    lines: Vec<String>,
+}
+
+impl Buffer {
+    pub fn joined(&self) -> String {
+        let mut text = String::new();
+        for (number, line) in self.lines.iter().enumerate() {
+            writeln!(text, "{number}: {line}").unwrap();
+        }
+        text
+    }
+}
+`,
+  "sample.md": `# Markdown, highlighted by tree-sitter
+
+wim reads the buffer's *extension* to pick a grammar.
+
+- \`.rs\` loads tree-sitter-rust
+- \`.md\` loads tree-sitter-markdown
+
+\`\`\`rust
+fn main() {
+    println!("the fence is drawn as one run");
+}
+\`\`\`
+
+See <https://github.com/bannzai/wim> for the rest.
+`,
+};
 
 /** Font size in CSS pixels. The cell size is measured from it, so the two never drift. */
 const FONT_SIZE = 16;
@@ -69,6 +113,12 @@ const daemonPath = document.querySelector("#daemon-path");
 /** The button that opens a file the browser itself hands over and writes back. */
 const localButton = document.querySelector("#local-open");
 
+/** The buttons that put one of `SAMPLES` in the buffer, keyed by the name they load it under. */
+const sampleButtons = {
+  "sample.rs": document.querySelector("#sample-rust"),
+  "sample.md": document.querySelector("#sample-markdown"),
+};
+
 /** Where opening and saving report what they did, under the file controls. */
 const fileStatus = document.querySelector("#file-status");
 
@@ -103,6 +153,22 @@ let view = {
 
 /** What an IME is composing right now, `""` when nothing is being composed. */
 let composition = "";
+
+/**
+ * The tree-sitter highlighter over the buffer, `null` for a buffer in no language the demo has a
+ * grammar for — which is what the demo starts on, and what a file with an unknown extension gets.
+ */
+let highlighter = null;
+
+/**
+ * How many languages have been asked for, which is what tells a grammar that has finished loading
+ * whether it is still the one the buffer is in. Fetching one takes a round trip, and a second file
+ * may well be opened before the first one's grammar has arrived.
+ */
+let languageGeneration = 0;
+
+/** The rows the last batch of keys changed the highlighting of, which are redrawn with the damage. */
+let highlightDamage = new Set();
 
 /**
  * Where the buffer came from and where `:w` writes it back, `null` until a file is opened.
@@ -226,6 +292,16 @@ function handleKeys(keys) {
     damageEnd: outcome.damage_end,
     effects: JSON.parse(outcome.effects),
   };
+  // Reparsing before the frame is what lets the rows whose colours changed be drawn with the rows
+  // whose text did. The viewport of the frame just gone is the one to look at: a key that moves it
+  // redraws everything anyway.
+  highlightDamage =
+    highlighter === null
+      ? new Set()
+      : highlighter.update(
+          editor.text(),
+          Array.from({ length: view.visibleRows }, (_, row) => view.scrollTop + row),
+        );
   draw();
   // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
   syncImeFocus();
@@ -244,14 +320,57 @@ function report(message) {
   fileStatus.textContent = message;
 }
 
-/** Replaces the buffer with `text`, which is what opening a file leaves behind. */
-function loadText(text) {
+/**
+ * Replaces the buffer with `text`, which is what opening a file leaves behind, and starts
+ * highlighting it as the language `name` is written in.
+ *
+ * The buffer is on screen before the grammar is: it is fetched over the network and the text is
+ * readable, and editable, while that is in the air. The answer is the grammar arriving, which is
+ * what the E2E run waits on.
+ */
+function loadText(text, name = "") {
   editor = new WimEditor(text);
   lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
   view = { ...view, scrollTop: 0 };
+  const highlighted = setLanguage(name);
   draw({ full: true });
   // A fresh editor is in Normal mode, whatever the one it replaced was in.
   syncImeFocus();
+  return highlighted;
+}
+
+/**
+ * Highlights the buffer as the language a file called `name` is written in, and stops highlighting
+ * it at all when that is a name no grammar is loaded for.
+ */
+async function setLanguage(name) {
+  const generation = (languageGeneration += 1);
+  highlighter?.close();
+  highlighter = null;
+  highlightDamage = new Set();
+  const language = languageOf(name);
+  if (language === null) {
+    return;
+  }
+  let started;
+  try {
+    started = await createHighlighter(language, editor.text());
+  } catch (error) {
+    if (generation === languageGeneration) {
+      report(`${language} のハイライトを読み込めません: ${error.message}`);
+    }
+    return;
+  }
+  if (generation !== languageGeneration) {
+    // Another buffer is being highlighted by now, and this grammar has nothing left to parse.
+    started.close();
+    return;
+  }
+  highlighter = started;
+  // Keys typed while the grammar was in the air went into the buffer and not into the tree, which
+  // was parsed from the text as it stood when the grammar was asked for.
+  highlighter.update(editor.text(), []);
+  draw({ full: true });
 }
 
 /**
@@ -400,7 +519,7 @@ async function openFromDaemon() {
   // the daemon that has the file rather than whatever the form says by then.
   closeOpenFile();
   openFile = { kind: "daemon", client, path, newline: newlineOf(content) };
-  loadText(content.replaceAll("\r\n", "\n"));
+  void loadText(content.replaceAll("\r\n", "\n"), path);
   focusEditor();
   report(`${path} を開きました`);
 }
@@ -449,7 +568,7 @@ async function openLocalFile() {
   }
   closeOpenFile();
   openFile = { kind: "local", handle, name: handle.name, newline: newlineOf(text) };
-  loadText(text.replaceAll("\r\n", "\n"));
+  void loadText(text.replaceAll("\r\n", "\n"), handle.name);
   focusEditor();
   report(`${handle.name} を開きました`);
 }
@@ -629,13 +748,43 @@ function drawGlyph(text, width, color, x, y) {
   );
 }
 
-/** Draws `cells` from `x` rightwards, each over as many cells as its width says. */
+/**
+ * Draws `cells` from `x` rightwards, each over as many cells as its width says, in `color` unless
+ * highlighting gave the cell one of its own.
+ */
 function drawCells(cells, x, y, color) {
   let left = x;
   for (const cell of cells) {
-    drawGlyph(cell.text, cell.width, color, left, y);
+    drawGlyph(cell.text, cell.width, cell.color ?? color, left, y);
     left += cell.width * view.cellWidth;
   }
+}
+
+/**
+ * `cells` with the colour the highlighting draws each of them in, left alone where the buffer is
+ * in no language or the row has nothing coloured on it.
+ *
+ * A run is a range of UTF-16 units, which is what tree-sitter counts columns in, while a cell is a
+ * grapheme cluster and may be several of them: a cell takes the colour of the run its first unit
+ * falls in, because a run that started inside a cluster would have no glyph of its own to colour.
+ */
+function colorCells(cells, line) {
+  if (highlighter === null) {
+    return cells;
+  }
+  const runs = highlighter.rowRuns(line);
+  let column = 0;
+  let index = 0;
+  for (const cell of cells) {
+    while (index < runs.length && runs[index].end <= column) {
+      index += 1;
+    }
+    if (index < runs.length && runs[index].start <= column) {
+      cell.color = runs[index].color;
+    }
+    column += cell.text.length;
+  }
+  return cells;
 }
 
 /** Draws the cursor on column `col` of `cells`, under the text so the character stays readable. */
@@ -666,7 +815,7 @@ function drawRow(line) {
     COLORS.muted,
   );
 
-  const cells = cellsOf(editor.line(line));
+  const cells = colorCells(cellsOf(editor.line(line)), line);
   if (line !== view.cursorLine) {
     drawCells(cells, view.textLeft, top, COLORS.text);
     return;
@@ -718,14 +867,18 @@ function scrolledTop(visibleRows) {
 }
 
 /**
- * The lines the last batch of keys left needing a redraw: the damage the editor reported, plus
- * the rows the cursor left and landed on.
+ * The lines the last batch of keys left needing a redraw: the damage the editor reported, the rows
+ * the cursor left and landed on, and the rows the reparse gave different colours to.
+ *
+ * The last of those is not in the editor's damage and cannot be: the core knows nothing about
+ * languages, so a quote typed on one line damages that line while turning every line under it into
+ * a string.
  *
  * The damage already counts the rows a deletion emptied, so a row that has fallen past the end
  * of the buffer is in it and gets the end-of-buffer filler drawn over the text it used to hold.
  */
 function damagedRows() {
-  const rows = new Set([view.cursorLine, editor.cursor_line()]);
+  const rows = new Set([view.cursorLine, editor.cursor_line(), ...highlightDamage]);
   for (let line = lastOutcome.damageStart; line < lastOutcome.damageEnd; line += 1) {
     rows.add(line);
   }
@@ -817,9 +970,13 @@ draw({ full: true });
 // Listening only once the editor exists is what keeps a key typed during the wasm fetch from
 // reaching a demo that has nothing to type into.
 window.addEventListener("keydown", (event) => {
-  // The file controls are text fields and buttons of the page's own, and a key typed into one
-  // of them is theirs: taking it here would leave an address that cannot be typed.
-  if (event.target instanceof Element && event.target.closest("#file-access") !== null) {
+  // The file controls and the sample buttons are the page's own, and a key typed into one of them
+  // is theirs: taking it here would leave an address that cannot be typed, and the Enter or Space
+  // that presses a button someone reached with Tab would be typed into the buffer as well.
+  if (
+    event.target instanceof Element &&
+    event.target.closest("#file-access, #samples") !== null
+  ) {
     return;
   }
   const keys = keyNotation(event);
@@ -886,6 +1043,17 @@ daemonForm.addEventListener("submit", (event) => {
 
 localButton.addEventListener("click", () => void openLocalFile());
 
+for (const [name, button] of Object.entries(sampleButtons)) {
+  button.addEventListener("click", () => {
+    // A sample is a buffer rather than a file: nothing on the other side of `:w` was opened, so
+    // whatever was open is let go of and the command reports that there is nowhere to write.
+    closeOpenFile();
+    void loadText(SAMPLES[name], name);
+    focusEditor();
+    report(`${name} を読み込みました`);
+  });
+}
+
 if (window.showOpenFilePicker === undefined) {
   // Firefox and Safari have no File System Access API, and without it a page can read a file
   // through an `<input type="file">` but has nowhere to write it back to.
@@ -896,10 +1064,16 @@ if (window.showOpenFilePicker === undefined) {
 // The handle the E2E run drives and inspects the demo through.
 window.wimDemo = {
   sendKeys: handleKeys,
-  /** Replaces the buffer, which is how the E2E run gets one taller than the viewport. */
+  /**
+   * Replaces the buffer, which is how the E2E run gets one taller than the viewport, under `name`
+   * when it is to be highlighted as the language that name says. The answer settles once the
+   * grammar has been fetched and the first highlighted frame is up.
+   */
   load: loadText,
   /** Redraws every row, which the E2E run compares the damage-driven redraw against. */
   redraw: () => draw({ full: true }),
+  /** The runs row `line` is coloured by, `null` for a buffer in no language the demo highlights. */
+  highlightRuns: (line) => (highlighter === null ? null : highlighter.rowRuns(line)),
   state: () => ({
     text: editor.text(),
     lines: Array.from({ length: editor.line_count() }, (_, line) => editor.line(line)),
@@ -909,6 +1083,12 @@ window.wimDemo = {
     damage: { start: lastOutcome.damageStart, end: lastOutcome.damageEnd },
     effects: lastOutcome.effects,
     viewport: { top: view.scrollTop, rows: view.visibleRows },
+    highlight: {
+      /** The grammar the buffer is parsed with, `null` when nothing highlights it. */
+      language: highlighter?.language ?? null,
+      /** The rows the last batch of keys changed the colours of, which were redrawn for it. */
+      damage: [...highlightDamage].sort((left, right) => left - right),
+    },
     ime: {
       /** What an IME is composing, which the row is drawn with and the buffer does not hold. */
       composition,

@@ -10,7 +10,9 @@ Vim 互換ではなく「Vim の文法を持つ新エディタ」です。オペ
 
 ## ブラウザデモ
 
-https://bannzai.github.io/wim/ で、`crates/wim-core` をそのまま Wasm にしたエディタが動きます (`crates/wim-wasm` のバインディング + `web/` の Canvas 描画)。`i` `a` `o` で Insert、`Esc` で Normal に戻り、`hjkl` `w` `b` `0` `$` の移動、`x` `dd` `yy` `p` `u` の編集、`:` の Ex コマンドが使えます。シンタックスハイライトはまだ入っていません。
+https://bannzai.github.io/wim/ で、`crates/wim-core` をそのまま Wasm にしたエディタが動きます (`crates/wim-wasm` のバインディング + `web/` の Canvas 描画)。`i` `a` `o` で Insert、`Esc` で Normal に戻り、`hjkl` `w` `b` `0` `$` の移動、`x` `dd` `yy` `p` `u` の編集、`:` の Ex コマンドが使えます。
+
+シンタックスハイライトは tree-sitter で、拡張子が `.rs` / `.md` のバッファに当たります。ページ上の「シンタックスハイライトの例」ボタンで、ファイルを開かずに色付きのバッファを読み込めます。ハイライトは `wim-wasm` / `web` 層の担当で、`crates/wim-core` は言語を一切知りません。tree-sitter のランタイムと文法 (`.wasm` と `highlights.scm`) は `scripts/vendor-tree-sitter.sh` が `web/vendor/tree-sitter/` へ取得したものをそのままコミットしてあり、Pages のデプロイも E2E もこのファイルを読みます。バージョンを上げるときだけ `make vendor-tree-sitter` を実行します。対応言語を足すには、同スクリプトの `GRAMMARS` と `web/highlight.js` の `LANGUAGES` にそれぞれ 1 行足します。
 
 ファイルは 2 通りの方法で開けて、どちらも `:w` で書き戻せます。1 つは手元で `wim serve --root .` を実行し、表示されたアドレスとトークンをページのフォームに入れてデーモン経由で開く方法で、デーモンが `--root` 配下のファイルを読み書きします。もう 1 つは File System Access API 対応ブラウザ (Chrome / Edge) で「ローカルファイルを開く」からファイルを選ぶ方法で、サーバーは要りません。
 
