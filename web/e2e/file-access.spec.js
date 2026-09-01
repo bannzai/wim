@@ -264,11 +264,9 @@ test.describe("through a daemon", () => {
 
     await expect(statusOf(page)).toHaveText("crlf.md を開きました");
     // The core edits LF text, so the carriage returns are not in the buffer to be edited around.
-    expect(await page.evaluate(() => window.wimDemo.state().lines)).toEqual([
-      "hello",
-      "world",
-      "",
-    ]);
+    // A trailing newline terminates the last line rather than opening an empty one, so the
+    // buffer holds the two lines the file has.
+    expect(await page.evaluate(() => window.wimDemo.state().lines)).toEqual(["hello", "world"]);
 
     await openLineBelow(page, "added");
     await write(page);
@@ -374,11 +372,9 @@ test.describe("through the browser's own picker", () => {
     await page.click("#local-open");
 
     await expect(statusOf(page)).toHaveText("crlf.md を開きました");
-    expect(await page.evaluate(() => window.wimDemo.state().lines)).toEqual([
-      "hello",
-      "world",
-      "",
-    ]);
+    // A trailing newline terminates the last line rather than opening an empty one, so the
+    // buffer holds the two lines the file has.
+    expect(await page.evaluate(() => window.wimDemo.state().lines)).toEqual(["hello", "world"]);
 
     await openLineBelow(page, "added");
     await write(page);
