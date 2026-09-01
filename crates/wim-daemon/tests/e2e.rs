@@ -34,10 +34,12 @@ const CHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long a test waits for one change before making it again.
 ///
-/// A backend is watching only some time after it says it is: on macOS the changes made in the
-/// window right after an FSEvents stream starts are reported by neither this run nor a later one,
-/// which measured as a third of the runs of this file. One change going unreported is therefore
-/// not yet a watch that does not work, and making the change again is what tells the two apart.
+/// A backend is watching only some time after it says it is, and `fs.watch` narrows that window
+/// rather than closing it: it probes for up to two seconds
+/// (`documents/adr/0002-daemon-watch-and-staging-robustness.md`), and an FSEvents stream was
+/// measured taking about four to become live on a loaded macOS machine. One change going
+/// unreported is therefore not yet a watch that does not work, and making the change again is what
+/// tells the two apart.
 const CHANGE_RETRY: Duration = Duration::from_millis(500);
 
 /// How long a test watches for a change that should not come.
@@ -228,26 +230,54 @@ impl Client {
     async fn change_to(
         &mut self,
         name: &str,
+        apply: impl AsyncFnMut(&mut Self),
+    ) -> FsChangedParams {
+        self.change_to_matching(
+            &format!("change to {name}"),
+            |change| change.path.ends_with(name),
+            apply,
+        )
+        .await
+    }
+
+    /// The change a watch reports that `matches`, with `apply` making it until one comes.
+    ///
+    /// `apply` runs once per round, so a change it cannot make twice is one to put back first.
+    /// `what` names what was waited for in the failure, which a predicate cannot.
+    async fn change_to_matching(
+        &mut self,
+        what: &str,
+        matches: impl Fn(&FsChangedParams) -> bool,
         mut apply: impl AsyncFnMut(&mut Self),
     ) -> FsChangedParams {
         let deadline = Instant::now() + CHANGE_TIMEOUT;
         loop {
             apply(self).await;
-            if let Some(change) = self.change_within(CHANGE_RETRY, name).await {
+            if let Some(change) = self.change_matching(CHANGE_RETRY, &matches).await {
                 return change;
             }
             assert!(
                 Instant::now() < deadline,
-                "no change to {name} was reported within {CHANGE_TIMEOUT:?}"
+                "no {what} was reported within {CHANGE_TIMEOUT:?}"
             );
         }
     }
 
     /// The next change a watch reports about `name`, and `None` when the window runs out first.
-    ///
-    /// Changes about other paths are passed over: a directory watch also sees the directory
-    /// itself, and what a backend reports around a write is its own to decide.
     async fn change_within(&mut self, window: Duration, name: &str) -> Option<FsChangedParams> {
+        self.change_matching(window, |change| change.path.ends_with(name))
+            .await
+    }
+
+    /// The next change a watch reports that `matches`, and `None` when the window runs out first.
+    ///
+    /// Changes that do not match are passed over: a directory watch also sees the directory
+    /// itself, and what a backend reports around a write is its own to decide.
+    async fn change_matching(
+        &mut self,
+        window: Duration,
+        matches: impl Fn(&FsChangedParams) -> bool,
+    ) -> Option<FsChangedParams> {
         let deadline = Instant::now() + window;
         loop {
             let push = match self.pushes.pop_front() {
@@ -261,7 +291,7 @@ impl Client {
                 },
             };
             let Event::FsChanged(change) = push.event;
-            if change.path.ends_with(name) {
+            if matches(&change) {
                 return Some(change);
             }
         }
@@ -765,6 +795,187 @@ async fn a_watch_on_a_path_that_is_not_there_is_reported_as_missing() {
         }))
         .await;
     assert_eq!(error.code, ErrorCode::NotFound);
+}
+
+#[tokio::test]
+async fn a_name_the_daemon_keeps_for_itself_is_neither_listed_nor_served() {
+    // A file at a staging name, left where one would be by a write that was interrupted or by
+    // something else on the machine; either way it is not a client's to see or to touch.
+    let fixture = Fixture::start(&[
+        ("notes.txt", "hello\n"),
+        (".wim-0123456789abcdef", "staged\n"),
+    ])
+    .await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let listing: FsListResult = client
+        .ok(Method::FsList(FsListParams {
+            path: ".".to_owned(),
+        }))
+        .await;
+    assert_eq!(
+        listing.entries,
+        [DirEntry {
+            name: "notes.txt".to_owned(),
+            kind: EntryKind::File,
+        }],
+        "what this daemon stages under is not part of the directory it serves"
+    );
+
+    for method in [
+        Method::FsRead(FsReadParams {
+            path: ".wim-0123456789abcdef".to_owned(),
+        }),
+        Method::FsWrite(FsWriteParams {
+            path: "./.wim-0123456789abcdef".to_owned(),
+            content: "planted\n".to_owned(),
+        }),
+        Method::FsWatch(FsWatchParams {
+            path: ".wim-0123456789abcdef".to_owned(),
+            recursive: false,
+        }),
+        Method::FsList(FsListParams {
+            path: ".wim-0123456789abcdef".to_owned(),
+        }),
+    ] {
+        let error = client.err(method).await;
+        assert_eq!(error.code, ErrorCode::PermissionDenied, "{error:?}");
+    }
+    assert_eq!(
+        fixture.read(".wim-0123456789abcdef"),
+        "staged\n",
+        "a refused write leaves what was there"
+    );
+}
+
+#[tokio::test]
+async fn a_watch_reports_nothing_about_the_file_a_write_stages() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let _: FsWatchResult = client
+        .ok(Method::FsWatch(FsWatchParams {
+            path: ".".to_owned(),
+            recursive: true,
+        }))
+        .await;
+    // The write stages its content beside the destination and renames it over: both steps happen
+    // in the directory being watched.
+    let _: Ack = client
+        .ok(Method::FsWrite(FsWriteParams {
+            path: "notes.txt".to_owned(),
+            content: "written\n".to_owned(),
+        }))
+        .await;
+
+    let staged = client
+        .change_matching(NO_CHANGE_WINDOW, |change| {
+            Path::new(&change.path)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".wim-"))
+        })
+        .await;
+    assert!(staged.is_none(), "a change was reported: {staged:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_watch_on_a_link_reports_the_link_itself_being_removed() {
+    // The link points at a file in the root, so that what the two ways of resolving it would watch
+    // both exist: the link's own name, and the file it points at.
+    let fixture = Fixture::start(&[("target.txt", "hello\n")]).await;
+    let link = fixture.root.join("link.txt");
+    std::os::unix::fs::symlink(fixture.root.join("target.txt"), &link)
+        .expect("the link should be created");
+    let mut client = Client::authenticated(&fixture).await;
+
+    let watch: FsWatchResult = client
+        .ok(Method::FsWatch(FsWatchParams {
+            path: "link.txt".to_owned(),
+            recursive: false,
+        }))
+        .await;
+
+    let target = fixture.root.join("target.txt");
+    let change = client
+        .change_to_matching(
+            "removal of link.txt",
+            |change| change.path.ends_with("link.txt") && change.kind == FsChangeKind::Removed,
+            async |_: &mut Client| {
+                // Put back before it is removed again, so that every round is the same removal.
+                if std::fs::symlink_metadata(&link).is_err() {
+                    std::os::unix::fs::symlink(&target, &link).expect("the link should be created");
+                }
+                std::fs::remove_file(&link).expect("the link should be removed");
+            },
+        )
+        .await;
+
+    assert_eq!(change.watch_id, watch.watch_id);
+    assert_eq!(
+        fixture.read("target.txt"),
+        "hello\n",
+        "the file the link pointed at is untouched"
+    );
+}
+
+#[tokio::test]
+async fn a_connection_holds_only_so_many_watches() {
+    let fixture = Fixture::start(&[("locked/notes.txt", "hello\n")]).await;
+    // A directory that cannot be written in is one a watch is answered for without waiting to see
+    // a probe, which is both a case of its own and what keeps a test that takes every watch a
+    // connection may hold from waiting out one readiness window per watch.
+    let locked = fixture.root.join("locked");
+    let mut permissions = std::fs::metadata(&locked)
+        .expect("the directory should be there")
+        .permissions();
+    permissions.set_readonly(true);
+    std::fs::set_permissions(&locked, permissions).expect("the permissions should be set");
+    let mut client = Client::authenticated(&fixture).await;
+
+    let mut watch_ids = Vec::new();
+    loop {
+        let response = client
+            .call(Method::FsWatch(FsWatchParams {
+                path: "locked".to_owned(),
+                recursive: false,
+            }))
+            .await;
+        match response.result() {
+            Some(result) => {
+                let watch: FsWatchResult =
+                    serde_json::from_value(result.clone()).expect("the result should be a watch");
+                watch_ids.push(watch.watch_id);
+                assert!(
+                    watch_ids.len() <= 1024,
+                    "a connection took more watches than a bound would allow"
+                );
+            }
+            None => {
+                let error = response.error().expect("a refusal carries an error");
+                assert_eq!(error.code, ErrorCode::InvalidRequest, "{error:?}");
+                assert!(
+                    error.message.contains("fs.unwatch"),
+                    "the refusal says how to make room: {}",
+                    error.message
+                );
+                break;
+            }
+        }
+    }
+
+    // Dropping one is what makes room for the next, which is what the refusal told the client.
+    let _: Ack = client
+        .ok(Method::FsUnwatch(FsUnwatchParams {
+            watch_id: watch_ids[0],
+        }))
+        .await;
+    let _: FsWatchResult = client
+        .ok(Method::FsWatch(FsWatchParams {
+            path: "locked".to_owned(),
+            recursive: false,
+        }))
+        .await;
 }
 
 #[tokio::test]

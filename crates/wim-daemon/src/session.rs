@@ -12,7 +12,8 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{self, Sender};
 use tokio::time::{Instant, timeout_at};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
@@ -22,6 +23,7 @@ use wim_protocol::{
     PROTOCOL_VERSION, Request, Response, ResponseError, is_supported_version,
 };
 
+use crate::root::{RESERVED_PREFIX, is_reserved};
 use crate::watch::Watches;
 use crate::{Shared, io_error};
 
@@ -51,6 +53,14 @@ const STAGING_BYTES: usize = 8;
 /// is a write that should fail rather than spin.
 const STAGING_ATTEMPTS: usize = 4;
 
+/// How many messages one connection's outbox holds before it is full.
+///
+/// A push is a few hundred bytes, so this is a few hundred kilobytes per connection: small enough
+/// to be a bound worth having, and deep enough to hold the burst a recursive watch sees when a
+/// build runs under it while a client that is reading catches up
+/// (`documents/adr/0002-daemon-watch-and-staging-robustness.md`).
+const OUTBOX_CAPACITY: usize = 1024;
+
 /// Serves one client until it goes away, or until it fails to present the token.
 pub(crate) async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<(), WebSocketError> {
     // The handshake and the `auth` that has to follow it share one deadline, so that what a peer
@@ -62,10 +72,11 @@ pub(crate) async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<(), 
         .map_err(|_| timed_out("the handshake did not finish in time"))??;
     let (mut sink, mut incoming) = websocket.split();
     // Writing is a task of its own so that a watch can push a change while the reading half is
-    // waiting on the client's next request. The outbox is unbounded because what fills it is the
-    // watcher's callback, which the file system backend runs on a thread of its own that must not
-    // be left waiting on a client that is slow to read.
-    let (outgoing, mut outbox) = mpsc::unbounded_channel();
+    // waiting on the client's next request. The outbox is bounded, and the two things that fill it
+    // meet that bound differently: a response waits, which is the request loop taking the pace of
+    // the client reading it, and a watch's push cannot wait — the backend's callback thread is not
+    // the client's to hold — so it ends the connection instead.
+    let (outgoing, mut outbox) = mpsc::channel(OUTBOX_CAPACITY);
     let sending = tokio::spawn(async move {
         while let Some(message) = outbox.recv().await {
             if sink.send(message).await.is_err() {
@@ -79,6 +90,7 @@ pub(crate) async fn serve(stream: TcpStream, shared: Arc<Shared>) -> Result<(), 
         shared,
         authenticated: false,
         outgoing,
+        overflowed: Arc::new(Notify::new()),
         watches: Watches::default(),
     };
     let outcome = session.receive(&mut incoming, deadline).await;
@@ -95,7 +107,10 @@ struct Session {
     /// Whether the connection opened with an `auth` that matched.
     authenticated: bool,
     /// Where responses and `fs.changed` pushes are handed to the writing task.
-    outgoing: UnboundedSender<Message>,
+    outgoing: Sender<Message>,
+    /// Raised when a watch had a change to push and no room to push it in, which is this
+    /// connection's last word: what it would report next has already been lost.
+    overflowed: Arc<Notify>,
     /// The watches this connection asked for, which go away with it.
     watches: Watches,
 }
@@ -107,18 +122,19 @@ impl Session {
     /// read taken before the token is in rather than only the first one, because the frames this
     /// daemon passes over — a binary frame, a ping the library answers — leave the connection
     /// waiting for another message without having said anything.
+    ///
+    /// A watch that could not push what it saw ends the loop wherever it is waiting, because from
+    /// there on the client would be reading a directory it is no longer being told about.
     async fn receive(
         &mut self,
         incoming: &mut Incoming,
         deadline: Instant,
     ) -> Result<(), WebSocketError> {
         loop {
-            let message = if self.authenticated {
-                incoming.next().await
-            } else {
-                timeout_at(deadline, incoming.next())
-                    .await
-                    .map_err(|_| timed_out("the connection did not present the token in time"))?
+            let message = tokio::select! {
+                biased;
+                () = self.overflowed.notified() => break,
+                message = next_message(incoming, self.authenticated, deadline) => message?,
             };
             let Some(message) = message else { break };
             let text = match message? {
@@ -134,7 +150,7 @@ impl Session {
                 Err(error) => Response::err(id, error),
             };
             let response = serde_json::to_string(&response).expect("a response should serialize");
-            if self.outgoing.send(Message::text(response)).is_err() {
+            if self.outgoing.send(Message::text(response)).await.is_err() {
                 // The writing task is gone, which is the connection being over.
                 break;
             }
@@ -218,18 +234,26 @@ impl Session {
     /// A path that is not there yet cannot be watched: the file system is asked what it is here,
     /// so that a missing path is reported as missing rather than as a watch that says nothing.
     async fn watch(&mut self, params: FsWatchParams) -> Result<Value, ResponseError> {
-        let path = self.shared.root.resolve(&params.path).await?;
-        let directory = fs::metadata(&path)
+        let path = self.shared.root.resolve_lexically(&params.path)?;
+        // `symlink_metadata`, so that a link is watched as the entry it is in the directory holding
+        // it: what a watch on that name reports is the name being replaced or removed, and not what
+        // happens to the file it points at
+        // (`documents/adr/0002-daemon-watch-and-staging-robustness.md`).
+        let directory = fs::symlink_metadata(&path)
             .await
             .map_err(|error| io_error(&params.path, error))?
             .is_dir();
-        let watch_id = self.watches.start(
-            &params.path,
-            &path,
-            params.recursive,
-            directory,
-            &self.outgoing,
-        )?;
+        let watch_id = self
+            .watches
+            .start(
+                &params.path,
+                &path,
+                params.recursive,
+                directory,
+                &self.outgoing,
+                &self.overflowed,
+            )
+            .await?;
         serialized(&FsWatchResult { watch_id })
     }
 
@@ -241,6 +265,9 @@ impl Session {
 }
 
 /// Lists the direct children of a directory, symlinks reported rather than followed.
+///
+/// The daemon's own working files are not among them: a listing taken while another connection is
+/// writing would otherwise name a staged file that is gone by the time the client asks about it.
 async fn list(shared: &Shared, params: FsListParams) -> Result<Value, ResponseError> {
     let path = shared.root.resolve(&params.path).await?;
     let mut reader = fs::read_dir(&path)
@@ -252,12 +279,16 @@ async fn list(shared: &Shared, params: FsListParams) -> Result<Value, ResponseEr
         .await
         .map_err(|error| io_error(&params.path, error))?
     {
+        let name = entry.file_name();
+        if is_reserved(&name) {
+            continue;
+        }
         let kind = entry
             .file_type()
             .await
             .map_err(|error| io_error(&params.path, error))?;
         entries.push(DirEntry {
-            name: entry.file_name().to_string_lossy().into_owned(),
+            name: name.to_string_lossy().into_owned(),
             kind: if kind.is_symlink() {
                 EntryKind::Symlink
             } else if kind.is_dir() {
@@ -379,7 +410,22 @@ fn staging_name() -> String {
     let mut bytes = [0u8; STAGING_BYTES];
     getrandom::fill(&mut bytes).expect("the operating system should have a random generator");
     let staged: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!(".wim-{staged}")
+    format!("{RESERVED_PREFIX}{staged}")
+}
+
+/// The next message of a connection, under the deadline one that has not authenticated is held to.
+async fn next_message(
+    incoming: &mut Incoming,
+    authenticated: bool,
+    deadline: Instant,
+) -> Result<Option<Result<Message, WebSocketError>>, WebSocketError> {
+    if authenticated {
+        Ok(incoming.next().await)
+    } else {
+        timeout_at(deadline, incoming.next())
+            .await
+            .map_err(|_| timed_out("the connection did not present the token in time"))
+    }
 }
 
 /// A deadline that ran out, as the error the connection it was on ends with.
