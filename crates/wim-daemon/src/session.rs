@@ -20,9 +20,9 @@ use tokio::time::{Instant, timeout_at};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{Error as WebSocketError, Message};
 use wim_protocol::{
-    Ack, AuthResult, DirEntry, EntryKind, ErrorCode, FsListParams, FsListResult, FsReadParams,
-    FsReadResult, FsUnwatchParams, FsWatchParams, FsWatchResult, FsWriteParams, Method,
-    PROTOCOL_VERSION, Request, Response, ResponseError, is_supported_version,
+    Ack, AuthResult, DirEntry, EntryKind, Envelope, ErrorCode, FsListParams, FsListResult,
+    FsReadParams, FsReadResult, FsUnwatchParams, FsWatchParams, FsWatchResult, FsWriteParams,
+    Method, PROTOCOL_VERSION, Request, Response, ResponseError, is_supported_version,
 };
 
 use crate::root::{RESERVED_PREFIX, confined_error, is_reserved};
@@ -146,11 +146,7 @@ impl Session {
                 // and a binary frame is nothing this daemon has anything to say about.
                 _ => continue,
             };
-            let (id, outcome) = self.answer(text.as_str()).await;
-            let response = match outcome {
-                Ok(result) => Response::ok(id, &result).expect("a value should serialize"),
-                Err(error) => Response::err(id, error),
-            };
+            let response = self.answer(text.as_str()).await;
             let response = serde_json::to_string(&response).expect("a response should serialize");
             if self.outgoing.send(Message::text(response)).await.is_err() {
                 // The writing task is gone, which is the connection being over.
@@ -166,41 +162,51 @@ impl Session {
         Ok(())
     }
 
-    /// Carries out what one message asks for.
+    /// Carries out what one message asks for, as the response that goes back for it.
     ///
-    /// The id comes back alongside the outcome because a response carries it even when the message
-    /// it answers did not parse as a request.
-    async fn answer(&mut self, text: &str) -> (u64, Result<Value, ResponseError>) {
-        let raw: Value = match serde_json::from_str(text) {
-            Ok(raw) => raw,
+    /// The message is read twice: first as the [`Envelope`] every version of this protocol has in
+    /// common, and then — only once `v` turns out to be a version this daemon speaks — as the
+    /// [`Request`] that version's methods are made of. The other order would not work: a message
+    /// of a later version names a method or a param this build has never heard of, so reading it
+    /// as a request fails before `v` has been looked at, and the client would be told its message
+    /// was malformed rather than that this daemon speaks another version
+    /// (`documents/adr/0004-protocol-envelope-and-listing-contract.md`).
+    ///
+    /// A message the envelope itself cannot be read out of is answered without an id. There is
+    /// none to answer under, and answering under one made up would be answering some request the
+    /// client is still waiting on.
+    async fn answer(&mut self, text: &str) -> Response {
+        let envelope: Envelope = match serde_json::from_str(text) {
+            Ok(envelope) => envelope,
             Err(error) => {
-                let message = format!("the message is not JSON: {error}");
-                return (
-                    0,
-                    Err(ResponseError::new(ErrorCode::InvalidRequest, message)),
-                );
+                return Response::err_unmatched(ResponseError::new(
+                    ErrorCode::InvalidRequest,
+                    format!("the message is not one of this protocol: {error}"),
+                ));
             }
         };
-        // The id is read before the rest, so that a message the daemon cannot make sense of is
-        // still answered under the id the client is waiting on.
-        let id = raw.get("id").and_then(Value::as_u64).unwrap_or(0);
-        if let Some(version) = raw.get("v").and_then(Value::as_u64)
+        if let Some(version) = envelope.version
             && !u32::try_from(version).is_ok_and(is_supported_version)
         {
-            let message =
-                format!("this daemon speaks protocol version {PROTOCOL_VERSION}, not {version}");
-            return (
-                id,
-                Err(ResponseError::new(ErrorCode::UnsupportedVersion, message)),
+            return refused(
+                envelope.id,
+                ResponseError::new(
+                    ErrorCode::UnsupportedVersion,
+                    format!(
+                        "this daemon speaks protocol version {PROTOCOL_VERSION}, not {version}"
+                    ),
+                ),
             );
         }
-        let request: Request = match serde_json::from_value(raw) {
+        let request: Request = match serde_json::from_str(text) {
             Ok(request) => request,
             Err(error) => {
-                let message = format!("the message is not a request this daemon serves: {error}");
-                return (
-                    id,
-                    Err(ResponseError::new(ErrorCode::InvalidRequest, message)),
+                return refused(
+                    envelope.id,
+                    ResponseError::new(
+                        ErrorCode::InvalidRequest,
+                        format!("the message is not a request this daemon serves: {error}"),
+                    ),
                 );
             }
         };
@@ -228,7 +234,10 @@ impl Session {
             Method::FsWatch(params) => self.watch(params).await,
             Method::FsUnwatch(params) => self.unwatch(params),
         };
-        (id, outcome)
+        match outcome {
+            Ok(result) => Response::ok(request.id, &result).expect("a value should serialize"),
+            Err(error) => Response::err(request.id, error),
+        }
     }
 
     /// Starts reporting changes under a path, and names the watch its pushes carry.
@@ -270,8 +279,20 @@ impl Session {
 ///
 /// The daemon's own working files are not among them: a listing taken while another connection is
 /// writing would otherwise name a staged file that is gone by the time the client asks about it.
+///
+/// Every child is named twice over: by its own name, and by the whole path to it that a client
+/// sends back as it is. The path is built here rather than by the client because it is this side's
+/// file system that decides how one is spelled
+/// (`documents/adr/0004-protocol-envelope-and-listing-contract.md`).
 async fn list(shared: &Shared, params: FsListParams) -> Result<Value, ResponseError> {
     let path = shared.root.relative(&params.path)?;
+    // The root is asked for as `.`, and joining a name onto that would spell every child of it
+    // with a `.` in the middle; the root's own path is what the children of the root hang off.
+    let base = if path == Path::new(".") {
+        shared.root.path().to_path_buf()
+    } else {
+        shared.root.path().join(&path)
+    };
     let entries = shared
         .root
         .blocking(move |dir| {
@@ -285,12 +306,17 @@ async fn list(shared: &Shared, params: FsListParams) -> Result<Value, ResponseEr
                 let kind = entry.file_type()?;
                 entries.push(DirEntry {
                     name: name.to_string_lossy().into_owned(),
+                    path: base.join(&name).to_string_lossy().into_owned(),
                     kind: if kind.is_symlink() {
                         EntryKind::Symlink
                     } else if kind.is_dir() {
                         EntryKind::Directory
-                    } else {
+                    } else if kind.is_file() {
                         EntryKind::File
+                    } else {
+                        // A socket, a FIFO, a device: a child of the directory all the same, and
+                        // one the client is told about as what it is rather than as a file.
+                        EntryKind::Other
                     },
                 });
             }
@@ -531,6 +557,18 @@ async fn next_message(
 /// A deadline that ran out, as the error the connection it was on ends with.
 fn timed_out(what: &str) -> WebSocketError {
     WebSocketError::Io(io::Error::new(io::ErrorKind::TimedOut, what.to_owned()))
+}
+
+/// A refusal, under the id the message carried where it carried one.
+///
+/// A message with no id to answer under is still answered, so that a client which sent something
+/// this daemon could not read hears about it; what comes back names no request, and is the
+/// client's to drop (`documents/adr/0004-protocol-envelope-and-listing-contract.md`).
+fn refused(id: Option<u64>, error: ResponseError) -> Response {
+    match id {
+        Some(id) => Response::err(id, error),
+        None => Response::err_unmatched(error),
+    }
 }
 
 /// The result of a method, as the value a response carries.
@@ -835,19 +873,58 @@ mod tests {
 
         let listed: FsListResult =
             serde_json::from_value(result).expect("the result should be a listing");
-        let mut kinds: Vec<(String, EntryKind)> = listed
-            .entries
-            .into_iter()
-            .map(|entry| (entry.name, entry.kind))
-            .collect();
-        kinds.sort_by(|one, other| one.0.cmp(&other.0));
+        let mut entries = listed.entries;
+        entries.sort_by(|one, other| one.name.cmp(&other.name));
         assert_eq!(
-            kinds,
+            entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.kind))
+                .collect::<Vec<_>>(),
             vec![
-                ("inside.md".to_owned(), EntryKind::Symlink),
-                ("notes.md".to_owned(), EntryKind::File),
-                ("outside.md".to_owned(), EntryKind::Symlink),
+                ("inside.md", EntryKind::Symlink),
+                ("notes.md", EntryKind::File),
+                ("outside.md", EntryKind::Symlink),
             ]
+        );
+        for entry in &entries {
+            assert_eq!(
+                entry.path,
+                shared.root.path().join(&entry.name).to_string_lossy(),
+                "the listing hands back a path the client sends straight back"
+            );
+        }
+    }
+
+    /// A child that is none of file, directory or link is reported as what it is rather than as a
+    /// file: a listing names every direct child, and calling a socket a file would have the client
+    /// offering to open something there is nothing to read at.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_listing_reports_a_socket_as_neither_a_file_nor_a_directory() {
+        let (_directory, shared) = shared().await;
+        // Held for as long as the listing takes, so that what is read is a socket rather than
+        // whatever a closed one leaves behind.
+        let _socket = std::os::unix::net::UnixListener::bind(shared.root.path().join("wim.sock"))
+            .expect("the socket should be bound");
+
+        let result = list(
+            &shared,
+            FsListParams {
+                path: ".".to_owned(),
+            },
+        )
+        .await
+        .expect("the root should be listed");
+
+        let listed: FsListResult =
+            serde_json::from_value(result).expect("the result should be a listing");
+        assert_eq!(
+            listed
+                .entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.kind))
+                .collect::<Vec<_>>(),
+            vec![("wim.sock", EntryKind::Other)]
         );
     }
 

@@ -105,7 +105,11 @@ async fn call<T: DeserializeOwned>(client: &mut Client, id: u64, method: Method)
     };
     let response: Response =
         serde_json::from_str(text.as_str()).expect("the answer should be a response");
-    assert_eq!(response.id, id, "a response answers the request it names");
+    assert_eq!(
+        response.id,
+        Some(id),
+        "a response answers the request it names"
+    );
     let result = response
         .result()
         .unwrap_or_else(|| panic!("the call should have gone through: {:?}", response.error()));

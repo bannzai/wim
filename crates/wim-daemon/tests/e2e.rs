@@ -189,7 +189,11 @@ impl Client {
         let request =
             serde_json::to_string(&Request::new(id, method)).expect("a request should serialize");
         let response = self.send(&request).await;
-        assert_eq!(response.id, id, "a response answers the request it names");
+        assert_eq!(
+            response.id,
+            Some(id),
+            "a response answers the request it names"
+        );
         response
     }
 
@@ -470,14 +474,47 @@ async fn a_listing_names_what_is_directly_under_the_directory() {
         [
             DirEntry {
                 name: "notes.txt".to_owned(),
+                path: fixture
+                    .root
+                    .join("notes.txt")
+                    .to_string_lossy()
+                    .into_owned(),
                 kind: EntryKind::File,
             },
             DirEntry {
                 name: "src".to_owned(),
+                path: fixture.root.join("src").to_string_lossy().into_owned(),
                 kind: EntryKind::Directory,
             },
         ]
     );
+}
+
+/// What the path of a listed child is for: the client sends it back as it stands, without knowing
+/// how the daemon's file system spells a path or where the directory it listed sits
+/// (`documents/adr/0004-protocol-envelope-and-listing-contract.md`).
+#[tokio::test]
+async fn a_listed_child_is_named_by_a_path_the_next_request_takes_as_it_is() {
+    let fixture = Fixture::start(&[("src/main.rs", "fn main() {}\n")]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let listing: FsListResult = client
+        .ok(Method::FsList(FsListParams {
+            path: "src".to_owned(),
+        }))
+        .await;
+    let entry = listing
+        .entries
+        .first()
+        .expect("the subdirectory holds the file it was started with");
+    assert_eq!(entry.name, "main.rs");
+
+    let read: FsReadResult = client
+        .ok(Method::FsRead(FsReadParams {
+            path: entry.path.clone(),
+        }))
+        .await;
+    assert_eq!(read.content, "fn main() {}\n");
 }
 
 #[tokio::test]
@@ -860,6 +897,11 @@ async fn a_name_the_daemon_keeps_for_itself_is_neither_listed_nor_served() {
         listing.entries,
         [DirEntry {
             name: "notes.txt".to_owned(),
+            path: fixture
+                .root
+                .join("notes.txt")
+                .to_string_lossy()
+                .into_owned(),
             kind: EntryKind::File,
         }],
         "what this daemon stages under is not part of the directory it serves"
@@ -1029,11 +1071,61 @@ async fn a_message_of_another_protocol_version_is_refused_under_the_id_it_carrie
     let response = client
         .send(r#"{"v":2,"id":41,"method":"fs.read","params":{"path":"notes.txt"}}"#)
         .await;
-    assert_eq!(response.id, 41);
+    assert_eq!(response.id, Some(41));
     assert_eq!(
         response.error().map(|error| &error.code),
         Some(&ErrorCode::UnsupportedVersion)
     );
+}
+
+/// A later version is free to name methods and params this one has never heard of, and such a
+/// message is still answered as a version this daemon does not speak: the version is read out of
+/// the envelope before anything tries to make a request of the rest
+/// (`documents/adr/0004-protocol-envelope-and-listing-contract.md`).
+#[tokio::test]
+async fn a_message_of_a_later_version_naming_an_unknown_method_is_refused_for_its_version() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let response = client
+        .send(r#"{"v":2,"id":42,"method":"fs.teleport","params":{"whither":"there"}}"#)
+        .await;
+
+    assert_eq!(
+        response.error().map(|error| &error.code),
+        Some(&ErrorCode::UnsupportedVersion),
+        "the version is what is answered, not the method it has never heard of"
+    );
+    assert_eq!(response.id, Some(42));
+}
+
+/// A message with an `id` that is not a number has none to be answered under, and is answered
+/// without one rather than under an id some request in flight may be waiting on.
+#[tokio::test]
+async fn a_message_whose_id_is_not_a_number_is_refused_without_one() {
+    let fixture = Fixture::start(&[("notes.txt", "hello\n")]).await;
+    let mut client = Client::authenticated(&fixture).await;
+
+    let response = client
+        .send(r#"{"v":1,"id":"seven","method":"fs.read","params":{"path":"notes.txt"}}"#)
+        .await;
+
+    assert_eq!(
+        response.error().map(|error| &error.code),
+        Some(&ErrorCode::InvalidRequest)
+    );
+    assert_eq!(
+        response.id, None,
+        "an answer to no request names no request"
+    );
+
+    // The connection goes on working, so what came back was a refusal and not the end of it.
+    let read: FsReadResult = client
+        .ok(Method::FsRead(FsReadParams {
+            path: "notes.txt".to_owned(),
+        }))
+        .await;
+    assert_eq!(read.content, "hello\n");
 }
 
 #[tokio::test]
@@ -1042,9 +1134,13 @@ async fn a_message_that_is_not_a_request_is_refused_and_the_connection_lives_on(
     let mut client = Client::authenticated(&fixture).await;
 
     for (text, id) in [
-        ("{ not json", 0),
-        (r#"{"v":1,"id":7,"method":"fs.explode","params":{}}"#, 7),
-        (r#"{"v":1,"id":8,"method":"fs.read","params":{}}"#, 8),
+        // Nothing an envelope can be read out of either, so nothing to answer under.
+        ("{ not json", None),
+        (
+            r#"{"v":1,"id":7,"method":"fs.explode","params":{}}"#,
+            Some(7),
+        ),
+        (r#"{"v":1,"id":8,"method":"fs.read","params":{}}"#, Some(8)),
     ] {
         let response = client.send(text).await;
         assert_eq!(response.id, id, "{text}");
