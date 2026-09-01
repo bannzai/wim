@@ -1,0 +1,11 @@
+name = ":q inside the keys of a :norm stops them where it is written, first line and all"
+input = '''
+a
+b
+c'''
+keys = ":%norm :q<lt>CR>A!<lt>Esc><CR>"
+expected = '''
+a
+b
+c'''
+expected_cursor = [0, 0]

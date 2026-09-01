@@ -1,0 +1,12 @@
+name = ":q inside the keys of a :g/pattern/norm ends the walk rather than the one line"
+input = '''
+a
+b
+c
+'''
+keys = ":g/^/norm A!<lt>Esc>:q<lt>CR><CR>"
+expected = '''
+a!
+b
+c
+'''

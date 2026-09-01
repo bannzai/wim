@@ -16,6 +16,7 @@
 //! writes the opening bracket as `<lt>`, as in `:g/^import/norm A;<lt>Esc>`.
 
 use std::fmt;
+use std::ops::ControlFlow;
 
 use crate::edit;
 use crate::editor::Editor;
@@ -199,6 +200,11 @@ fn run(editor: &mut Editor, command: &ExCommand) -> Result<Vec<Effect>, ExError>
                 &(first..=last).collect::<Vec<usize>>(),
                 |editor, line| {
                     run_keys_on_line(editor, line, &keys, &mut effects);
+                    if quit_requested(&effects) {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
                 },
             );
             Ok(effects)
@@ -236,13 +242,21 @@ fn global(
 
     let mut effects = Vec::new();
     match command {
+        // `:d` and `:s` reach the buffer without a key being read, so the walk is told what
+        // they did rather than hearing it from `Editor::handle_key`.
         ExKind::Delete => walk_marked_lines(editor, &marks, |editor, line| {
-            delete_lines(editor, line, line);
+            editor.edit_directly(|editor| delete_lines(editor, line, line));
+            ControlFlow::Continue(())
         }),
         ExKind::Normal { keys } => {
             let keys = parse_keys(keys).map_err(ExError::BadKeys)?;
             walk_marked_lines(editor, &marks, |editor, line| {
                 run_keys_on_line(editor, line, &keys, &mut effects);
+                if quit_requested(&effects) {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
             });
         }
         ExKind::Substitute {
@@ -254,15 +268,19 @@ fn global(
             // Compiling here reports a broken pattern once, rather than on every marked line.
             search::compile(pattern, *ignore_case).map_err(ExError::BadPattern)?;
             walk_marked_lines(editor, &marks, |editor, line| {
-                // A marked line the substitution does not match is not a failure of the `:g`.
-                let _ = substitute(
-                    editor,
-                    (line, line),
-                    pattern,
-                    replacement,
-                    *all,
-                    *ignore_case,
-                );
+                editor.edit_directly(|editor| {
+                    // A marked line the substitution does not match is not a failure of the
+                    // `:g`.
+                    let _ = substitute(
+                        editor,
+                        (line, line),
+                        pattern,
+                        replacement,
+                        *all,
+                        *ignore_case,
+                    );
+                });
+                ControlFlow::Continue(())
             });
         }
         other => return Err(ExError::BadGlobalCommand(format!("{other:?}"))),
@@ -272,24 +290,29 @@ fn global(
 
 /// Runs `act` on each of the marked lines, the way `:g` does: the lines are picked before
 /// anything runs, and each one is found again through however many lines the edits before it
-/// added or took away. A line the edits removed is skipped.
+/// added or took away. A line the edits removed is skipped, and `act` ends the walk early by
+/// breaking.
 fn walk_marked_lines(
     editor: &mut Editor,
     marks: &[usize],
-    mut act: impl FnMut(&mut Editor, usize),
+    mut act: impl FnMut(&mut Editor, usize) -> ControlFlow<()>,
 ) {
-    let mut moved: isize = 0;
-    for mark in marks {
-        let Ok(line) = usize::try_from(*mark as isize + moved) else {
-            continue;
-        };
-        if line >= editor.buffer().line_count() {
-            continue;
+    editor.begin_line_walk(marks.iter().copied());
+    while let Some(line) = editor.next_walked_line() {
+        if act(editor, line).is_break() {
+            break;
         }
-        let before = editor.buffer().line_count();
-        act(editor, line);
-        moved += editor.buffer().line_count() as isize - before as isize;
     }
+    editor.end_line_walk();
+}
+
+/// Whether the effects hold a request to put the editor down, which is what ends a walk before
+/// its lines run out: `:q` inside a `:norm` ends the run over the text rather than the run over
+/// the one line that typed it.
+fn quit_requested(effects: &[Effect]) -> bool {
+    effects
+        .iter()
+        .any(|effect| matches!(effect, Effect::QuitRequested { .. }))
 }
 
 /// Types `keys` at the start of `line`, as `:norm` does. A key that fails ends the line's run,

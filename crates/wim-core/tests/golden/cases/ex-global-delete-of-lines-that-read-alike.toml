@@ -1,0 +1,8 @@
+name = ":g/pattern/d takes both of two neighbouring lines that read alike"
+input = '''
+a
+a
+b'''
+keys = ":g/^a/d<CR>"
+expected = "b"
+expected_cursor = [0, 0]
