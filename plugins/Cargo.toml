@@ -1,0 +1,22 @@
+# Plugins build for wasm32-wasip2 only, so they are a workspace of their own: keeping them out
+# of the root workspace is what stops `cargo test --workspace` and `cargo clippy --workspace`
+# from pulling a wasm-only crate into the native build.
+[workspace]
+resolver = "3"
+members = ["hello-wim"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/bannzai/wim"
+
+[workspace.dependencies]
+# Pinned rather than left to a caret range: what this generates is the ABI surface itself, so a
+# plugin has to be reproducible from the committed Cargo.lock.
+wit-bindgen = "=0.61.1"
+
+[profile.release]
+# Plugins ship as .wasm, where the size of the artifact matters more than the last bit of speed.
+opt-level = "s"
+lto = true
+strip = true

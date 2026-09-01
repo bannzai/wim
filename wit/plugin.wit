@@ -1,0 +1,113 @@
+// wim のプラグイン ABI。Wasm Component Model の world を 1 つ定義し、プラグインはこれを
+// export した .wasm component としてビルドされる。
+//
+// バージョニング方針:
+//   - この package のバージョンが ABI のバージョンそのもので、wit/ 配下で 1 つに揃える。
+//   - 1.0.0 に達するまでは minor を破壊的変更に、patch を後方互換な追加に使う。関数・型の
+//     意味を変える、record からフィールドを削る、variant / enum からケースを削る変更は
+//     破壊的として minor を上げる。interface・関数の追加は patch で足りる。
+//   - ホストはロードする component の package バージョンを見て、自分がビルドされた時と
+//     major.minor が一致しないものは拒否する。
+package wim:plugin@0.1.0;
+
+/// バッファの読み書き。ホストの状態を指すハンドルは渡さず、呼び出しごとにテキストを値で
+/// 渡し、編集結果を値で返す純関数型にする。プラグインは自分に渡された内容だけで完結する。
+interface buffer {
+    /// 0 始まりの行と、その行頭からの文字数 (grapheme cluster ではなく Unicode scalar 数)。
+    record position {
+        line: u32,
+        column: u32,
+    }
+
+    /// 呼び出し時にホストが渡すバッファのスナップショット。
+    record snapshot {
+        /// ファイルパス。まだファイルに紐付いていないバッファでは空文字列。
+        name: string,
+        /// バッファ全体のテキスト。
+        text: string,
+        /// 呼び出し時点のカーソル位置。
+        cursor: position,
+    }
+
+    /// 行範囲 [start, end) を text で置き換える指示。end == start は挿入になる。
+    record line-edit {
+        start: u32,
+        end: u32,
+        text: string,
+    }
+
+    /// プラグインがホストに返す結果。編集か、出力か、何もしないかのいずれか。
+    variant edit {
+        /// バッファ全体を置き換える。
+        replace-all(string),
+        /// 一部の行だけを置き換える。
+        replace-lines(line-edit),
+        /// バッファは変えず、メッセージだけを表示させる。
+        message(string),
+        /// 何もしない。
+        noop,
+    }
+}
+
+/// コマンド登録。プラグインが名前付きコマンドを公開し、ホストがそれを Ex コマンドとして呼ぶ。
+interface commands {
+    use buffer.{snapshot, edit};
+
+    record command {
+        /// Ex コマンド名。ホストは `:<name>` で引く。
+        name: string,
+        /// 1 行の説明。
+        description: string,
+    }
+
+    /// ホストがロード時に呼び、公開されたコマンドを登録する。
+    list-commands: func() -> list<command>;
+
+    /// 登録済みコマンドの実行。args は Ex コマンドの引数を空白で分割したもの。
+    /// 失敗はホストがそのまま表示するエラーメッセージで返す。
+    run: func(name: string, args: list<string>, buf: snapshot) -> result<edit, string>;
+}
+
+/// イベントフック。ホストが発火したイベントを受け取る。イベントの種類は Phase 4-4 で
+/// 増えるため、名前は wit の enum に固定せず文字列のままにしてある。
+interface events {
+    use buffer.{snapshot, edit};
+
+    record event {
+        /// "buffer-write" のようなホストが定義するイベント名。
+        name: string,
+        /// イベント固有のペイロード。JSON 文字列で、ペイロードの無いイベントでは空文字列。
+        payload: string,
+    }
+
+    /// プラグインが購読するイベント名。ここに無いイベントをホストは配送しない。
+    subscriptions: func() -> list<string>;
+
+    /// 購読したイベントの配送。
+    on-event: func(ev: event, buf: snapshot) -> result<edit, string>;
+}
+
+/// UI パネル。プラグインが HTML 文字列を返し、ホストがパネルとして表示する。
+/// Markdown Preview の土台になる。
+interface ui {
+    use buffer.{snapshot};
+
+    record panel {
+        /// パネルの見出し。
+        title: string,
+        /// パネルの中身。ホストは信頼しないものとして扱い、描画する前にサニタイズする。
+        html: string,
+    }
+
+    /// ホストがパネルを開く時と、バッファが変わって描き直す時に呼ぶ。
+    /// none を返したプラグインのパネルはホストが閉じる。
+    render: func(buf: snapshot) -> option<panel>;
+}
+
+/// プラグインが実装する world。3 つの interface はどれもホスト側で任意扱いにはできないため、
+/// 使わない interface でも空の実装を export する。
+world plugin {
+    export commands;
+    export events;
+    export ui;
+}

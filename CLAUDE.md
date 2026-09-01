@@ -8,7 +8,10 @@ Vim の文法を持つ新エディタ (Vim 互換ではない)。設計の正は
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+make check-plugins
 ```
+
+`plugins/` は root とは別の Cargo workspace のため `--workspace` に入らない。ABI とサンプルプラグインを触ったら `make check-plugins` (ホスト target の fmt / clippy / unit test) も実行する。component 本体のビルド (`make build-plugins`) は wasm32-wasip2 が要るため CI が行う。
 
 wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`) は CI が行う。ローカルの Homebrew Rust には wasm32 の std が無いため実行しない。`web/` のデモとその Playwright E2E (`make e2e`) も wasm ビルドを前提とするため、同じ理由でローカルでは動かず CI で検証する。
 

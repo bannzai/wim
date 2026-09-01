@@ -57,6 +57,24 @@ jobs:
       - run: cargo build -p wim-protocol --target wasm32-unknown-unknown
       - run: cargo build -p wim-wasm --target wasm32-unknown-unknown
 
+  plugins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins
+      # The generated bindings compile on the host target, so the ABI and the sample are checked
+      # here the same way they are locally.
+      - run: make check-plugins
+      - run: make build-plugins
+
   browser-e2e:
     runs-on: ubuntu-latest
     steps:
