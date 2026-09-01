@@ -39,7 +39,7 @@
 「特定のキーマクロをファイルに繰り返し適用する」ツール (sed のキーマクロ版) は、モーダル編集コアの CLI ラッパーでしかない。
 
 ```sh
-vimacro 'ciwfoo<Esc>j' --repeat-to-eof file.txt
+vimacro 'ciwfoo<Esc>' --repeat-to-eof file.txt
 vimacro --global '^import' 'A;<Esc>' --in-place src/*.ts   # :g/pat/norm 相当
 ```
 
