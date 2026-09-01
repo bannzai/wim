@@ -109,6 +109,32 @@ make web  # http://127.0.0.1:4173/ で :upcase が使えます
 
 「同一の .wasm がネイティブとブラウザの両方で動く」ことは E2E が機械的に確かめます。`web/e2e/plugin.spec.js` が同じ component をネイティブホスト (`wim plugin run`) とブラウザの両方に同じ入力で通し、返ってきたバッファとエラーメッセージが一致することを検証します。
 
+## 設定 (wim.jsonc) と autocmd
+
+設定ファイルは vimrc ではなく VS Code 方式の JSONC で、`autocmds` にイベントとハンドラの組を宣言します。ハンドラは VimScript ではなく、ビルトインの Ex コマンド・キー列・Wasm プラグイン関数の 3 つから選びます。形式の全体とイベント一覧は [documents/CONFIG.md](documents/CONFIG.md) にあります。
+
+```jsonc
+{
+  "autocmds": [
+    // 保存の直前に行末の空白を落とす (パターンは Vim の方言ではなく Rust の regex)
+    { "event": "buffer-write", "handler": { "kind": "ex", "command": "%s/\\s+$//" } },
+    // 保存の直前にプラグインへ知らせる
+    { "event": "buffer-write", "handler": { "kind": "plugin", "plugin": "hello-wim" } },
+  ],
+}
+```
+
+イベントを報告するのはコアで、購読と配線はホストの担当です (`crates/wim-core` は設定ファイルもプラグインも知りません)。ネイティブでは `wim edit` が設定を読み、キー列をファイルに適用しながら autocmd を実行します。`:w` はその場でファイルを書き、`buffer-write` は書き込みの直前に発火するため、上の例では空白を落としたバッファが書き込まれます。
+
+```sh
+wim edit notes.txt --keys ':w<CR>' --config web/wim.jsonc \
+  --plugin hello-wim=plugins/target/wasm32-unknown-unknown/release/hello_wim.component.wasm
+# => buffer-write ex: %s/\s+$//
+#    buffer-write plugin hello-wim: hello-wim saw `buffer-write` on notes.txt
+```
+
+ブラウザデモは同じ形式の `web/wim.jsonc` を fetch して同じイベントで同じハンドラを実行します。「同じ設定が両方のホストで発火する」ことは E2E が確かめます (`crates/wim/tests/autocmd.rs` と `web/e2e/autocmd.spec.js`)。
+
 ## 開発コマンド
 
 ```sh

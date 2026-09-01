@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crate::buffer::Buffer;
 use crate::command::{Command, InsertAnchor, Operator, OperatorTarget, SelectionShape};
 use crate::edit;
-use crate::effect::Effect;
+use crate::effect::{Effect, Event};
 use crate::ex;
 use crate::grammar::Grammar;
 use crate::key::{KeyCode, KeyEvent, KeyParseError, format_keys, parse_keys};
@@ -89,6 +89,14 @@ pub struct Editor {
     /// of a `:norm` — rather than reading keys a user typed. A recording keeps only typed
     /// keys, as Vim's does.
     fed_keys: usize,
+    /// How many changes have altered the text, which is what tells a key that changed it from
+    /// one that did not. Counting the changes that closed is cheaper than comparing the buffer
+    /// on either side of every key, and it counts what [`Event::TextChanged`] reports: one
+    /// completed change, whether it came from a command, an Ex line or an undo.
+    changes: usize,
+    /// How deeply [`Editor::handle_key`] is running inside itself, which is what keeps the keys
+    /// a macro or a `.` types from each reporting the events of the key that typed them.
+    reading_keys: usize,
 }
 
 impl Editor {
@@ -154,7 +162,12 @@ impl Editor {
     /// Reads one key in the current mode.
     ///
     /// A recording keeps the key, unless the editor is typing it at itself; the marks are
-    /// moved over whatever the key changed.
+    /// moved over whatever the key changed; and what the key changed about the editor itself
+    /// is reported as [`Event`]s after the effects the key produced.
+    ///
+    /// The events belong to the key that was read rather than to the keys it went on to type
+    /// at the editor: a `@q` that changes the text is one [`Event::TextChanged`], however many
+    /// keys the macro holds.
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         if self.fed_keys == 0
             && let Some(recording) = &mut self.recording
@@ -164,11 +177,25 @@ impl Editor {
         // Comparing the buffers costs a walk of the text, which is worth doing only when
         // there is a mark to move.
         let before = (!self.marks.is_empty()).then(|| self.buffer.clone());
-        let effects = self.run_key(key);
+        let watched = (self.reading_keys == 0).then_some((self.mode, self.changes));
+        self.reading_keys += 1;
+        let mut effects = self.run_key(key);
+        self.reading_keys -= 1;
         if let Some(before) = before
             && before.line_count() != self.buffer.line_count()
         {
             self.move_marks(&before);
+        }
+        if let Some((mode, changes)) = watched {
+            if self.changes != changes {
+                effects.push(Effect::Event(Event::TextChanged));
+            }
+            if self.mode != mode {
+                effects.push(Effect::Event(Event::ModeChanged {
+                    from: mode,
+                    to: self.mode,
+                }));
+            }
         }
         effects
     }
@@ -569,6 +596,9 @@ impl Editor {
             moved = true;
         }
         if moved {
+            // Walking the history is a change of the text like any other, and a count that
+            // walked several of them is the one step the key took.
+            self.changes += 1;
             self.motion_context.desired_col = self.cursor.col;
             return Vec::new();
         }
@@ -659,7 +689,7 @@ impl Editor {
         let effects = ex::execute(self, &command);
         if outermost {
             self.running_ex = false;
-            self.history.commit(&self.buffer, self.cursor);
+            self.commit_change();
         }
         effects
     }
@@ -904,7 +934,7 @@ impl Editor {
             self.open_edit_keys.clear();
             return;
         }
-        if self.history.commit(&self.buffer, self.cursor) {
+        if self.commit_change() {
             self.last_edit = Some(LastEdit {
                 command,
                 insert_keys: Vec::new(),
@@ -920,7 +950,7 @@ impl Editor {
         if self.running_ex {
             return;
         }
-        if self.history.commit(&self.buffer, self.cursor)
+        if self.commit_change()
             && let Some(command) = command
         {
             self.last_edit = Some(LastEdit {
@@ -928,6 +958,16 @@ impl Editor {
                 insert_keys,
             });
         }
+    }
+
+    /// Closes the open undo unit and counts it when it altered the text, which is what
+    /// [`Event::TextChanged`] is raised from. Returns whether it did.
+    fn commit_change(&mut self) -> bool {
+        let changed = self.history.commit(&self.buffer, self.cursor);
+        if changed {
+            self.changes += 1;
+        }
+        changed
     }
 
     fn enter_insert(&mut self, anchor: InsertAnchor) {
@@ -1613,6 +1653,7 @@ mod tests {
         let effects = editor
             .handle_keys(&format!("yl{huge}p"))
             .expect("key string should parse");
+        let effects = requests(&effects);
         assert!(
             matches!(effects.as_slice(), [Effect::Error(_)]),
             "{effects:?}"
@@ -1663,6 +1704,7 @@ mod tests {
     fn undoing_what_never_changed_reports_an_error() {
         let mut editor = Editor::new("ab");
         let effects = editor.handle_keys("u").expect("key string should parse");
+        let effects = requests(&effects);
         assert!(
             matches!(effects.as_slice(), [Effect::Error(_)]),
             "{effects:?}"
@@ -1671,6 +1713,7 @@ mod tests {
         let effects = editor
             .handle_keys("yy<C-r>")
             .expect("key string should parse");
+        let effects = requests(&effects);
         assert!(
             matches!(effects.as_slice(), [Effect::Error(_)]),
             "a yank is not a change: {effects:?}"
@@ -1707,16 +1750,42 @@ mod tests {
     fn repeat_without_a_change_to_repeat_reports_an_error() {
         let mut editor = Editor::new("ab");
         let effects = editor.handle_keys(".").expect("key string should parse");
+        let effects = requests(&effects);
         assert!(
             matches!(effects.as_slice(), [Effect::Error(_)]),
             "{effects:?}"
         );
     }
 
-    /// The effects `keys` asked the host for.
+    /// The effects `keys` asked the host for, without the events that report what the keys did
+    /// to the editor. Those are checked on their own, by the tests that use [`events`].
     fn effects(text: &str, keys: &str) -> Vec<Effect> {
         let mut editor = Editor::new(text);
-        editor.handle_keys(keys).expect("key string should parse")
+        let effects = editor.handle_keys(keys).expect("key string should parse");
+        requests(&effects)
+    }
+
+    /// The effects that ask something of the host, which is everything but the events.
+    fn requests(effects: &[Effect]) -> Vec<Effect> {
+        effects
+            .iter()
+            .filter(|effect| !matches!(effect, Effect::Event(_)))
+            .cloned()
+            .collect()
+    }
+
+    /// The events `keys` reported, in the order they were reported in.
+    fn events(text: &str, keys: &str) -> Vec<Event> {
+        let mut editor = Editor::new(text);
+        editor
+            .handle_keys(keys)
+            .expect("key string should parse")
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::Event(event) => Some(event),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The one error `keys` reported, which fails the test when they reported anything else.
@@ -1874,6 +1943,98 @@ mod tests {
             "an empty line does nothing"
         );
         assert_eq!(error("ab", ":nope<CR>"), "not an editor command: nope");
+    }
+
+    #[test]
+    fn a_write_is_announced_in_front_of_the_save_it_belongs_to() {
+        let mut editor = Editor::new("ab");
+        let effects = editor.handle_keys(":w<CR>").expect("keys should parse");
+        let announced = effects
+            .iter()
+            .position(|effect| effect == &Effect::Event(Event::BufferWrite));
+        let saved = effects
+            .iter()
+            .position(|effect| matches!(effect, Effect::SaveRequested { .. }));
+        assert_eq!(
+            (announced, saved),
+            (Some(1), Some(2)),
+            "a handler is to run before the host reads the text it writes: {effects:?}"
+        );
+        assert!(
+            events("ab", ":q<CR>")
+                .iter()
+                .all(|event| event.name() != "buffer-write"),
+            "nothing is written by a quit"
+        );
+    }
+
+    #[test]
+    fn a_change_that_altered_the_text_reports_it_once() {
+        assert_eq!(events("abc", "x"), vec![Event::TextChanged]);
+        assert_eq!(
+            events("abc", "l"),
+            Vec::new(),
+            "a cursor that moved changed no text"
+        );
+        assert_eq!(
+            events("abc", ":s/z/y/<CR>")
+                .into_iter()
+                .filter(|event| event == &Event::TextChanged)
+                .count(),
+            0,
+            "a substitute that matched nothing altered nothing"
+        );
+    }
+
+    #[test]
+    fn an_insert_session_is_reported_when_it_closes() {
+        assert_eq!(
+            events("ab", "ixy"),
+            vec![Event::ModeChanged {
+                from: Mode::Normal,
+                to: Mode::Insert
+            }],
+            "the text of an open session is not a change yet"
+        );
+        assert_eq!(
+            events("ab", "ixy<Esc>"),
+            vec![
+                Event::ModeChanged {
+                    from: Mode::Normal,
+                    to: Mode::Insert
+                },
+                Event::TextChanged,
+                Event::ModeChanged {
+                    from: Mode::Insert,
+                    to: Mode::Normal
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn the_keys_a_macro_types_are_reported_as_the_one_key_that_typed_them() {
+        // `qq` records `xx`, and `@q` plays it: two characters go, and the key that took them
+        // is the `@`.
+        assert_eq!(
+            events("abcdef", "qqxxq@q"),
+            vec![Event::TextChanged; 3],
+            "one for each key recorded, and one for the playback"
+        );
+    }
+
+    #[test]
+    fn walking_the_history_is_a_change_of_its_own() {
+        assert_eq!(
+            events("ab", "xu<C-r>"),
+            vec![Event::TextChanged; 3],
+            "the change, the undo and the redo"
+        );
+        assert_eq!(
+            events("ab", "u"),
+            Vec::new(),
+            "an undo with nothing to undo altered nothing"
+        );
     }
 
     #[test]

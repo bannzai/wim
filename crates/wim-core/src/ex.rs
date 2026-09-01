@@ -19,7 +19,7 @@ use std::fmt;
 
 use crate::edit;
 use crate::editor::Editor;
-use crate::effect::Effect;
+use crate::effect::{Effect, Event};
 use crate::key::{KeyEvent, KeyParseError, parse_keys};
 use crate::motion::first_non_blank;
 use crate::position::Position;
@@ -150,9 +150,16 @@ pub(crate) fn execute(editor: &mut Editor, command: &ExCommand) -> Vec<Effect> {
 
 fn run(editor: &mut Editor, command: &ExCommand) -> Result<Vec<Effect>, ExError> {
     match &command.kind {
-        ExKind::Write { path } => Ok(vec![Effect::SaveRequested { path: path.clone() }]),
+        // The event goes in front of the request it belongs to: a host carries the effects out
+        // in order, so a `buffer-write` handler has run — and whatever it edited is in the
+        // buffer — by the time the host reads the text the save writes.
+        ExKind::Write { path } => Ok(vec![
+            Effect::Event(Event::BufferWrite),
+            Effect::SaveRequested { path: path.clone() },
+        ]),
         ExKind::Quit { force } => Ok(vec![Effect::QuitRequested { force: *force }]),
         ExKind::WriteQuit { path, force } => Ok(vec![
+            Effect::Event(Event::BufferWrite),
             Effect::SaveRequested { path: path.clone() },
             Effect::QuitRequested { force: *force },
         ]),

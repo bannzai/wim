@@ -3,8 +3,11 @@
 //! `wim serve` runs the daemon of `wim-daemon` over a directory and prints what a client needs to
 //! reach it: the address it took and the token it will ask for. `wim plugin` runs a plugin
 //! against a buffer read from standard input, which is how a `.wasm` is checked without an
-//! editor around it.
+//! editor around it. `wim edit` types keys at a file with the autocmds of a `wim.jsonc` wired up,
+//! which is the native host of `documents/CONFIG.md`.
 
+mod config;
+mod edit;
 mod plugin;
 
 use std::io::{self, Write};
@@ -43,6 +46,8 @@ enum Command {
     Serve(Serve),
     /// Run a wasm plugin over a buffer.
     Plugin(plugin::Plugin),
+    /// Type keys at a file, running the autocmds a config declares.
+    Edit(edit::Edit),
 }
 
 #[derive(Debug, Args)]
@@ -98,6 +103,9 @@ async fn main() -> ExitCode {
         // Running a plugin is one call into wasmtime and then the answer, with nothing else to
         // wait on, so it is done on this thread rather than handed to the runtime.
         Command::Plugin(plugin) => plugin::main(plugin),
+        // A run reads a file, types keys at it and writes it back, all of it in step: there is
+        // nothing to await either.
+        Command::Edit(edit) => edit::main(edit),
     }
 }
 

@@ -25,7 +25,7 @@ pub mod undo;
 pub use buffer::Buffer;
 pub use command::{Command, InsertAnchor, Operator, OperatorTarget};
 pub use editor::Editor;
-pub use effect::Effect;
+pub use effect::{Effect, Event};
 pub use ex::{ExCommand, ExError};
 pub use grammar::Grammar;
 pub use key::{KeyCode, KeyEvent, KeyParseError, format_keys, parse_keys};

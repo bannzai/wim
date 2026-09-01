@@ -95,7 +95,11 @@ test("a name no plugin published is still the core's to refuse", async ({ page }
   // subcommand reaches by naming a command directly — is unreachable through an Ex line, and what
   // answers instead is the core.
   const state = await browser(page, ":nope", []);
-  expect(state.effects).toEqual([{ kind: "error", message: "not an editor command: nope" }]);
+  // The events the core reports about itself are not part of what it refused; they are checked
+  // on their own (`e2e/autocmd.spec.js`).
+  expect(state.effects.filter((effect) => effect.kind !== "event")).toEqual([
+    { kind: "error", message: "not an editor command: nope" },
+  ]);
   expect(state.text).toBe(BUFFER);
 });
 

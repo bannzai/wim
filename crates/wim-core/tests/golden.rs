@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use wim_core::{Editor, Position};
+use wim_core::{Editor, Effect, Position};
 
 /// One golden case, as written in a TOML file.
 #[derive(Debug, Deserialize)]
@@ -27,6 +27,10 @@ struct Case {
     /// The cursor the keys should leave behind, `[line, col]`. Not checked when absent.
     #[serde(default)]
     expected_cursor: Option<[usize; 2]>,
+    /// The events the keys should report, by name and in order, which is what a host binds
+    /// autocmds to. Not checked when absent.
+    #[serde(default)]
+    expected_events: Option<Vec<String>>,
 }
 
 #[test]
@@ -90,13 +94,16 @@ fn check(file: &Path) -> Option<String> {
     let expected = case.expected.replace("\r\n", "\n");
 
     let mut editor = Editor::new(&input);
-    if let Err(error) = editor.handle_keys(&case.keys) {
-        return Some(report(
-            &name,
-            &case,
-            &format!("the keys do not parse: {error}"),
-        ));
-    }
+    let effects = match editor.handle_keys(&case.keys) {
+        Ok(effects) => effects,
+        Err(error) => {
+            return Some(report(
+                &name,
+                &case,
+                &format!("the keys do not parse: {error}"),
+            ));
+        }
+    };
 
     let mut problems = String::new();
     let actual = editor.text();
@@ -115,10 +122,31 @@ fn check(file: &Path) -> Option<String> {
             );
         }
     }
+    if let Some(wanted) = &case.expected_events {
+        let actual = event_names(&effects);
+        if &actual != wanted {
+            let _ = writeln!(
+                problems,
+                "  events:\n    - expected {wanted:?}\n    + actual   {actual:?}"
+            );
+        }
+    }
     if problems.is_empty() {
         return None;
     }
     Some(report(&name, &case, &problems))
+}
+
+/// The names of the events among `effects`, in the order they were reported in. The requests an
+/// effect makes of a host — writing a file, quitting — are not part of a case (`README.md`).
+fn event_names(effects: &[Effect]) -> Vec<String> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Event(event) => Some(event.name().to_owned()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn report(name: &str, case: &Case, problems: &str) -> String {

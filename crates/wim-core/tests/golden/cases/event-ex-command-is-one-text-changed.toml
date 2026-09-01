@@ -1,0 +1,17 @@
+name = "an Ex command that edits several lines is one change, and one that matches nothing is none"
+input = '''
+foo
+foo
+bar'''
+keys = ":%s/foo/baz/<CR>:%s/zzz/x/<CR>"
+expected = '''
+baz
+baz
+bar'''
+expected_events = [
+  "mode-changed",
+  "text-changed",
+  "mode-changed",
+  "mode-changed",
+  "mode-changed",
+]

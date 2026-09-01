@@ -1,0 +1,6 @@
+name = "an edit reports text-changed once, and a motion reports nothing"
+input = "abcdef"
+keys = "xwl"
+expected = "bcdef"
+expected_cursor = [0, 4]
+expected_events = ["text-changed"]

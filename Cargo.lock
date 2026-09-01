@@ -795,6 +795,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jsonc-parser"
+version = "0.33.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0560e3f9a9a03ea6b6e90b41138c5db9e21526c99eb192c1a26c68176593285"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1866,11 +1875,14 @@ dependencies = [
  "assert_cmd",
  "clap",
  "futures-util",
+ "jsonc-parser",
+ "predicates",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "wim-core",
  "wim-daemon",
  "wim-plugin-host",
  "wim-protocol",

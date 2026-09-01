@@ -1,0 +1,5 @@
+name = ":w announces the write before the save, and the command line is a mode of its own"
+input = "ab"
+keys = ":w<CR>"
+expected = "ab"
+expected_events = ["mode-changed", "buffer-write", "mode-changed"]

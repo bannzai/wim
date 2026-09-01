@@ -107,8 +107,10 @@ fn read_input() -> Result<String, String> {
 /// The buffer after `edit`, and the message the plugin asked to have shown, if any.
 ///
 /// An editor would do this to its own buffer; here it is done to the text that was read, so that
-/// what comes out is the buffer as the plugin left it whichever kind of edit it chose.
-fn apply(text: &str, edit: Edit) -> Result<(String, Option<String>), String> {
+/// what comes out is the buffer as the plugin left it whichever kind of edit it chose. `wim edit`
+/// applies what a plugin's event handler answers with through here as well, so that one edit means
+/// the same thing whichever call it came back from.
+pub(crate) fn apply(text: &str, edit: Edit) -> Result<(String, Option<String>), String> {
     match edit {
         Edit::ReplaceAll(replacement) => Ok((replacement, None)),
         Edit::ReplaceLines(lines) => Ok((replace_lines(text, &lines)?, None)),

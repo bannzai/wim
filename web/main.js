@@ -10,6 +10,7 @@ import init, { WimEditor, display_cells } from "./pkg/wim_wasm.js";
 import { connect } from "./daemon.js";
 import { createHighlighter, languageOf } from "./highlight.js";
 import { loadPlugins } from "./plugins.js";
+import { loadConfig } from "./config.js";
 
 const INITIAL_TEXT = `wim is a Vim-grammar editor, not a Vim clone.
 The core is one pure Rust crate, compiled to Wasm for this page.
@@ -127,6 +128,13 @@ const fileStatus = document.querySelector("#file-status");
 const pluginCommandList = document.querySelector("#plugin-commands");
 const pluginStatus = document.querySelector("#plugin-status");
 
+/** The line listing the autocmds the config declared, and the one a handler reports on. */
+const autocmdList = document.querySelector("#autocmd-list");
+const autocmdStatus = document.querySelector("#autocmd-status");
+
+/** The config the demo binds its autocmds from, served next to the page. */
+const CONFIG = "./wim.jsonc";
+
 /**
  * The modes whose keys are text rather than commands, which are the ones text may be composed
  * into. In every other mode a key is a command the moment it is pressed.
@@ -148,6 +156,28 @@ let bufferName = "";
  * until the modules have been fetched, and on a demo served without any.
  */
 let pluginCommands = new Map();
+
+/**
+ * The plugins the build transpiled, keyed by the name an autocmd names them by. A command is
+ * looked up in `pluginCommands`; this is what an event is delivered over.
+ */
+let plugins = new Map();
+
+/**
+ * The autocmds the config declared, in the order they are written. Empty until `wim.jsonc` has
+ * been fetched, and on a demo served without one.
+ */
+let autocmds = [];
+
+/**
+ * Whether a handler is running, which is what keeps a handler that edits the buffer from being
+ * run again by the event its own edit reports. Vim's autocmds nest only when they are asked to;
+ * here they never do, and the native host does the same (`crates/wim/src/edit.rs`).
+ */
+let inHandler = false;
+
+/** What the handlers of the last batch of keys did, which the E2E run reads. */
+let lastAutocmds = [];
 
 /** What the last batch of keys did, which the demo shows in its status line. */
 let lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
@@ -336,14 +366,126 @@ function handleKeys(keys) {
   draw();
   // Keys are what changes the mode, and the mode is what decides whether an IME may compose.
   syncImeFocus();
-  for (const effect of lastOutcome.effects) {
+  carryOut(lastOutcome.effects);
+  return lastOutcome;
+}
+
+/**
+ * Carries out what the core handed back, in the order it handed it back.
+ *
+ * The order is what puts a `buffer-write` handler in front of the write it belongs to: the core
+ * reports the event ahead of the request, so whatever the handler edits is in the buffer by the
+ * time the text to write is read out of it (`crates/wim-core/src/effect.rs`).
+ */
+function carryOut(effects) {
+  lastAutocmds = [];
+  // A handler that rewrites the buffer replaces the editor, which starts a new outcome; what
+  // this batch of keys did is the one to report, so it is put back afterwards.
+  const outcome = lastOutcome;
+  for (const effect of effects) {
+    if (effect.kind === "event") {
+      dispatch(effect.name, effect.payload);
+    }
     if (effect.kind === "save") {
       // Writing reaches a daemon or the file system, and neither answers within the key that
       // asked for it: what it did turns up in the report line once it is done.
       void save(effect.path ?? null);
     }
   }
-  return lastOutcome;
+  lastOutcome = outcome;
+}
+
+/** Runs every autocmd bound to the event `name`, and redraws what they changed. */
+function dispatch(name, payload) {
+  if (inHandler) {
+    return;
+  }
+  const bound = autocmds.filter((autocmd) => autocmd.event === name);
+  if (bound.length === 0) {
+    return;
+  }
+  inHandler = true;
+  try {
+    for (const { handler } of bound) {
+      lastAutocmds.push(`${name} ${runHandler(name, payload, handler)}`);
+    }
+  } finally {
+    inHandler = false;
+  }
+  reportAutocmd(lastAutocmds.join(" / "));
+  // A handler may have rewritten the buffer, and what it did is not in the damage the keys
+  // reported.
+  draw({ full: true });
+  syncImeFocus();
+}
+
+/** Runs one handler and says what it did, for the line under the list of them. */
+function runHandler(name, payload, handler) {
+  try {
+    switch (handler.kind) {
+      case "ex":
+        // The keys are the characters of the line, so a `<` in a command is typed rather than
+        // read as the start of a key name. `wim edit` types the same characters natively.
+        typeAtEditor(`:${handler.command.replaceAll("<", "<lt>")}<CR>`);
+        return `ex: ${handler.command}`;
+      case "keys":
+        typeAtEditor(handler.keys);
+        return `keys: ${handler.keys}`;
+      default:
+        return `plugin ${handler.plugin}: ${callPlugin(name, payload, handler.plugin)}`;
+    }
+  } catch (error) {
+    return `${handler.kind} が失敗しました: ${error.message}`;
+  }
+}
+
+/**
+ * Types the keys of a handler at the editor and carries out what they asked for.
+ *
+ * The two `<Esc>`s are what closes a command a handler left half-typed, the way `:norm` closes
+ * the keys of a line; without them the keys typed next would be read as the rest of it.
+ */
+function typeAtEditor(keys) {
+  const outcome = editor.handle_keys(`${keys}<Esc><Esc>`);
+  const effects = JSON.parse(outcome.effects);
+  const failed = effects.find((effect) => effect.kind === "error");
+  if (failed !== undefined) {
+    throw new Error(failed.message);
+  }
+  // The events these raise are the handler's own doing, and `inHandler` is what stops them from
+  // running it again; a `:w` inside a handler still writes.
+  for (const effect of effects) {
+    if (effect.kind === "save") {
+      void save(effect.path ?? null);
+    }
+  }
+}
+
+/**
+ * Gives the event to a plugin and applies the edit it answers with.
+ *
+ * The buffer crosses by value and the answer comes back by value, which is the whole of what the
+ * ABI lets a plugin touch: the edit is applied here, by the host.
+ */
+function callPlugin(name, payload, plugin) {
+  const loaded = plugins.get(plugin);
+  if (loaded === undefined) {
+    throw new Error(`${plugin} というプラグインは読み込まれていません`);
+  }
+  if (!loaded.subscriptions.includes(name)) {
+    // The ABI has the host deliver nothing a plugin did not subscribe to.
+    throw new Error(`${plugin} は ${name} を購読していません`);
+  }
+  return applyEdit(
+    loaded.onEvent(
+      { name, payload },
+      {
+        name: bufferName,
+        text: editor.text(),
+        cursor: { line: editor.cursor_line(), column: editor.cursor_col() },
+      },
+    ),
+  );
 }
 
 /** Shows `message` under the demo, which is where opening and saving report. */
@@ -354,6 +496,11 @@ function report(message) {
 /** Shows what running a plugin command did, on the line under the list of them. */
 function reportPlugin(message) {
   pluginStatus.textContent = message;
+}
+
+/** Shows what the autocmds that just ran did, on the line under the list of them. */
+function reportAutocmd(message) {
+  autocmdStatus.textContent = message;
 }
 
 /**
@@ -441,8 +588,9 @@ function applyEdit(edit) {
  * what `Plugin::from_file` and `list_commands` do natively.
  */
 async function startPlugins() {
-  const { commands, failures } = await loadPlugins();
+  const { commands, plugins: loaded, failures } = await loadPlugins();
   pluginCommands = commands;
+  plugins = loaded;
   const published = [...commands.values()].map(
     (command) => `:${command.name} — ${command.description}`,
   );
@@ -452,6 +600,51 @@ async function startPlugins() {
       : `プラグインのコマンド ${published.join(" / ")}`;
   if (failures.length > 0) {
     reportPlugin(`読み込めないプラグインがあります: ${failures.join(" / ")}`);
+  }
+}
+
+/**
+ * Reads `wim.jsonc` and registers the autocmds it declares, which is the browser's half of what
+ * `wim edit` does with --config (`documents/CONFIG.md`).
+ *
+ * A handler of kind `plugin` is checked against what that plugin subscribed to once the plugins
+ * are in, so that a binding which could never fire is reported where the config is read rather
+ * than by never running.
+ */
+async function startAutocmds() {
+  const config = await loadConfig(CONFIG);
+  if (config.error !== null) {
+    autocmdList.textContent = `${CONFIG} を読めません: ${config.error}`;
+    return;
+  }
+  autocmds = config.autocmds;
+  const declared = autocmds.map((autocmd) => `${autocmd.event} → ${describe(autocmd.handler)}`);
+  autocmdList.textContent =
+    declared.length === 0
+      ? "autocmd は設定されていません"
+      : `autocmd ${declared.join(" / ")}`;
+  await pluginsStarted;
+  const unreachable = autocmds
+    .filter((autocmd) => autocmd.handler.kind === "plugin")
+    .filter(
+      (autocmd) =>
+        !plugins.get(autocmd.handler.plugin)?.subscriptions.includes(autocmd.event),
+    )
+    .map((autocmd) => `${autocmd.handler.plugin} → ${autocmd.event}`);
+  if (unreachable.length > 0) {
+    reportAutocmd(`配送されない autocmd があります: ${unreachable.join(" / ")}`);
+  }
+}
+
+/** One handler, as the list of declared autocmds shows it. */
+function describe(handler) {
+  switch (handler.kind) {
+    case "ex":
+      return `:${handler.command}`;
+    case "keys":
+      return handler.keys;
+    default:
+      return handler.plugin;
   }
 }
 
@@ -589,31 +782,42 @@ function save(path) {
   // was on screen when it was typed even when it waits for an earlier save to finish first.
   const file = openFile;
   const text = withNewline(editor.text(), file.newline);
-  writing = writing.then(() => writeOut(file, path, text));
+  writing = writing.then(async () => {
+    // Whether a write happened is the host's to know, so `buffer-write-post` is raised here
+    // rather than by the core, and only once the bytes are on the file.
+    if (await writeOut(file, path, text)) {
+      dispatch("buffer-write-post", "");
+    }
+  });
 }
 
-/** Puts `text` on `file`, to `path` when the `:w` that asked for it named one. */
+/**
+ * Puts `text` on `file`, to `path` when the `:w` that asked for it named one, and says whether
+ * the bytes landed there.
+ */
 async function writeOut(file, path, text) {
   try {
     if (file.kind === "daemon") {
       const destination = path ?? file.path;
       await file.client.write(destination, text);
       report(`${destination} を保存しました`);
-      return;
+      return true;
     }
     if (path !== null) {
       // The browser hands over the one file the picker was pointed at and no way to name
       // another, so writing somewhere else would take a picker of its own — which opens on a
       // click rather than on a command.
       report("ローカルファイルでは :w にパスを指定できません");
-      return;
+      return false;
     }
     const writable = await file.handle.createWritable();
     await writable.write(text);
     await writable.close();
     report(`${file.name} を保存しました`);
+    return true;
   } catch (error) {
     report(`保存できません: ${error.message}`);
+    return false;
   }
 }
 
@@ -1107,6 +1311,10 @@ draw({ full: true });
 // way a grammar is. The answer is what the E2E run waits on before it types a plugin's command.
 const pluginsStarted = startPlugins();
 
+// The autocmds are read out of a file the same way, and a demo served without one binds nothing.
+// The answer is what the E2E run waits on before it types a key that raises an event.
+const autocmdsStarted = startAutocmds();
+
 // Listening only once the editor exists is what keeps a key typed during the wasm fetch from
 // reaching a demo that has nothing to type into.
 window.addEventListener("keydown", (event) => {
@@ -1225,6 +1433,16 @@ window.wimDemo = {
       })),
       status: pluginStatus.textContent,
     })),
+  /**
+   * Settles once `wim.jsonc` has been read and its autocmds registered, with the ones it
+   * declared. Nothing rejects: a demo served without a config binds nothing.
+   */
+  autocmds: () =>
+    autocmdsStarted.then(() => ({
+      declared: autocmds,
+      list: autocmdList.textContent,
+      status: autocmdStatus.textContent,
+    })),
   /** The runs row `line` is coloured by, `null` for a buffer in no language the demo highlights. */
   highlightRuns: (line) => (highlighter === null ? null : highlighter.rowRuns(line)),
   state: () => ({
@@ -1245,6 +1463,11 @@ window.wimDemo = {
     plugin: {
       /** What running a plugin command last did, which is where its message or its error lands. */
       status: pluginStatus.textContent,
+    },
+    autocmd: {
+      /** What the handlers the last batch of keys ran did, one entry each. */
+      ran: lastAutocmds,
+      status: autocmdStatus.textContent,
     },
     ime: {
       /** What an IME is composing, which the row is drawn with and the buffer does not hold. */
