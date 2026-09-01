@@ -17,6 +17,12 @@
 //! passed by value, and everything it can change goes back as an [`Edit`] the host applies
 //! itself (`wit/README.md`).
 //!
+//! What the linker withholds is capability; what a plugin can still spend is time and memory,
+//! and every call runs on the caller's thread. So the store meters both: each call is given
+//! [`CALL_FUEL`] to burn and the guest's memory may not grow past [`MEMORY_LIMIT`]. A plugin
+//! that loops forever or keeps allocating trips one of the two and comes back as an
+//! [`Error::Wasm`] rather than taking the editor down with it.
+//!
 //! ```no_run
 //! # fn load() -> Result<(), wim_plugin_host::Error> {
 //! use wim_plugin_host::{Edit, Plugin, Position, Snapshot};
@@ -50,7 +56,7 @@ use std::io;
 use std::path::Path;
 
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 
 pub use bindings::exports::wim::plugin::commands::Command;
 pub use bindings::exports::wim::plugin::events::Event;
@@ -71,6 +77,30 @@ const PACKAGE: &str = "wim:plugin";
 /// `scripts/check-wasm-component.sh` makes on the build output.
 const COMPONENT_HEADER: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
 
+/// The fuel one guest call may burn before wasmtime stops it, given again for every call so that
+/// a plugin the editor keeps loaded is bounded per call rather than over its life.
+///
+/// A unit of fuel is about one wasm instruction, so what this bounds is work; what that costs in
+/// time was measured. The number sits between the two:
+///
+/// - what a call spends grows with the buffer, since every interface of the world is a transform
+///   over one [`Snapshot`]. Upcasing a byte or writing it into a panel is a handful of
+///   instructions, and the canonical ABI copies the buffer in and the answer back out; at twenty
+///   instructions a byte, generous for both, a 1 MiB buffer comes to 2e7 — and the files wim
+///   edits are far smaller than that.
+/// - burning the budget to the end, which is what a plugin that never returns does, took ~0.3 s
+///   on an Apple M4 Max. That is how long the editor pauses before it is told the plugin is gone.
+const CALL_FUEL: u64 = 100_000_000;
+
+/// The bytes the guest's linear memory may grow to.
+///
+/// A plugin is given the buffer by value and answers by value, so its memory has to hold the
+/// snapshot, the answer, and whatever its allocator keeps between the two — a few times the
+/// buffer, plus the module's own statics. 64 MiB is room to work over a buffer of several MiB,
+/// well past the source files wim edits, while a component that grows memory in a loop stops
+/// here rather than at the host's address space.
+const MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
 /// What can go wrong between reading a `.wasm` off disk and getting an answer out of it.
 #[derive(Debug)]
 pub enum Error {
@@ -81,7 +111,7 @@ pub enum Error {
     NotAComponent,
     /// The component is one, but exports nothing from the `wim:plugin` package.
     NotAPlugin,
-    /// The component was built against an ABI whose `major.minor` is not this host's.
+    /// The component was built against an ABI version that is not exactly this host's.
     AbiMismatch {
         /// The version this host was built against.
         expected: String,
@@ -89,7 +119,8 @@ pub enum Error {
         found: String,
     },
     /// wasmtime refused the component or the guest trapped. Imports the host does not provide —
-    /// WASI above all — end up here.
+    /// WASI above all — end up here, and so does a plugin stopped for spending more than
+    /// [`CALL_FUEL`] or growing past [`MEMORY_LIMIT`].
     Wasm(wasmtime::Error),
     /// The plugin ran and reported a failure of its own, in the wording it wants shown.
     Plugin(String),
@@ -101,8 +132,8 @@ impl fmt::Display for Error {
             Error::Io(error) => write!(f, "{error}"),
             Error::NotAComponent => write!(
                 f,
-                "not a wasm component: a plugin is built for wasm32-wasip2, which links one \
-                 directly"
+                "not a wasm component: a plugin is a core module turned into a component by \
+                 `make build-plugins`, and this file was not"
             ),
             Error::NotAPlugin => write!(f, "no `{PACKAGE}` interface is exported"),
             Error::AbiMismatch { expected, found } => write!(
@@ -143,7 +174,7 @@ impl From<wasmtime::Error> for Error {
 /// plugin holds no state between calls that the host can see: what it is given is a [`Snapshot`]
 /// and what it gives back is an [`Edit`].
 pub struct Plugin {
-    store: Store<()>,
+    store: Store<StoreLimits>,
     bindings: bindings::Plugin,
 }
 
@@ -165,14 +196,19 @@ impl Plugin {
         // import, `wim:plugin/buffer`, carries types and no functions, and wasmtime satisfies
         // such an instance without anything being defined for it, so a component that imports
         // more than that — any WASI interface — fails to instantiate here.
-        let linker = Linker::<()>::new(&engine);
-        let mut store = Store::new(&engine, ());
+        let linker = Linker::<StoreLimits>::new(&engine);
+        let mut store = Store::new(&engine, store_limits());
+        store.limiter(|limits| limits);
+        // Instantiating runs guest code too — the module's own initialisers — so the budget is
+        // in place before the component is built rather than before the first call.
+        store.set_fuel(CALL_FUEL)?;
         let bindings = bindings::Plugin::instantiate(&mut store, &component, &linker)?;
         Ok(Plugin { store, bindings })
     }
 
     /// The commands the plugin publishes, which the host registers as Ex commands.
     pub fn list_commands(&mut self) -> Result<Vec<Command>, Error> {
+        self.refuel()?;
         Ok(self
             .bindings
             .wim_plugin_commands()
@@ -181,6 +217,7 @@ impl Plugin {
 
     /// Runs one of those commands over `buffer`.
     pub fn run(&mut self, name: &str, args: &[String], buffer: &Snapshot) -> Result<Edit, Error> {
+        self.refuel()?;
         self.bindings
             .wim_plugin_commands()
             .call_run(&mut self.store, name, args, buffer)?
@@ -189,6 +226,7 @@ impl Plugin {
 
     /// The event names the plugin wants delivered. The host delivers nothing else.
     pub fn subscriptions(&mut self) -> Result<Vec<String>, Error> {
+        self.refuel()?;
         Ok(self
             .bindings
             .wim_plugin_events()
@@ -197,6 +235,7 @@ impl Plugin {
 
     /// Delivers one of those events.
     pub fn on_event(&mut self, event: &Event, buffer: &Snapshot) -> Result<Edit, Error> {
+        self.refuel()?;
         self.bindings
             .wim_plugin_events()
             .call_on_event(&mut self.store, event, buffer)?
@@ -206,51 +245,47 @@ impl Plugin {
     /// Renders the plugin's panel over `buffer`, or `None` when it has nothing to show, which is
     /// the host's cue to close the panel.
     pub fn render(&mut self, buffer: &Snapshot) -> Result<Option<Panel>, Error> {
+        self.refuel()?;
         Ok(self
             .bindings
             .wim_plugin_ui()
             .call_render(&mut self.store, buffer)?)
     }
-}
 
-/// How the engine is configured. Plugins are compiled on load rather than ahead of time, and
-/// nothing beyond the component model is turned on: what a plugin may do is decided by what the
-/// linker offers, and the linker offers nothing.
-fn engine_config() -> Config {
-    let mut config = Config::new();
-    config.wasm_component_model(true);
-    config
-}
-
-/// A `major.minor` ABI version. The patch digit is dropped on purpose: the wit package's patch
-/// marks changes that do not touch the ABI, so a component built against `0.1.0` and a host
-/// built against `0.1.4` still speak to each other (`wit/README.md`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Abi {
-    major: u64,
-    minor: u64,
-}
-
-impl Abi {
-    /// Reads `0.1.0` and the like. Anything a pre-release or build suffix adds is ignored, since
-    /// what is compared is only the two leading numbers.
-    fn parse(version: &str) -> Option<Self> {
-        let version = version
-            .split(['-', '+'])
-            .next()
-            .expect("splitting always yields a first piece");
-        let (major, rest) = version.split_once('.')?;
-        let minor = rest.split('.').next()?;
-        Some(Abi {
-            major: major.parse().ok()?,
-            minor: minor.parse().ok()?,
-        })
+    /// Gives the call about to be made its own [`CALL_FUEL`]. Fuel is not given back when a call
+    /// returns, so without this the calls of a session would share one budget and a plugin the
+    /// editor keeps loaded would eventually stop for having been used rather than for looping.
+    fn refuel(&mut self) -> Result<(), Error> {
+        Ok(self.store.set_fuel(CALL_FUEL)?)
     }
 }
 
+/// How the engine is configured. Plugins are compiled on load rather than ahead of time, and
+/// nothing beyond the component model and the fuel the store meters calls with is turned on:
+/// what a plugin may do is decided by what the linker offers, and the linker offers nothing.
+fn engine_config() -> Config {
+    let mut config = Config::new();
+    config.wasm_component_model(true);
+    config.consume_fuel(true);
+    config
+}
+
+/// What a plugin's store may allocate. Only the size of a linear memory is capped; the counts
+/// wasmtime limits by default (instances, tables, memories) are left where they are, since a
+/// component built from this world has one of each.
+fn store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(MEMORY_LIMIT)
+        // A refused `memory.grow` otherwise answers -1 and leaves the guest to fail however its
+        // allocator happens to, which reaches the host as whatever the plugin says went wrong.
+        // Trapping instead is what makes the limit an error about the limit.
+        .trap_on_grow_failure(true)
+        .build()
+}
+
 /// The ABI version of the wit this host was generated from, taken off the `package` line.
-fn host_abi() -> (&'static str, Abi) {
-    let version = PLUGIN_WIT
+fn host_abi() -> &'static str {
+    PLUGIN_WIT
         .lines()
         .find_map(|line| {
             line.strip_prefix("package ")?
@@ -258,19 +293,19 @@ fn host_abi() -> (&'static str, Abi) {
                 .strip_prefix(PACKAGE)?
                 .strip_prefix('@')
         })
-        .expect("wit/plugin.wit declares a versioned package");
-    let abi = Abi::parse(version).expect("the wit package version is a version");
-    (version, abi)
+        .expect("wit/plugin.wit declares a versioned package")
 }
 
-/// Refuses a component whose exports name an ABI this host does not speak.
+/// Refuses a component whose exports name an ABI version other than this host's.
 ///
 /// A component carries the version in the names of the interfaces it exports
-/// (`wim:plugin/commands@0.1.0`), and instantiating one built against a different ABI would
-/// otherwise fail somewhere inside wasmtime with a message about a missing export. Checking the
-/// names first is what turns that into an answer about versions.
+/// (`wim:plugin/commands@0.1.0`), and so do the names the bindings above look up. That is why
+/// the whole version has to match: a component built against `0.1.1` exports nothing the host
+/// generated from `0.1.0` can find, however little its patch changed. Reading the names first is
+/// what turns that into an answer about versions instead of a wasmtime message about a missing
+/// export (`wit/README.md`).
 fn check_abi(engine: &Engine, component: &Component) -> Result<(), Error> {
-    let (expected_text, expected) = host_abi();
+    let expected = host_abi();
     let mut found_any = false;
     for (name, _) in component.component_type().exports(engine) {
         let Some(rest) = name.strip_prefix(PACKAGE) else {
@@ -281,9 +316,9 @@ fn check_abi(engine: &Engine, component: &Component) -> Result<(), Error> {
         }
         found_any = true;
         let found = rest.split_once('@').map(|(_, version)| version);
-        if found.and_then(Abi::parse) != Some(expected) {
+        if found != Some(expected) {
             return Err(Error::AbiMismatch {
-                expected: expected_text.to_string(),
+                expected: expected.to_string(),
                 found: found.unwrap_or("(unversioned)").to_string(),
             });
         }
@@ -301,24 +336,15 @@ mod tests {
 
     #[test]
     fn the_host_abi_is_the_one_the_wit_declares() {
-        assert_eq!(host_abi().1, Abi { major: 0, minor: 1 });
-    }
-
-    #[test]
-    fn a_version_is_compared_by_its_leading_two_numbers() {
-        assert_eq!(Abi::parse("0.1.0"), Some(Abi { major: 0, minor: 1 }));
-        assert_eq!(Abi::parse("0.1.4"), Abi::parse("0.1.0"));
-        assert_eq!(Abi::parse("1.2.3-rc.1"), Some(Abi { major: 1, minor: 2 }));
-        assert_ne!(Abi::parse("0.2.0"), Abi::parse("0.1.0"));
-        assert_ne!(Abi::parse("1.1.0"), Abi::parse("0.1.0"));
-        assert_eq!(Abi::parse("0"), None);
-        assert_eq!(Abi::parse("nope"), None);
+        // The whole version, since the whole version is what the export names the bindings look
+        // up are built out of.
+        assert_eq!(host_abi(), "0.1.0");
     }
 
     #[test]
     fn a_core_module_is_not_a_plugin() {
-        // `\0asm` and the core module version, which is what a plugin built for a wasm32 target
-        // other than wasip2 comes out as.
+        // `\0asm` and the core module version, which is what a plugin that has not been turned
+        // into a component comes out as.
         let module = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
         assert!(matches!(
             Plugin::from_binary(&module),

@@ -5,7 +5,7 @@
 //! the ones in the plugin are generated from the same file for the guest, and nothing but the
 //! component travels between them.
 //!
-//! Building that component needs the `wasm32-wasip2` target, which not every machine has
+//! Building that component needs the `wasm32-unknown-unknown` std, which not every machine has
 //! (`wit/README.md`), so the component is not built here: its path is taken from
 //! `WIM_PLUGIN_WASM` and these tests step aside when it is not set. `make test-plugin-host`
 //! builds the component and sets it, and that is what CI runs.

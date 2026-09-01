@@ -122,7 +122,14 @@ fn apply(text: &str, edit: Edit) -> Result<(String, Option<String>), String> {
 /// Lines are split so that each keeps its own newline: a buffer whose last line has none stays
 /// that way unless the replacement is the piece that lands at the end.
 fn replace_lines(text: &str, edit: &LineEdit) -> Result<String, String> {
-    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let lines: Vec<&str> = if text.is_empty() {
+        // An empty buffer is one empty line in the editor (`Buffer::line_count`), and a plugin
+        // that answers with `replace-lines { start: 0, end: 1 }` means that line. Splitting
+        // yields no lines at all, which would make the same edit out of range here only.
+        vec![""]
+    } else {
+        text.split_inclusive('\n').collect()
+    };
     let start = edit.start as usize;
     let end = edit.end as usize;
     if start > end || end > lines.len() {
@@ -198,6 +205,19 @@ mod tests {
             replace_lines("one\ntwo", &line_edit(0, 1, "ONE\n")),
             Ok("ONE\ntwo".to_string())
         );
+    }
+
+    #[test]
+    fn an_empty_buffer_still_has_the_line_the_editor_shows() {
+        assert_eq!(
+            replace_lines("", &line_edit(0, 1, "one\n")),
+            Ok("one\n".to_string())
+        );
+        assert_eq!(
+            replace_lines("", &line_edit(0, 0, "one\n")),
+            Ok("one\n".to_string())
+        );
+        assert!(replace_lines("", &line_edit(0, 2, "one\n")).is_err());
     }
 
     #[test]

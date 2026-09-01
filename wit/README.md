@@ -27,8 +27,14 @@ component としてビルドされる。同じ .wasm がブラウザでもネイ
 ABI のバージョンは wit の package バージョン (`wim:plugin@0.1.0`) そのもので、`wit/` 配下で
 1 つに揃える。1.0.0 に達するまでは minor が ABI の変更 (export への関数追加を含む — 新しい
 ホストは古い component にその export が無いと instantiate できない)、patch が ABI に触れない
-変更を表し、ホストは自分がビルドされた時と major.minor が一致しない component を拒否する。
-判断の基準は `plugin.wit` 冒頭のコメントに書いてある。
+変更を表す。判断の基準は `plugin.wit` 冒頭のコメントに書いてある。
+
+ホストが受け入れるのは、自分がビルドされた時とバージョンが完全に一致する component だけで、
+patch 差も許容しない。export 名にはフルバージョンが入る (`wim:plugin/commands@0.1.0`) ため、
+ホストの bindings が探す export 名も `@0.1.0` で固定されており、patch だけ違う component は
+バージョン検査を通しても instantiate で export が見つからずに失敗するだけになる。patch は ABI
+に触れない変更にしか使わないので、patch を上げた時にホストとプラグイン双方の再ビルドが要る
+こと自体に実害はない。
 
 ## ビルド
 
@@ -61,13 +67,19 @@ wasmtime の `bindgen!` が同じ `wit/` から生成する。ロード時に行
 
 - component かどうかを先頭 8 バイトで見る (`scripts/check-wasm-component.sh` と同じ判定)。
   componentize していないビルド成果物 (素の core module) はここで弾かれる
-- export 名 (`wim:plugin/commands@0.1.0`) が持つ ABI バージョンを見て、major.minor が
-  ホストのものと違う component を拒否する。ホスト側のバージョンは `wit/plugin.wit` の
-  package 行から読むので、定数として二重に持たない
+- export 名 (`wim:plugin/commands@0.1.0`) が持つ ABI バージョンを見て、ホストのものと完全に
+  一致しない component を拒否する。ホスト側のバージョンは `wit/plugin.wit` の package 行から
+  読むので、定数として二重に持たない
 - linker に何も足さずに instantiate する。world が import する `wim:plugin/buffer` は型だけの
   interface で、wasmtime は関数を持たない instance を linker の定義なしで満たすため、それ以外を
   import する component — WASI を要求する component すべて — はここで弾かれる。これが
   サンドボックスで、実行時に禁止するのではなくロード時に成立しない形にしてある
+
+linker が断つのは「できること」で、プラグインがなお使えるのは時間とメモリになる。呼び出しは
+すべてホストのスレッドで同期実行されるため、store 側で両方に上限を置く。1 回の呼び出しごとに
+fuel (wasm 命令数相当) を与え直し、guest の linear memory の上限も設ける。無限ループや際限の
+ない `memory.grow` は上限に当たって trap し、ホストにはエラーとして返る。上限値と選定根拠は
+`crates/wim-plugin-host/src/lib.rs` の `CALL_FUEL` / `MEMORY_LIMIT` に書いてある。
 
 エディタに組み込まずに動かす入口が `wim plugin run <wasm> <command> [--input TEXT]` で、
 標準入力 (または `--input`) のテキストを snapshot として渡し、返ってきた edit を適用した結果を

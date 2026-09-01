@@ -83,17 +83,17 @@ fn a_component_built_against_another_abi_is_refused() {
 }
 
 #[test]
-fn an_abi_that_differs_only_in_its_patch_passes_the_version_check() {
-    // The patch digit marks changes that do not touch the ABI, so the version check lets this
-    // one through; it fails afterwards, on the functions the empty instances do not export.
+fn an_abi_that_differs_only_in_its_patch_is_refused_too() {
+    // The patch digit marks changes that do not touch the ABI, but it is part of the export names
+    // all the same, so a component built against 0.1.7 exports nothing this host can find. Saying
+    // so as a version mismatch is the point: letting it past here would only move the refusal to
+    // a wasmtime message about a missing export (`wit/README.md`).
     let wasm = component(&exports_at("0.1.7"));
-    let Err(error) = Plugin::from_binary(&wasm) else {
-        panic!("the empty instances are not the world's interfaces");
+    let Err(Error::AbiMismatch { expected, found }) = Plugin::from_binary(&wasm) else {
+        panic!("a component built against 0.1.7 should be refused");
     };
-    assert!(
-        !matches!(error, Error::AbiMismatch { .. }),
-        "the patch digit should not be compared: {error}"
-    );
+    assert_eq!(expected, "0.1.0");
+    assert_eq!(found, "0.1.7");
 }
 
 #[test]
