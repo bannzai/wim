@@ -11,7 +11,7 @@ cargo test --workspace
 make check-plugins
 ```
 
-`plugins/` は root とは別の Cargo workspace のため `--workspace` に入らない。ABI とサンプルプラグインを触ったら `make check-plugins` (ホスト target の fmt / clippy / unit test) も実行する。component 本体のビルド (`make build-plugins`) は wasm32-wasip2 が要るため CI が行う。
+`plugins/` は root とは別の Cargo workspace のため `--workspace` に入らない。ABI とサンプルプラグインを触ったら `make check-plugins` (ホスト target の fmt / clippy / unit test) も実行する。component 本体のビルド (`make build-plugins`) は wasm32 の std が要るため CI が行う。
 
 wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`) は CI が行う。ローカルの Homebrew Rust には wasm32 の std が無いため実行しない。`web/` のデモとその Playwright E2E (`make e2e`) も wasm ビルドを前提とするため、同じ理由でローカルでは動かず CI で検証する。
 

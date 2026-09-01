@@ -8,7 +8,10 @@
 //     新しいホストは古い component にその export が無いと instantiate できないため、
 //     「追加」もプラグイン側の再ビルドを要する破壊的変更になる。
 //   - ホストはロードする component の package バージョンを見て、自分がビルドされた時と
-//     major.minor が一致しないものは拒否する。
+//     完全に一致しないものは拒否する。export 名にフルバージョンが入る
+//     (wim:plugin/commands@0.1.0) ため、patch だけ違う component もホストが探す export を
+//     持たず instantiate できない。patch は ABI に触れない変更にしか使わないので、
+//     patch を上げた時に双方の再ビルドが要ること自体に実害はない。
 package wim:plugin@0.1.0;
 
 /// バッファの読み書き。ホストの状態を指すハンドルは渡さず、呼び出しごとにテキストを値で

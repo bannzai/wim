@@ -85,8 +85,15 @@ vimacro --ex '%s/foo/bar/g' --keys 'ggA!<Esc>' notes.txt
 プラグインは Wasm Component Model の component で、ABI は [wit/plugin.wit](wit/plugin.wit) が定義します。コマンド登録・イベントフック・HTML パネルの 3 つを export し、バッファはハンドルではなくテキストの値で受け渡す純関数型のインターフェースです。ABI の読み方とビルド方法は [wit/README.md](wit/README.md)、最小の実装例は [plugins/hello-wim](plugins/hello-wim) にあります。
 
 ```sh
-rustup target add wasm32-wasip2
+rustup target add wasm32-unknown-unknown
 make build-plugins
+```
+
+ビルドした component は `crates/wim-plugin-host` が wasmtime でロードします。プラグインには WASI を一切渡さないため、ファイル IO・ネットワーク・時刻に触れる component はロード時点で拒否されます。エディタに組み込まずに動かすには `wim plugin run` を使います (Ex コマンドへの配線は Phase 4-4)。
+
+```sh
+echo 'hello wim' | cargo run -p wim -- plugin run plugins/target/wasm32-unknown-unknown/release/hello_wim.component.wasm upcase
+# => HELLO WIM
 ```
 
 ## 開発コマンド
@@ -98,7 +105,7 @@ cargo test --workspace
 make check-plugins  # plugins/ は別 workspace のため --workspace に入りません
 ```
 
-wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`)、プラグインの component ビルド (`make build-plugins`)、デモページに対する Playwright の E2E (`make e2e`) は CI が行います。
+wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`)、プラグインの component ビルド (`make build-plugins`)、ビルドした component を実際にロードするホストのテスト (`make test-plugin-host`)、デモページに対する Playwright の E2E (`make e2e`) は CI が行います。
 
 ## License
 

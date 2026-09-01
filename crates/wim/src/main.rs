@@ -1,7 +1,11 @@
 //! `wim`: the command line front end of wim.
 //!
 //! `wim serve` runs the daemon of `wim-daemon` over a directory and prints what a client needs to
-//! reach it: the address it took and the token it will ask for.
+//! reach it: the address it took and the token it will ask for. `wim plugin` runs a plugin
+//! against a buffer read from standard input, which is how a `.wasm` is checked without an
+//! editor around it.
+
+mod plugin;
 
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -25,7 +29,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:0";
 /// project without naming it twice.
 const DEFAULT_ROOT: &str = ".";
 
-/// Runs wim's daemon.
+/// Runs wim's daemon and its plugins.
 #[derive(Debug, Parser)]
 #[command(name = PROGRAM, version, about)]
 struct Cli {
@@ -37,6 +41,8 @@ struct Cli {
 enum Command {
     /// Serve a directory to wim clients over WebSocket.
     Serve(Serve),
+    /// Run a wasm plugin over a buffer.
+    Plugin(plugin::Plugin),
 }
 
 #[derive(Debug, Args)]
@@ -89,6 +95,9 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve(serve) => run(serve).await,
+        // Running a plugin is one call into wasmtime and then the answer, with nothing else to
+        // wait on, so it is done on this thread rather than handed to the runtime.
+        Command::Plugin(plugin) => plugin::main(plugin),
     }
 }
 
@@ -146,7 +155,9 @@ mod tests {
                 .chain(arguments.iter().copied()),
         )
         .expect("arguments should parse");
-        let Command::Serve(serve) = cli.command;
+        let Command::Serve(serve) = cli.command else {
+            panic!("`serve` should parse as `serve`");
+        };
         serve
     }
 

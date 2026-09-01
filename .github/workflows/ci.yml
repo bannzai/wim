@@ -69,15 +69,24 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-wasip2
+          targets: wasm32-unknown-unknown
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: plugins
+          # The host that loads the plugin lives in the root workspace, and the plugin itself in
+          # its own, so this job builds out of both.
+          workspaces: |
+            .
+            plugins
       # The generated bindings compile on the host target, so the ABI and the sample are checked
       # here the same way they are locally.
       - run: make check-plugins
       - run: make build-plugins
+      # The one place the two halves of the ABI meet: the component built just above is loaded by
+      # the native host and run. This is the only job that builds the component, so it is the
+      # only one where those tests do anything; in the `test` job they step aside for want of a
+      # component, the way they do on a machine that cannot build one.
+      - run: make test-plugin-host
 
   browser-e2e:
     runs-on: ubuntu-latest

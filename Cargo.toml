@@ -5,6 +5,7 @@ members = [
     "crates/wim-protocol",
     "crates/wim-wasm",
     "crates/wim-daemon",
+    "crates/wim-plugin-host",
     "crates/vimacro",
     "crates/wim",
 ]
@@ -19,7 +20,17 @@ repository = "https://github.com/bannzai/wim"
 wim-core = { path = "crates/wim-core", version = "0.0.0" }
 wim-protocol = { path = "crates/wim-protocol", version = "0.0.0" }
 wim-daemon = { path = "crates/wim-daemon", version = "0.0.0" }
+wim-plugin-host = { path = "crates/wim-plugin-host", version = "0.0.0" }
 ropey = "1.6"
+# Pinned rather than left to a caret range, the way `wit-bindgen` is in plugins/Cargo.toml: the
+# host bindings this generates are the other half of the ABI, and wasmtime's component API still
+# moves between majors.
+wasmtime = { version = "=48.0.1", default-features = false, features = [
+    "component-model",
+    "cranelift",
+    "runtime",
+    "std",
+] }
 wasm-bindgen = "0.2"
 unicode-segmentation = "1.12"
 regex = "1.11"
@@ -33,5 +44,6 @@ futures-util = "0.3"
 notify = "8.2"
 getrandom = "0.4"
 assert_cmd = "2.0"
+wat = "1.254"
 predicates = "3.1"
 tempfile = "3.14"

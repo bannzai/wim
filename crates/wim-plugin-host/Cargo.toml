@@ -1,0 +1,16 @@
+[package]
+name = "wim-plugin-host"
+version = "0.0.0"
+description = "Native host for wim plugins. Loads and runs wim:plugin components on wasmtime, with no WASI."
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+wasmtime.workspace = true
+
+[dev-dependencies]
+# What a component asks of its host is decided by its imports and exports alone, so the tests
+# that fix the sandbox and the ABI check write those by hand rather than needing a wasm32
+# toolchain to build a real plugin.
+wat.workspace = true

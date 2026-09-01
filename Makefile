@@ -1,8 +1,9 @@
 WASM := target/wasm32-unknown-unknown/release/wim_wasm.wasm
 PLUGINS := plugins/Cargo.toml
-HELLO_WIM := plugins/target/wasm32-wasip2/release/hello_wim.wasm
+HELLO_WIM_CORE := plugins/target/wasm32-unknown-unknown/release/hello_wim.wasm
+HELLO_WIM := plugins/target/wasm32-unknown-unknown/release/hello_wim.component.wasm
 
-.PHONY: build-web web e2e install-wasm-bindgen vendor-tree-sitter build-plugins check-plugins
+.PHONY: build-web web e2e install-wasm-bindgen vendor-tree-sitter build-plugins check-plugins test-plugin-host
 
 # Builds the wasm module and the JS glue the demo page imports.
 build-web:
@@ -28,10 +29,15 @@ vendor-tree-sitter:
 install-wasm-bindgen:
 	cargo install wasm-bindgen-cli --version "$$(bash scripts/wasm-bindgen-version.sh)" --locked
 
-# Builds the sample plugin as a wasm component. wasm32-wasip2 links the component itself, so the
-# rustup target is the whole toolchain requirement.
+# Builds the sample plugin as a wasm component. The build targets wasm32-unknown-unknown rather
+# than wasm32-wasip2 because wasip2's std links WASI imports (wasi:io and friends) into the
+# component, and the host's sandbox refuses everything that imports WASI; on unknown-unknown the
+# component imports nothing but the ABI's own types. The core module wit-bindgen leaves behind is
+# turned into a component by a pinned wasm-tools binary.
 build-plugins:
-	cargo build --manifest-path $(PLUGINS) --target wasm32-wasip2 --release --locked
+	cargo build --manifest-path $(PLUGINS) --target wasm32-unknown-unknown --release --locked
+	bash scripts/install-wasm-tools.sh > /dev/null
+	"$$(bash scripts/install-wasm-tools.sh)" component new $(HELLO_WIM_CORE) -o $(HELLO_WIM)
 	bash scripts/check-wasm-component.sh $(HELLO_WIM)
 
 # Checks the plugins on the host target, where the ABI bindings still compile even though the
@@ -40,3 +46,10 @@ check-plugins:
 	cargo fmt --manifest-path $(PLUGINS) --all --check
 	cargo clippy --manifest-path $(PLUGINS) --all-targets --locked -- -D warnings
 	cargo test --manifest-path $(PLUGINS) --lib --locked
+
+# Runs the native host against the sample plugin it was built to load. WIM_PLUGIN_WASM is what
+# points the tests at the component, and it has to be absolute: a test binary runs in its own
+# package directory, not here. The tests that need it step aside when it is unset, which is what
+# `cargo test --workspace` does on a machine that cannot build the component.
+test-plugin-host: build-plugins
+	WIM_PLUGIN_WASM="$(CURDIR)/$(HELLO_WIM)" cargo test -p wim-plugin-host -p wim --locked

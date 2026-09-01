@@ -27,28 +27,72 @@ component としてビルドされる。同じ .wasm がブラウザでもネイ
 ABI のバージョンは wit の package バージョン (`wim:plugin@0.1.0`) そのもので、`wit/` 配下で
 1 つに揃える。1.0.0 に達するまでは minor が ABI の変更 (export への関数追加を含む — 新しい
 ホストは古い component にその export が無いと instantiate できない)、patch が ABI に触れない
-変更を表し、ホストは自分がビルドされた時と major.minor が一致しない component を拒否する。
-判断の基準は `plugin.wit` 冒頭のコメントに書いてある。
+変更を表す。判断の基準は `plugin.wit` 冒頭のコメントに書いてある。
+
+ホストが受け入れるのは、自分がビルドされた時とバージョンが完全に一致する component だけで、
+patch 差も許容しない。export 名にはフルバージョンが入る (`wim:plugin/commands@0.1.0`) ため、
+ホストの bindings が探す export 名も `@0.1.0` で固定されており、patch だけ違う component は
+バージョン検査を通しても instantiate で export が見つからずに失敗するだけになる。patch は ABI
+に触れない変更にしか使わないので、patch を上げた時にホストとプラグイン双方の再ビルドが要る
+こと自体に実害はない。
 
 ## ビルド
 
-`plugins/` は root の Cargo workspace とは別の workspace になっている。プラグインは
-wasm32-wasip2 でしかリンクできないため、root の `cargo test --workspace` /
+`plugins/` は root の Cargo workspace とは別の workspace になっている。プラグインの cdylib は
+wasm でしかリンクできないため、root の `cargo test --workspace` /
 `cargo clippy --workspace` に混ぜないための分離で、`wit-bindgen` のバージョンは
 `plugins/Cargo.toml` の `[workspace.dependencies]` で固定し `plugins/Cargo.lock` を commit する。
 
 ```sh
-make build-plugins   # wasm32-wasip2 でビルドし、成果物が component であることを確認する
+make build-plugins   # wasm32-unknown-unknown でビルドして componentize する
 make check-plugins   # ホスト target で fmt / clippy / unit test
 ```
 
-`wasm32-wasip2` はリンク時に component を直接出力するため、cargo-component や wasm-tools は
-要らない (cargo-component は上流で deprecate が進んでいる)。必要なのは rustup の target だけ。
+target は `wasm32-wasip2` ではなく `wasm32-unknown-unknown` を使う。wasip2 の std は
+wasi:io などの WASI import を component に残し、ホストのサンドボックス (WASI を import する
+component をロード時に拒否する) が自分のプラグインを弾いてしまうため。unknown-unknown の
+core module には ABI 由来の import しか残らず、pin した wasm-tools
+(`scripts/install-wasm-tools.sh` がリリースバイナリを取得) の `component new` で component に
+する (cargo-component は上流で deprecate が進んでいるため使わない)。
 
 `check-plugins` の test が `--lib` に限定されているのは、cdylib のリンクだけがホスト target で
 失敗するため。バインディングの生成とコンパイルはホスト target でも通るので、wit の型検査と
 プラグインのロジックの test はローカルで行える。wasm32 系の std を持たない環境 (Homebrew の
 Rust など) で `.wasm` を作れないのは Phase 3 と同じで、component のビルドは CI が正になる。
+
+## ホスト
+
+ネイティブ側のホストは `crates/wim-plugin-host` で、バインディングは wit-bindgen ではなく
+wasmtime の `bindgen!` が同じ `wit/` から生成する。ロード時に行うことは 3 つある。
+
+- component かどうかを先頭 8 バイトで見る (`scripts/check-wasm-component.sh` と同じ判定)。
+  componentize していないビルド成果物 (素の core module) はここで弾かれる
+- export 名 (`wim:plugin/commands@0.1.0`) が持つ ABI バージョンを見て、ホストのものと完全に
+  一致しない component を拒否する。ホスト側のバージョンは `wit/plugin.wit` の package 行から
+  読むので、定数として二重に持たない
+- linker に何も足さずに instantiate する。world が import する `wim:plugin/buffer` は型だけの
+  interface で、wasmtime は関数を持たない instance を linker の定義なしで満たすため、それ以外を
+  import する component — WASI を要求する component すべて — はここで弾かれる。これが
+  サンドボックスで、実行時に禁止するのではなくロード時に成立しない形にしてある
+
+linker が断つのは「できること」で、プラグインがなお使えるのは時間とメモリになる。呼び出しは
+すべてホストのスレッドで同期実行されるため、store 側で両方に上限を置く。1 回の呼び出しごとに
+fuel (wasm 命令数相当) を与え直し、guest の linear memory の上限も設ける。無限ループや際限の
+ない `memory.grow` は上限に当たって trap し、ホストにはエラーとして返る。上限値と選定根拠は
+`crates/wim-plugin-host/src/lib.rs` の `CALL_FUEL` / `MEMORY_LIMIT` に書いてある。
+
+エディタに組み込まずに動かす入口が `wim plugin run <wasm> <command> [--input TEXT]` で、
+標準入力 (または `--input`) のテキストを snapshot として渡し、返ってきた edit を適用した結果を
+標準出力へ書く。Ex コマンドへの配線は Phase 4-4 の autocmd・設定と合わせて行う。
+
+```sh
+make build-plugins      # component をビルドする (要 wasm32-unknown-unknown)
+make test-plugin-host   # ビルドした component をホストで実際にロードして動かす
+```
+
+`make test-plugin-host` は component のパスを `WIM_PLUGIN_WASM` でテストに渡す。素の
+`cargo test --workspace` ではこの変数が無いため、component を要するテストは skip される
+(component をビルドできない環境でも workspace のテストが通るようにするため)。
 
 ## 新しいプラグインを足す
 

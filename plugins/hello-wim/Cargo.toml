@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-# cdylib is what the wasm32-wasip2 link step turns into a component; rlib keeps the crate
+# cdylib is the wasm module wasm-tools turns into a component; rlib keeps the crate
 # testable on a native target, where the generated bindings are never called.
 crate-type = ["cdylib", "rlib"]
 
