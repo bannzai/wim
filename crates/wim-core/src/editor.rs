@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, LineEdit};
 use crate::command::{Command, InsertAnchor, Operator, OperatorTarget, SelectionShape};
 use crate::edit;
 use crate::effect::{Effect, Event};
@@ -38,25 +38,26 @@ struct Recording {
 /// The lines something outside the editor is walking, picked before any of them ran.
 ///
 /// This is what makes `:g` visit the lines the pattern matched rather than whatever text ends
-/// up at those indices: each line still to come is carried over the lines every key adds or
+/// up at those indices: each line still to come is carried over the lines every edit adds or
 /// takes away, and a line an edit took away is dropped rather than stood in for by the line
 /// that slid into its place. Counting the buffer's lines before and after a whole macro cannot
 /// tell the two apart — a macro that deletes a line and opens another leaves the count where it
-/// found it — so the walk is tracked per key, the way the marks are.
+/// found it — so the walk is carried over each edit the buffer records, the way the marks are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LineWalk {
     /// The lines still to visit, in the order they were given, `None` where the line went away.
     pending: VecDeque<Option<usize>>,
 }
 
-/// Where the line at `line` ends up once a change that added `added` lines from `changed_at`
-/// downwards is in, `None` when the change took the line away.
-fn moved_line(line: usize, changed_at: usize, added: isize) -> Option<usize> {
-    if line < changed_at {
+/// Where the line at `line` ends up once `edit` is in, `None` when the edit took it away.
+fn moved_line(line: usize, edit: LineEdit) -> Option<usize> {
+    if line < edit.at {
         return Some(line);
     }
-    line.checked_add_signed(added)
-        .filter(|moved| *moved >= changed_at)
+    if line < edit.at + edit.removed {
+        return None;
+    }
+    Some(line - edit.removed + edit.added)
 }
 
 /// How deep `@` playbacks may nest.
@@ -201,16 +202,11 @@ impl Editor {
         {
             recording.keys.push(key);
         }
-        let before = self.tracks_lines().then(|| self.buffer.clone());
         let watched = (self.reading_keys == 0).then_some((self.mode, self.changes));
         self.reading_keys += 1;
         let mut effects = self.run_key(key);
         self.reading_keys -= 1;
-        if let Some(before) = before
-            && before.line_count() != self.buffer.line_count()
-        {
-            self.move_tracked_lines(&before);
-        }
+        self.move_tracked_lines_over_edits();
         if let Some((mode, changes)) = watched {
             if self.changes != changes {
                 effects.push(Effect::Event(Event::TextChanged));
@@ -619,7 +615,12 @@ impl Editor {
     }
 
     /// Walks `count` changes back with `u`, or forward again with `<C-r>`.
+    ///
+    /// A snapshot is put in place of the buffer whole rather than edited into it, so it brings
+    /// no record of what changed with it and the marks and the walks are carried over the two
+    /// texts instead.
     fn walk_history(&mut self, count: Option<usize>, backwards: bool) -> Vec<Effect> {
+        let before = self.tracks_lines().then(|| self.buffer.clone());
         let mut moved = false;
         for _ in 0..at_least_one(count) {
             let restored = if backwards {
@@ -633,10 +634,19 @@ impl Editor {
                 break;
             };
             self.buffer = buffer;
+            // A snapshot was taken while the change that made it was still running, so it may
+            // hold edits the tracking was carried over as they happened. They are not carried
+            // over a second time.
+            self.buffer.take_line_edits();
             self.cursor = self.buffer.clamp(cursor);
             moved = true;
         }
         if moved {
+            if let Some(before) = before
+                && before.line_count() != self.buffer.line_count()
+            {
+                self.move_tracked_lines(&before);
+            }
             // Walking the history is a change of the text like any other, and a count that
             // walked several of them is the one step the key took.
             self.changes += 1;
@@ -850,6 +860,9 @@ impl Editor {
     /// Returns whether every key ran without complaining. The first that reports an error ends
     /// the run, which is what stops a macro at the first thing it cannot do, and a macro that
     /// feeds more than [`MACRO_STEP_LIMIT`] keys is stopped the same way.
+    ///
+    /// A `:q` also ends the run, where it is written rather than after the keys behind it:
+    /// putting the editor down is the last thing the keys that asked for it get to do.
     pub(crate) fn feed_keys(&mut self, keys: &[KeyEvent], effects: &mut Vec<Effect>) -> bool {
         self.fed_keys += 1;
         let mut ran = true;
@@ -868,8 +881,11 @@ impl Editor {
             ran = !produced
                 .iter()
                 .any(|effect| matches!(effect, Effect::Error(_)));
+            let quit = produced
+                .iter()
+                .any(|effect| matches!(effect, Effect::QuitRequested { .. }));
             effects.append(&mut produced);
-            if !ran {
+            if !ran || quit {
                 break;
             }
         }
@@ -891,24 +907,22 @@ impl Editor {
         Vec::new()
     }
 
-    /// Moves the marks and the lines still to walk over a change that added or took away
-    /// lines.
+    /// Moves the marks and the lines still to walk over the edits the buffer recorded, and
+    /// leaves it with none.
     ///
-    /// Tracking is by line and best-effort rather than the exact tracking Vim does through
-    /// every edit: a line below the first that differs moves by however many lines came or
-    /// went, and one that went away is dropped. A change inside a line leaves the marks on it
-    /// where they are, so a mark's column can end up past the end of its line; a jump clamps
-    /// it back onto the line.
-    fn move_tracked_lines(&mut self, before: &Buffer) {
-        // A line past the end of a buffer reads as empty, so a change that only added or took
-        // away empty lines at the end finds no line that differs; those lines came or went at
-        // the end of the shorter buffer.
-        let changed_at = (0..before.line_count().max(self.buffer.line_count()))
-            .find(|line| before.line_text(*line) != self.buffer.line_text(*line))
-            .unwrap_or_else(|| before.line_count().min(self.buffer.line_count()));
-        let added = self.buffer.line_count() as isize - before.line_count() as isize;
+    /// A change inside a line moves no line and records nothing, so the marks on it stay where
+    /// they are and a mark's column can end up past the end of its line; a jump clamps it back
+    /// onto the line.
+    fn move_tracked_lines_over_edits(&mut self) {
+        for edit in self.buffer.take_line_edits() {
+            self.move_tracked_lines_over(edit);
+        }
+    }
+
+    /// Moves the marks and the lines still to walk over one edit of the line structure.
+    fn move_tracked_lines_over(&mut self, edit: LineEdit) {
         self.marks
-            .retain(|_, mark| match moved_line(mark.line, changed_at, added) {
+            .retain(|_, mark| match moved_line(mark.line, edit) {
                 Some(line) => {
                     mark.line = line;
                     true
@@ -917,9 +931,33 @@ impl Editor {
             });
         for walk in &mut self.line_walks {
             for pending in &mut walk.pending {
-                *pending = pending.and_then(|line| moved_line(line, changed_at, added));
+                *pending = pending.and_then(|line| moved_line(line, edit));
             }
         }
+    }
+
+    /// Moves the marks and the lines still to walk over a text that was put in place of the
+    /// buffer whole rather than edited into it — an undo, a redo, or the text a plugin
+    /// answered with.
+    ///
+    /// Such a text brings no record of what changed with it, so what changed is guessed from
+    /// the two buffers: the lines below the first that differs are taken to have moved by
+    /// however many came or went. That is best-effort where the recorded edits are exact — two
+    /// lines holding the same text cannot be told apart this way — and it is all there is to
+    /// go on when the edits themselves were never seen.
+    fn move_tracked_lines(&mut self, before: &Buffer) {
+        // A line past the end of a buffer reads as empty, so a change that only added or took
+        // away empty lines at the end finds no line that differs; those lines came or went at
+        // the end of the shorter buffer.
+        let at = (0..before.line_count().max(self.buffer.line_count()))
+            .find(|line| before.line_text(*line) != self.buffer.line_text(*line))
+            .unwrap_or_else(|| before.line_count().min(self.buffer.line_count()));
+        let (before, after) = (before.line_count(), self.buffer.line_count());
+        self.move_tracked_lines_over(LineEdit {
+            at,
+            removed: before.saturating_sub(after),
+            added: after.saturating_sub(before),
+        });
     }
 
     /// Starts walking `lines`, which are then visited in the order they are given.
@@ -964,18 +1002,14 @@ impl Editor {
     /// the lines still to walk over what it did, which [`Editor::handle_key`] does for the
     /// edits a key makes.
     pub(crate) fn edit_directly<T>(&mut self, edit: impl FnOnce(&mut Self) -> T) -> T {
-        let before = self.tracks_lines().then(|| self.buffer.clone());
         let edited = edit(self);
-        if let Some(before) = before
-            && before.line_count() != self.buffer.line_count()
-        {
-            self.move_tracked_lines(&before);
-        }
+        self.move_tracked_lines_over_edits();
         edited
     }
 
     /// Whether anything is following the lines of the buffer, which is what makes a copy of it
-    /// worth taking before an edit. Comparing the buffers costs a walk of the text.
+    /// worth taking before a change that hands over a whole text. Comparing the buffers costs a
+    /// walk of the text.
     fn tracks_lines(&self) -> bool {
         !self.marks.is_empty() || !self.line_walks.is_empty()
     }
@@ -2332,6 +2366,20 @@ mod tests {
             run("a\nb\nc", ":%norm A!<lt>Esc>:q<lt>CR><CR>").text(),
             "a!\nb\nc"
         );
+        assert_eq!(
+            run("a\nb\nc", ":%norm :q<lt>CR>A!<lt>Esc><CR>").text(),
+            "a\nb\nc",
+            ":q stops the keys behind it, on the line that typed it as well"
+        );
+    }
+
+    #[test]
+    fn a_macro_played_over_a_walk_moves_its_lines_once() {
+        // The `dd` inside the macro is one edit, and the key that played the macro is not a
+        // second one: a walk that carried its lines over both would step past a line each time
+        // and leave the last of them standing.
+        let editor = run("a\nb\nc", "qqddqu:%norm @q<CR>");
+        assert_eq!(editor.text(), "");
     }
 
     #[test]

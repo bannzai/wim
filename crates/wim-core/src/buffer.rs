@@ -7,22 +7,60 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::position::Position;
 
+/// A change to the line structure of the buffer: the `removed` lines from `at` on went away,
+/// and `added` lines took their place.
+///
+/// This is what something following a line of the buffer — a mark, a line walk — is carried
+/// over. An edit inside one line moves no line and records none of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineEdit {
+    /// The first line the edit reached. What was in front of it stayed where it was.
+    pub(crate) at: usize,
+    pub(crate) removed: usize,
+    pub(crate) added: usize,
+}
+
 /// The text being edited.
 ///
 /// Columns are grapheme cluster indices inside a line, so a multi-byte character and a
 /// multi-codepoint cluster each occupy exactly one column. Line endings are not part of a
 /// line's columns; a trailing newline terminates the last line rather than starting an
 /// empty one, and it is preserved when the buffer is rendered back to text.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct Buffer {
     rope: Rope,
+    /// The line structure changes made since they were last taken away, in the order they
+    /// were made.
+    line_edits: Vec<LineEdit>,
 }
+
+/// Two buffers are the same buffer when they hold the same text. What either of them has
+/// recorded is bookkeeping about how it got there, which is no part of what it holds — and
+/// telling a change that altered the text from one that did not compares the text alone.
+impl PartialEq for Buffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.rope == other.rope
+    }
+}
+
+impl Eq for Buffer {}
 
 impl Buffer {
     pub fn new(text: &str) -> Self {
         Self {
             rope: Rope::from_str(text),
+            line_edits: Vec::new(),
         }
+    }
+
+    /// The line structure changes made since this was last called, leaving none behind.
+    ///
+    /// The editor takes them after every key and carries its marks and its line walks over
+    /// them. A key that plays other keys — a macro, the keys of a `:norm` — takes them as each
+    /// of those keys is read, so the key that played them finds nothing left to carry anything
+    /// over a second time.
+    pub(crate) fn take_line_edits(&mut self) -> Vec<LineEdit> {
+        std::mem::take(&mut self.line_edits)
     }
 
     pub fn line_count(&self) -> usize {
@@ -118,7 +156,12 @@ impl Buffer {
 
     pub fn insert(&mut self, pos: Position, text: &str) {
         let index = self.char_index(pos);
+        let lines_before = self.line_count();
         self.rope.insert(index, text);
+        // What stood in front of `pos` stays on its line, so the lines that moved start below
+        // the one the text went into — except in column 0, where the whole line is pushed
+        // down and the text starts a line of its own.
+        self.note_lines_added(pos.line + usize::from(pos.col > 0), lines_before);
     }
 
     /// Inserts a line break at `at`, plus the newline that terminates the buffer when the
@@ -145,6 +188,7 @@ impl Buffer {
             self.insert(Position::new(line, 0), text);
             return;
         }
+        let lines_before = self.line_count();
         let end = self.rope.len_chars();
         if self.has_trailing_newline() {
             self.rope.insert(end, text);
@@ -153,14 +197,24 @@ impl Buffer {
             self.rope
                 .insert(end + 1, text.strip_suffix('\n').unwrap_or(text));
         }
+        self.note_lines_added(line, lines_before);
     }
 
     /// Removes the text between the two positions, `end` exclusive, and returns it.
     pub fn delete(&mut self, start: Position, end: Position) -> String {
-        let (start, end) = (self.char_index(start), self.char_index(end));
-        let (start, end) = (start.min(end), start.max(end));
+        let (first, last) = (start.min(end), start.max(end));
+        let (start, end) = (self.char_index(first), self.char_index(last));
         let removed = self.rope.slice(start..end).to_string();
         self.rope.remove(start..end);
+        // The lines the span crossed are merged away: what followed the span joins the line
+        // the span started on, and the lines below it move up by as many.
+        if last.line > first.line {
+            self.line_edits.push(LineEdit {
+                at: first.line + 1,
+                removed: last.line - first.line,
+                added: 0,
+            });
+        }
         removed
     }
 
@@ -190,7 +244,28 @@ impl Buffer {
             (start, content_end)
         };
         self.rope.remove(start..end);
+        self.line_edits.push(LineEdit {
+            at: first,
+            removed: last + 1 - first,
+            added: 0,
+        });
         removed
+    }
+
+    /// Records the lines an insert grew the buffer by, the first of them being `at`.
+    ///
+    /// How many lines came is what the buffer holds afterwards rather than how many breaks the
+    /// text carried: a break at the very end of a buffer that had none terminates the last
+    /// line instead of starting a new one.
+    fn note_lines_added(&mut self, at: usize, lines_before: usize) {
+        let added = self.line_count() - lines_before;
+        if added > 0 {
+            self.line_edits.push(LineEdit {
+                at,
+                removed: 0,
+                added,
+            });
+        }
     }
 
     fn line_slice(&self, line: usize) -> RopeSlice<'_> {
@@ -390,5 +465,78 @@ mod tests {
         let mut buffer = Buffer::new("ab\ncd");
         buffer.insert_lines(1, "xy\n");
         assert_eq!(buffer.to_string(), "ab\nxy\ncd");
+    }
+
+    /// The line edits `edit` leaves behind on a buffer holding `text`.
+    fn line_edits(text: &str, edit: impl FnOnce(&mut Buffer)) -> Vec<LineEdit> {
+        let mut buffer = Buffer::new(text);
+        edit(&mut buffer);
+        buffer.take_line_edits()
+    }
+
+    #[test]
+    fn an_edit_records_the_lines_it_moved() {
+        let added = |at, added| LineEdit {
+            at,
+            removed: 0,
+            added,
+        };
+        let removed = |at, removed| LineEdit {
+            at,
+            removed,
+            added: 0,
+        };
+
+        assert_eq!(
+            line_edits("ab\ncd", |buffer| {
+                buffer.delete_lines(0, 0);
+            }),
+            [removed(0, 1)]
+        );
+        assert_eq!(
+            line_edits("ab\ncd\nef", |buffer| {
+                buffer.delete(Position::new(0, 1), Position::new(2, 1));
+            }),
+            [removed(1, 2)],
+            "the lines the span crossed are merged away"
+        );
+        assert_eq!(
+            line_edits("ab\ncd", |buffer| {
+                buffer.insert(Position::new(0, 1), "x\ny\n");
+            }),
+            [added(1, 2)]
+        );
+        assert_eq!(
+            line_edits("ab\ncd", |buffer| {
+                buffer.insert(Position::new(1, 0), "x\n");
+            }),
+            [added(1, 1)],
+            "in column 0 the line itself is pushed down"
+        );
+        assert_eq!(
+            line_edits("ab", |buffer| buffer.insert_lines(1, "cd\n")),
+            [added(1, 1)]
+        );
+        assert_eq!(
+            line_edits("ab", |buffer| {
+                buffer.insert_line_break(Position::new(0, 2));
+            }),
+            [added(1, 1)],
+            "a break at the end of a buffer that had none makes one line, not two"
+        );
+        assert!(
+            line_edits("ab\ncd", |buffer| {
+                buffer.insert(Position::new(0, 1), "xy");
+            })
+            .is_empty(),
+            "an edit inside one line moves no line"
+        );
+    }
+
+    #[test]
+    fn two_buffers_holding_the_same_text_are_the_same_buffer() {
+        let mut edited = Buffer::new("ab\ncd");
+        edited.delete_lines(1, 1);
+        assert_eq!(edited, Buffer::new("ab"), "whatever either recorded");
     }
 }
