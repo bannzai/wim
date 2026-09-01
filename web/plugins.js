@@ -22,12 +22,17 @@ const MANIFEST = "./plugins/manifest.json";
 
 /**
  * The interface the commands live on, whose versioned export name carries the ABI. The other two
- * of the world (`events`, `ui`) are exported alongside it and the demo does not call them yet.
+ * of the world (`events`, `ui`) are exported alongside it, and `events` is what an autocmd of
+ * kind `plugin` reaches (`documents/CONFIG.md`).
  */
 const COMMANDS = "wim:plugin/commands";
 
+/** The interface an event is delivered over. */
+const EVENTS = "wim:plugin/events";
+
 /**
- * Loads every plugin the build transpiled, as commands keyed by the name `:name` runs them under.
+ * Loads every plugin the build transpiled: the commands keyed by the name `:name` runs them
+ * under, and the plugins themselves keyed by the name an autocmd names them by.
  *
  * Nothing here throws: a demo served without plugins is the normal state of a checkout that
  * cannot build components, and a plugin that fails to load is reported rather than taking the
@@ -42,34 +47,38 @@ export async function loadPlugins() {
     }
     manifest = await response.json();
   } catch {
-    return { abi: null, commands: new Map(), failures: [] };
+    return { abi: null, commands: new Map(), plugins: new Map(), failures: [] };
   }
 
   const commands = new Map();
+  const plugins = new Map();
   const failures = [];
-  for (const plugin of manifest.plugins) {
+  for (const declared of manifest.plugins) {
     try {
-      for (const command of await loadPlugin(plugin, manifest.abi)) {
+      const { published, plugin } = await loadPlugin(declared, manifest.abi);
+      for (const command of published) {
         commands.set(command.name, command);
       }
+      plugins.set(plugin.name, plugin);
     } catch (error) {
-      failures.push(`${plugin.name}: ${error.message}`);
+      failures.push(`${declared.name}: ${error.message}`);
     }
   }
-  return { abi: manifest.abi, commands, failures };
+  return { abi: manifest.abi, commands, plugins, failures };
 }
 
-/** The commands one plugin publishes, once it has been held to `abi`. */
-async function loadPlugin(plugin, abi) {
-  const module = await import(plugin.module);
+/** What one plugin publishes, once it has been held to `abi`. */
+async function loadPlugin(declared, abi) {
+  const module = await import(declared.module);
   const commands = module[`${COMMANDS}@${abi}`];
   if (commands === undefined) {
     throw new Error(abiComplaint(module, abi));
   }
-  return commands.listCommands().map((command) => ({
+  const events = module[`${EVENTS}@${abi}`];
+  const published = commands.listCommands().map((command) => ({
     name: command.name,
     description: command.description,
-    plugin: plugin.name,
+    plugin: declared.name,
     /**
      * Runs the command over `buffer`, answering with the edit the host is to apply. What the
      * plugin refuses comes back as a `ComponentError` whose message is its own wording, which
@@ -77,6 +86,16 @@ async function loadPlugin(plugin, abi) {
      */
     run: (args, buffer) => commands.run(command.name, args, buffer),
   }));
+  return {
+    published,
+    plugin: {
+      name: declared.name,
+      /** The event names it asked for. The host delivers nothing else (`wit/plugin.wit`). */
+      subscriptions: events.subscriptions(),
+      /** Delivers one of those events, answering with an edit the way a command does. */
+      onEvent: (event, buffer) => events.onEvent(event, buffer),
+    },
+  };
 }
 
 /**

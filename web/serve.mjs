@@ -18,6 +18,9 @@ const CONTENT_TYPES = {
   ".html": "text/html; charset=utf-8",
   ".js": "text/javascript; charset=utf-8",
   ".json": "application/json; charset=utf-8",
+  // JSONC is JSON with comments, which is not JSON: it is served as text so that nothing on the
+  // way tries to read it as the JSON it is not (`documents/CONFIG.md`).
+  ".jsonc": "text/plain; charset=utf-8",
   ".mjs": "text/javascript; charset=utf-8",
   ".wasm": "application/wasm",
 };

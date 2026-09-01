@@ -1,0 +1,6 @@
+name = "an insert session reports the modes it went through and the change it closed with"
+input = "ab"
+keys = "iX<Esc>"
+expected = "Xab"
+expected_cursor = [0, 0]
+expected_events = ["mode-changed", "text-changed", "mode-changed"]

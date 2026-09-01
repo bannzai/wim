@@ -7,6 +7,15 @@ const FIRST_LINE = "wim is a Vim-grammar editor, not a Vim clone.";
 const BACKGROUND = [18, 20, 26];
 const CURSOR = [92, 156, 245];
 
+/**
+ * The effects that ask something of the host, which is everything but the events the core
+ * reports about itself. What those are and when they are raised is checked on its own
+ * (`e2e/autocmd.spec.js`).
+ */
+function requests(state) {
+  return state.effects.filter((effect) => effect.kind !== "event");
+}
+
 /** A buffer of `count` numbered lines, taller than the viewport when `count` is large. */
 function numberedLines(count) {
   return Array.from({ length: count }, (_, line) => `line ${line + 1}`).join("\n");
@@ -117,6 +126,10 @@ async function preeditOf(page) {
 test.beforeEach(async ({ page }) => {
   await page.goto("/index.html");
   await page.waitForFunction(() => window.wimDemo !== undefined);
+  // The editor holds the keys it is pressed with until the autocmds are in, so that no event goes
+  // out over a config that has not been read yet (`web/main.js`). Waiting for that is what makes
+  // a key pressed here one the editor types rather than one it queues.
+  await page.evaluate(() => window.wimDemo.autocmds());
 });
 
 test("starts in Normal mode over the initial buffer", async ({ page }) => {
@@ -403,7 +416,7 @@ test("the command line takes composed text too", async ({ page }) => {
   await page.keyboard.press("Enter");
   const state = await page.evaluate(() => window.wimDemo.state());
   expect(state.mode).toBe("NORMAL");
-  expect(state.effects).toEqual([{ kind: "save", path: "メモ.txt" }]);
+  expect(requests(state)).toEqual([{ kind: "save", path: "メモ.txt" }]);
   expect(state.ime.focused).toBe(false);
 });
 
@@ -428,7 +441,7 @@ test("an Ex command hands its effect back to the host", async ({ page }) => {
 
   const state = await page.evaluate(() => window.wimDemo.state());
   expect(state.mode).toBe("NORMAL");
-  expect(state.effects).toEqual([{ kind: "save", path: "notes.txt" }]);
+  expect(requests(state)).toEqual([{ kind: "save", path: "notes.txt" }]);
 });
 
 test("the canvas is drawn and redrawn as keys come in", async ({ page }) => {

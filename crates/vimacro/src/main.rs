@@ -375,6 +375,12 @@ fn feed(editor: &mut Editor, keys: &[KeyEvent], applied: &mut Applied) -> Stop {
                     }
                 }
                 Effect::QuitRequested { .. } => return Stop::Quit,
+                // An event is something to hang an autocmd on, and autocmds are declared in a
+                // config a host reads. This one takes no config: what it runs is the keys it
+                // was given and nothing else, so that a macro applied to a file does the same
+                // thing wherever it is run. `wim edit` is the host that wires them up
+                // (`crates/wim/src/edit.rs`).
+                Effect::Event(_) => {}
             }
         }
     }

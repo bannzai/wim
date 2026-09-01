@@ -1,0 +1,17 @@
+// wim のデモが読み込む設定。書式は documents/CONFIG.md が正で、ネイティブの
+// `wim edit --config` が読むものと同じファイル形式・同じイベント名を使う。
+//
+// JSONC なので行コメント・ブロックコメントと末尾カンマが書ける。それ以外の拡張
+// (シングルクォート・16 進数・カンマ省略) は両ホストとも受け付けない。
+{
+  "autocmds": [
+    // 保存の直前に行末の空白を落とす。パターンは Vim の方言ではなく Rust の regex
+    // (documents/PROJECT.md) なので `\s+$` と書く。落とす空白が無い時は :s が
+    // 「見つからない」と言い、それが autocmd の行に出る
+    { "event": "buffer-write", "handler": { "kind": "ex", "command": "%s/\\s+$//" } },
+
+    // 保存の直前に hello-wim へ知らせる。hello-wim が購読しているのは buffer-write
+    // だけで、購読していないイベントはホストが配送しない (wit/plugin.wit)
+    { "event": "buffer-write", "handler": { "kind": "plugin", "plugin": "hello-wim" } },
+  ],
+}

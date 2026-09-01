@@ -50,7 +50,8 @@ impl KeyOutcome {
     ///
     /// One object per effect: `{"kind":"error","message":…}` for a key the mode had no
     /// meaning for, `{"kind":"save","path":…}` for `:w`, `{"kind":"quit","force":…}` for
-    /// `:q`. JSON rather than an exported type per effect keeps the boundary to the one
+    /// `:q`, and `{"kind":"event","name":…,"payload":…}` for something a host's autocmds may
+    /// be bound to. JSON rather than an exported type per effect keeps the boundary to the one
     /// value a batch of keys returns.
     #[wasm_bindgen(getter)]
     pub fn effects(&self) -> String {
@@ -226,6 +227,12 @@ fn effects_json(effects: &[Effect]) -> String {
             Effect::Error(message) => json!({ "kind": "error", "message": message }),
             Effect::SaveRequested { path } => json!({ "kind": "save", "path": path }),
             Effect::QuitRequested { force } => json!({ "kind": "quit", "force": force }),
+            // The payload crosses as the string the plugin ABI carries it in rather than as an
+            // object of its own, so that a host passes on what the core wrote instead of
+            // building the same JSON again (`wit/plugin.wit`).
+            Effect::Event(event) => {
+                json!({ "kind": "event", "name": event.name(), "payload": event.payload() })
+            }
         })
         .collect();
     serde_json::Value::Array(effects).to_string()
@@ -285,7 +292,11 @@ mod tests {
         assert_eq!(editor.mode(), "NORMAL");
         assert_eq!((editor.cursor_line(), editor.cursor_col()), (0, 3));
         assert_eq!((outcome.damage_start(), outcome.damage_end()), (0, 1));
-        assert_eq!(outcome.effects(), "[]");
+        assert_eq!(
+            effect_kinds(&outcome),
+            ["event", "event", "event"],
+            "the modes it went through and the change it closed with"
+        );
     }
 
     #[test]
@@ -359,7 +370,47 @@ mod tests {
         assert_eq!(editor.command_line().as_deref(), Some(":w note"));
 
         let outcome = editor.handle_keys("<CR>").expect("keys should parse");
-        assert_eq!(outcome.effects(), r#"[{"kind":"save","path":"note"}]"#);
+        let effects: serde_json::Value =
+            serde_json::from_str(&outcome.effects()).expect("effects should be JSON");
+        assert_eq!(
+            effects[0],
+            serde_json::json!({ "kind": "event", "name": "buffer-write", "payload": "" }),
+            "the write is announced in front of the save it belongs to"
+        );
+        assert_eq!(
+            effects[1],
+            serde_json::json!({ "kind": "save", "path": "note" })
+        );
         assert_eq!(editor.command_line(), None);
+    }
+
+    #[test]
+    fn a_mode_change_carries_the_two_modes_as_the_payload_a_plugin_is_given() {
+        let mut editor = WimEditor::new("alpha");
+        let outcome = editor.handle_keys("i").expect("keys should parse");
+        let effects: serde_json::Value =
+            serde_json::from_str(&outcome.effects()).expect("effects should be JSON");
+        assert_eq!(
+            effects[0],
+            serde_json::json!({
+                "kind": "event",
+                "name": "mode-changed",
+                // A string rather than an object: it crosses to a plugin as the string the
+                // ABI carries a payload in.
+                "payload": r#"{"from":"NORMAL","to":"INSERT"}"#,
+            })
+        );
+    }
+
+    /// The `kind` of each effect of `outcome`, which is what a host switches on.
+    fn effect_kinds(outcome: &KeyOutcome) -> Vec<String> {
+        let effects: serde_json::Value =
+            serde_json::from_str(&outcome.effects()).expect("effects should be JSON");
+        effects
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|effect| effect["kind"].as_str().expect("a kind").to_owned())
+            .collect()
     }
 }

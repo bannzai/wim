@@ -11,8 +11,12 @@ component としてビルドされる。同じ .wasm がブラウザでもネイ
 | interface | 役割 |
 | --- | --- |
 | `commands` | 名前付きコマンドを公開し、ホストが Ex コマンドとして呼ぶ |
-| `events` | ホストが発火したイベント (`buffer-write` 等) を受ける |
+| `events` | ホストが発火したイベントを受ける。名前は `documents/CONFIG.md` の一覧 (`buffer-write` 等) |
 | `ui` | HTML 文字列を返し、ホストがパネルとして表示する (Markdown Preview の土台) |
+
+`events` に配送されるのは、プラグインが `subscriptions` で挙げたイベントだけ。どのイベントを
+どのハンドラに束ねるかは wim.jsonc の autocmd がホスト側で決めるため、プラグインが購読して
+いないイベントに束ねた autocmd は、発火しない設定としてホストが弾く (`documents/CONFIG.md`)。
 
 型だけを持つ 4 つ目の interface `buffer` が、この 3 つが受け渡すバッファのスナップショットと
 編集結果を定義する。ホストの状態を指すハンドルは渡さず、呼び出しごとにテキストを値で渡して
