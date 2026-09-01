@@ -98,10 +98,22 @@ async function openThroughDaemon(page, daemon, path) {
   await page.click("#daemon-form button[type=submit]");
 }
 
-/** Types `wim ` in front of the first line, which is an edit the file on disk does not have. */
-async function editFirstLine(page) {
+/** Types `text` where the cursor is and goes back to Normal mode. */
+async function insert(page, text) {
   await page.keyboard.press("i");
-  await page.keyboard.type("wim ");
+  await page.keyboard.type(text);
+  await page.keyboard.press("Escape");
+}
+
+/** Types `wim ` in front of the first line, which is an edit the file on disk does not have. */
+function editFirstLine(page) {
+  return insert(page, "wim ");
+}
+
+/** Opens a line under the cursor holding `text`, which is the edit that adds a line separator. */
+async function openLineBelow(page, text) {
+  await page.keyboard.press("o");
+  await page.keyboard.type(text);
   await page.keyboard.press("Escape");
 }
 
@@ -117,26 +129,64 @@ async function write(page, argument = "") {
  *
  * The handle is what the File System Access API hands over: a name, the file to read, and a
  * writable stream to put the buffer back through. What the demo wrote is left in `window.wimFile`
- * for the test to read.
+ * for the test to read: `written` is the text of the last write to have finished, and `writes`
+ * holds every one of them in the order they landed on the file.
+ *
+ * `text` is what the file holds, as a string for a UTF-8 one and as the bytes themselves for a
+ * file that is not.
+ *
+ * A writable puts its text on the file when it is closed rather than when it is written, which is
+ * what the API's siloed streams do, so a run can hold one open and see what a second save does
+ * while the first has not landed. `gateFirstWrite` holds the first one until the test releases it
+ * with `window.wimReleaseWrite()`, and `gatePick` holds the pick itself until
+ * `window.wimReleasePick()`, which is how an open is left in the air while another starts.
  */
-async function stubPicker(page, name, text) {
+async function stubPicker(page, name, text, { gateFirstWrite = false, gatePick = false } = {}) {
   await page.addInitScript(
-    ([pickedName, pickedText]) => {
-      window.wimFile = { name: pickedName, text: pickedText, written: null };
+    ([pickedName, pickedText, holdFirstWrite, holdPick]) => {
+      window.wimFile = { name: pickedName, text: pickedText, written: null, writes: [] };
+      const gate = (hold) => {
+        if (!hold) {
+          return { wait: Promise.resolve(), release: () => {} };
+        }
+        let release;
+        return { wait: new Promise((resolve) => (release = resolve)), release: () => release() };
+      };
+      const pick = gate(holdPick);
+      const firstWrite = gate(holdFirstWrite);
+      window.wimReleasePick = pick.release;
+      window.wimReleaseWrite = firstWrite.release;
+      let writables = 0;
       window.showOpenFilePicker = async () => [
         {
           name: pickedName,
-          getFile: async () => new File([window.wimFile.text], pickedName),
-          createWritable: async () => ({
-            write: async (data) => {
-              window.wimFile.written = data;
-            },
-            close: async () => {},
-          }),
+          getFile: async () => {
+            await pick.wait;
+            const content = window.wimFile.text;
+            return new File(
+              [typeof content === "string" ? content : new Uint8Array(content)],
+              pickedName,
+            );
+          },
+          createWritable: async () => {
+            const held = writables === 0 ? firstWrite.wait : Promise.resolve();
+            writables += 1;
+            let pending = null;
+            return {
+              write: async (data) => {
+                pending = data;
+              },
+              close: async () => {
+                await held;
+                window.wimFile.writes.push(pending);
+                window.wimFile.written = pending;
+              },
+            };
+          },
         },
       ];
     },
-    [name, text],
+    [name, text, gateFirstWrite, gatePick],
   );
 }
 
@@ -206,6 +256,52 @@ test.describe("through a daemon", () => {
     await expect(statusOf(page)).toContainText("開けません");
   });
 
+  test("saves a CRLF file back with the line endings it was opened with", async ({ page }) => {
+    await writeFile(join(root, "crlf.md"), "hello\r\nworld\r\n");
+    await openDemo(page);
+
+    await openThroughDaemon(page, daemon, "crlf.md");
+
+    await expect(statusOf(page)).toHaveText("crlf.md を開きました");
+    // The core edits LF text, so the carriage returns are not in the buffer to be edited around.
+    expect(await page.evaluate(() => window.wimDemo.state().lines)).toEqual([
+      "hello",
+      "world",
+      "",
+    ]);
+
+    await openLineBelow(page, "added");
+    await write(page);
+
+    await expect(statusOf(page)).toHaveText("crlf.md を保存しました");
+    // The line the edit added ends the way the ones the file came with do, rather than leaving
+    // the file holding both endings.
+    expect(await readFile(join(root, "crlf.md"), "utf8")).toBe("hello\r\nadded\r\nworld\r\n");
+  });
+
+  test("ignores a picked file that arrives after a newer daemon open", async ({ page }) => {
+    await writeFile(join(root, "newer.md"), "newer\n");
+    await stubPicker(page, "stale.md", "stale\n", { gatePick: true });
+    await openDemo(page);
+
+    // The pick is held, so this open is still in the air when the daemon one is asked for.
+    await page.click("#local-open");
+    await openThroughDaemon(page, daemon, "newer.md");
+    await expect(statusOf(page)).toHaveText("newer.md を開きました");
+
+    await page.evaluate(() => window.wimReleasePick());
+
+    // The older ask finishing last leaves nothing behind: the buffer, what is reported and the
+    // connection `:w` writes over all stay the ones the newer open put there.
+    expect(await page.evaluate(() => window.wimDemo.state().lines[0])).toBe("newer");
+    await editFirstLine(page);
+    await write(page);
+
+    await expect(statusOf(page)).toHaveText("newer.md を保存しました");
+    expect(await readFile(join(root, "newer.md"), "utf8")).toBe("wim newer\n");
+    expect(await page.evaluate(() => window.wimFile.written)).toBeNull();
+  });
+
   test("leaves the keys typed into the file controls to them", async ({ page }) => {
     await openDemo(page);
     const before = await page.evaluate(() => window.wimDemo.state().text);
@@ -251,6 +347,68 @@ test.describe("through the browser's own picker", () => {
 
     await expect(statusOf(page)).toHaveText("ローカルファイルでは :w にパスを指定できません");
     expect(await page.evaluate(() => window.wimFile.written)).toBeNull();
+  });
+
+  test("refuses a picked file that is not UTF-8", async ({ page }) => {
+    // 「あ」 in Shift-JIS, which is not a UTF-8 sequence: 0x82 starts none and 0xa0 continues none.
+    await stubPicker(page, "sjis.txt", [0x82, 0xa0, 0x0a]);
+    await openDemo(page);
+    const before = await page.evaluate(() => window.wimDemo.state().text);
+
+    await page.click("#local-open");
+
+    await expect(statusOf(page)).toHaveText("UTF-8 ではないため開けません");
+    expect(await page.evaluate(() => window.wimDemo.state().text)).toBe(before);
+
+    // Nothing was opened, so a `:w` has no file to put a lossily decoded buffer back on.
+    await page.click("h1");
+    await write(page);
+    await expect(statusOf(page)).toHaveText("開いているファイルがありません");
+    expect(await page.evaluate(() => window.wimFile.written)).toBeNull();
+  });
+
+  test("saves a CRLF file back with the line endings it was opened with", async ({ page }) => {
+    await stubPicker(page, "crlf.md", "hello\r\nworld\r\n");
+    await openDemo(page);
+
+    await page.click("#local-open");
+
+    await expect(statusOf(page)).toHaveText("crlf.md を開きました");
+    expect(await page.evaluate(() => window.wimDemo.state().lines)).toEqual([
+      "hello",
+      "world",
+      "",
+    ]);
+
+    await openLineBelow(page, "added");
+    await write(page);
+
+    await expect(statusOf(page)).toHaveText("crlf.md を保存しました");
+    expect(await page.evaluate(() => window.wimFile.written)).toBe(
+      "hello\r\nadded\r\nworld\r\n",
+    );
+  });
+
+  test("puts two saves on the file in the order they were typed", async ({ page }) => {
+    await stubPicker(page, "local.md", "hello\n", { gateFirstWrite: true });
+    await openDemo(page);
+    await page.click("#local-open");
+    await expect(statusOf(page)).toHaveText("local.md を開きました");
+
+    await insert(page, "A");
+    await write(page);
+    await insert(page, "B");
+    await write(page);
+
+    // The first save is held open, and the second one waits for it rather than going around it.
+    expect(await page.evaluate(() => window.wimFile.writes)).toEqual([]);
+
+    await page.evaluate(() => window.wimReleaseWrite());
+
+    await expect
+      .poll(() => page.evaluate(() => window.wimFile.writes))
+      .toEqual(["Ahello\n", "BAhello\n"]);
+    await expect(statusOf(page)).toHaveText("local.md を保存しました");
   });
 
   test("is offered only by a browser that has the API", async ({ page }) => {
