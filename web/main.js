@@ -107,12 +107,34 @@ let composition = "";
 /**
  * Where the buffer came from and where `:w` writes it back, `null` until a file is opened.
  *
- * `{ kind: "daemon", client, path }` for a file a daemon serves, `{ kind: "local", handle, name }`
- * for one the browser opened through the File System Access API. The two differ in more than
- * where the bytes go: a daemon takes any path under the directory it serves, while the browser
- * hands over the one file that was picked and no way of naming another.
+ * `{ kind: "daemon", client, path, newline }` for a file a daemon serves,
+ * `{ kind: "local", handle, name, newline }` for one the browser opened through the File System
+ * Access API. The two differ in more than where the bytes go: a daemon takes any path under the
+ * directory it serves, while the browser hands over the one file that was picked and no way of
+ * naming another.
  */
 let openFile = null;
+
+/**
+ * How many opens have been asked for, which is what tells a completion whether it is still the one
+ * being waited for. An open counts from the point it names a file: the daemon form names one when
+ * it is submitted, while the browser's picker does not until it hands one over.
+ *
+ * Neither way of opening a file answers within the click that asked for it, and nothing stops a
+ * second one from being started while the first is still in the air. Whichever finishes last
+ * would otherwise become the open file whatever order they were asked for in, and a stale one
+ * finishing after a newer one would close the connection the newer file is read and written over.
+ */
+let openGeneration = 0;
+
+/**
+ * The save in flight, which the next one waits for.
+ *
+ * A writable stream per save is a silo of its own: two of them opened over one file may close in
+ * the order they finish rather than the order they were started, and the earlier buffer would
+ * land on the file after the later one. Chaining them keeps the last `:w` the last write.
+ */
+let writing = Promise.resolve();
 
 /** Glyphs baked at the current scale and cell size, keyed by the colour they were baked in. */
 const atlas = {
@@ -232,12 +254,49 @@ function loadText(text) {
   syncImeFocus();
 }
 
-/** Lets go of whatever is open, closing the connection a daemon's file was read over. */
+/**
+ * The line separator a file opened as `text` is written back with.
+ *
+ * The core edits LF text, so a CRLF file is normalized on the way in and restored on the way out,
+ * which is what the `vimacro` host does with the same core. A file holding both endings counts as
+ * CRLF there and here, so a save leaves one ending rather than the mixture it was opened with.
+ */
+function newlineOf(text) {
+  return text.includes("\r\n") ? "\r\n" : "\n";
+}
+
+/** `text` with its line endings back as `newline`, which is how the file it came from reads. */
+function withNewline(text, newline) {
+  return newline === "\r\n" ? text.replaceAll("\n", "\r\n") : text;
+}
+
+/**
+ * Lets go of whatever is open, closing the connection a daemon's file was read over once the
+ * saves already queued for it have gone out.
+ *
+ * A `:w` takes its snapshot when it is typed and then waits its turn on `writing`, so a save
+ * still queued when a file is let go belongs to that file and is written over its connection.
+ * Closing where this stands would leave those saves with a socket that is already going away and
+ * the daemon would never hear the last of the edits, so the close goes on the end of the same
+ * chain instead — after the writes it must not overtake, and before nothing.
+ *
+ * The open that let go does not wait for that. The file it is opening is reached over a
+ * connection of its own and nothing it does depends on the old one being down, while waiting
+ * would hold a new file behind a save the daemon is slow to answer. Saves typed over the new file
+ * queue behind the close, which is what the one chain already did for saves over two files.
+ */
 function closeOpenFile() {
-  if (openFile !== null && openFile.kind === "daemon") {
-    openFile.client.close();
+  if (openFile === null) {
+    return;
   }
+  const closing = openFile;
   openFile = null;
+  if (closing.kind !== "daemon") {
+    return;
+  }
+  // `writeOut` reports what it cannot write rather than throwing, so the chain this is put on
+  // stays fulfilled and the close is reached whatever the saves before it did.
+  writing = writing.then(() => closing.client.close());
 }
 
 /**
@@ -262,17 +321,28 @@ function focusEditor() {
  * The core does no file IO of its own — it hands back the request and the host carries it out
  * (`documents/adr/0001-daemon-fs-provider.md`) — so this is where the demo's two ways of reaching
  * a file are told apart.
+ *
+ * The buffer is taken here and the writing waits for the save before it, so that saves land in
+ * the order they were typed and each one puts the text `:w` was typed over on the file.
  */
-async function save(path) {
+function save(path) {
   if (openFile === null) {
     report("開いているファイルがありません");
     return;
   }
-  const text = editor.text();
+  // The buffer is read here rather than in the write itself, so that a `:w` writes the text that
+  // was on screen when it was typed even when it waits for an earlier save to finish first.
+  const file = openFile;
+  const text = withNewline(editor.text(), file.newline);
+  writing = writing.then(() => writeOut(file, path, text));
+}
+
+/** Puts `text` on `file`, to `path` when the `:w` that asked for it named one. */
+async function writeOut(file, path, text) {
   try {
-    if (openFile.kind === "daemon") {
-      const destination = path ?? openFile.path;
-      await openFile.client.write(destination, text);
+    if (file.kind === "daemon") {
+      const destination = path ?? file.path;
+      await file.client.write(destination, text);
       report(`${destination} を保存しました`);
       return;
     }
@@ -283,10 +353,10 @@ async function save(path) {
       report("ローカルファイルでは :w にパスを指定できません");
       return;
     }
-    const writable = await openFile.handle.createWritable();
+    const writable = await file.handle.createWritable();
     await writable.write(text);
     await writable.close();
-    report(`${openFile.name} を保存しました`);
+    report(`${file.name} を保存しました`);
   } catch (error) {
     report(`保存できません: ${error.message}`);
   }
@@ -294,13 +364,22 @@ async function save(path) {
 
 /** Opens the file the daemon form names, and keeps the connection for the saves that follow. */
 async function openFromDaemon() {
+  const generation = (openGeneration += 1);
   const path = daemonPath.value.trim();
   report("デーモンに接続しています");
   let client;
   try {
     client = await connect(daemonAddress.value, daemonToken.value);
   } catch (error) {
-    report(`接続できません: ${error.message}`);
+    if (generation === openGeneration) {
+      report(`接続できません: ${error.message}`);
+    }
+    return;
+  }
+  if (generation !== openGeneration) {
+    // Another open was asked for while this one was connecting, and it is the one being waited
+    // for: this connection has nothing left to read for and is dropped where it stands.
+    client.close();
     return;
   }
   let content;
@@ -308,41 +387,69 @@ async function openFromDaemon() {
     content = await client.read(path);
   } catch (error) {
     client.close();
-    report(`開けません: ${error.message}`);
+    if (generation === openGeneration) {
+      report(`開けません: ${error.message}`);
+    }
+    return;
+  }
+  if (generation !== openGeneration) {
+    client.close();
     return;
   }
   // The connection the file was read over is the one it is written back over, so a save reaches
   // the daemon that has the file rather than whatever the form says by then.
   closeOpenFile();
-  openFile = { kind: "daemon", client, path };
-  loadText(content);
+  openFile = { kind: "daemon", client, path, newline: newlineOf(content) };
+  loadText(content.replaceAll("\r\n", "\n"));
   focusEditor();
   report(`${path} を開きました`);
 }
 
 /** Opens a file the browser hands over, which is the one it will let the page write back. */
 async function openLocalFile() {
+  // Nothing is being opened until the picker hands a file over: it is the browser's own window
+  // and it may be closed again without choosing anything. Taking a generation before it answers
+  // would make that closing count as a newer open and throw away the one already in the air —
+  // which would leave the file that was asked for unopened and its report the last thing said.
+  const started = openGeneration;
   let handle;
   try {
     [handle] = await window.showOpenFilePicker();
   } catch (error) {
     // Closing the picker without choosing anything throws, and is not a failure to report: it
     // is someone deciding not to open a file after all.
-    if (error.name !== "AbortError") {
+    if (error.name !== "AbortError" && started === openGeneration) {
       report(`開けません: ${error.message}`);
     }
     return;
   }
+  // A file has been picked, so this is an open now and the newest one: what was in the air before
+  // it, picked or served, is no longer what is being waited for.
+  const generation = (openGeneration += 1);
   let text;
   try {
-    text = await (await handle.getFile()).text();
+    const bytes = await (await handle.getFile()).arrayBuffer();
+    // The core edits text, and the daemon refuses a file that is not UTF-8 for that reason. A
+    // lossy decode here would put replacement characters in the buffer and a `:w` would write
+    // them over the bytes they stand for, so a file that does not decode is not opened at all.
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch (error) {
-    report(`開けません: ${error.message}`);
+    if (generation !== openGeneration) {
+      return;
+    }
+    report(
+      error instanceof TypeError
+        ? "UTF-8 ではないため開けません"
+        : `開けません: ${error.message}`,
+    );
+    return;
+  }
+  if (generation !== openGeneration) {
     return;
   }
   closeOpenFile();
-  openFile = { kind: "local", handle, name: handle.name };
-  loadText(text);
+  openFile = { kind: "local", handle, name: handle.name, newline: newlineOf(text) };
+  loadText(text.replaceAll("\r\n", "\n"));
   focusEditor();
   report(`${handle.name} を開きました`);
 }

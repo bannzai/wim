@@ -165,7 +165,9 @@
       <section id="file-access">
         <p>
           ファイルを開くと <code>:w</code> で書き戻せます。デーモン経由で開くには手元で
-          <code>wim serve --root .</code> を実行し、表示されたアドレスとトークンを入れてください。ローカルファイルは
+          <code>wim serve --root .</code> を実行し、表示されたアドレスとトークンを入れてください。デーモンへの接続は
+          Chrome / Edge / Firefox で行ってください。これらは 127.0.0.1 を安全な接続元として扱うため https:
+          のページからでも <code>ws://127.0.0.1</code> に接続できますが、Safari はこれを許可しません。ローカルファイルは
           File System Access API 対応ブラウザ (Chrome / Edge) でのみ開けます。
         </p>
         <form id="daemon-form">
