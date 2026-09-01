@@ -3,5 +3,6 @@
 /tmp
 /web/node_modules
 /web/pkg
+/web/plugins
 /web/playwright-report
 /web/test-results

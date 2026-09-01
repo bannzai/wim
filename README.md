@@ -89,12 +89,25 @@ rustup target add wasm32-unknown-unknown
 make build-plugins
 ```
 
-ビルドした component は `crates/wim-plugin-host` が wasmtime でロードします。プラグインには WASI を一切渡さないため、ファイル IO・ネットワーク・時刻に触れる component はロード時点で拒否されます。エディタに組み込まずに動かすには `wim plugin run` を使います (Ex コマンドへの配線は Phase 4-4)。
+ビルドした component は `crates/wim-plugin-host` が wasmtime でロードします。プラグインには WASI を一切渡さないため、ファイル IO・ネットワーク・時刻に触れる component はロード時点で拒否されます。エディタに組み込まずに動かすには `wim plugin run` を使います (ネイティブエディタの Ex コマンドへの配線は Phase 4-4)。
 
 ```sh
 echo 'hello wim' | cargo run -p wim -- plugin run plugins/target/wasm32-unknown-unknown/release/hello_wim.component.wasm upcase
 # => HELLO WIM
 ```
+
+### ブラウザで動かす
+
+同じ component をブラウザデモでも動かせます。[jco](https://github.com/bytecodealliance/jco) が component を ES module へ transpile し、デモがそれを import してプラグインのコマンドを `:upcase` のような Ex コマンドとして実行します。transpile 生成物は `.wasm` から機械生成されるためコミットせず、`make build-web-plugins` が毎回作り直します (`web/plugins/` は gitignore)。jco のバージョンは `web/package.json` で固定します。
+
+```sh
+make build-web-plugins
+make web  # http://127.0.0.1:4173/ で :upcase が使えます
+```
+
+ブラウザ側のサンドボックスとバージョン検査はネイティブと同じ形です。world が import する `wim:plugin/buffer` は型だけの interface なので jco の出力は何も import せず、WASI シムも入りません (`scripts/transpile-plugins.sh` が生成物を検査します)。ロード時には export 名が持つ ABI バージョン (`wim:plugin/commands@0.1.0`) を `wit/plugin.wit` の package バージョンと突き合わせ、完全に一致しない module を拒否します。
+
+「同一の .wasm がネイティブとブラウザの両方で動く」ことは E2E が機械的に確かめます。`web/e2e/plugin.spec.js` が同じ component をネイティブホスト (`wim plugin run`) とブラウザの両方に同じ入力で通し、返ってきたバッファとエラーメッセージが一致することを検証します。
 
 ## 開発コマンド
 
@@ -105,7 +118,7 @@ cargo test --workspace
 make check-plugins  # plugins/ は別 workspace のため --workspace に入りません
 ```
 
-wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`)、プラグインの component ビルド (`make build-plugins`)、ビルドした component を実際にロードするホストのテスト (`make test-plugin-host`)、デモページに対する Playwright の E2E (`make e2e`) は CI が行います。
+wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`)、プラグインの component ビルド (`make build-plugins`)、ビルドした component を実際にロードするホストのテスト (`make test-plugin-host`)、その component を transpile したブラウザホストを含むデモページの Playwright E2E (`make e2e`) は CI が行います。
 
 ## License
 

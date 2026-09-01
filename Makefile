@@ -3,22 +3,32 @@ PLUGINS := plugins/Cargo.toml
 HELLO_WIM_CORE := plugins/target/wasm32-unknown-unknown/release/hello_wim.wasm
 HELLO_WIM := plugins/target/wasm32-unknown-unknown/release/hello_wim.component.wasm
 
-.PHONY: build-web web e2e install-wasm-bindgen vendor-tree-sitter build-plugins check-plugins test-plugin-host
+.PHONY: build-web build-web-plugins web e2e install-wasm-bindgen vendor-tree-sitter build-plugins check-plugins test-plugin-host
 
 # Builds the wasm module and the JS glue the demo page imports.
 build-web:
 	cargo build -p wim-wasm --target wasm32-unknown-unknown --release
 	wasm-bindgen $(WASM) --out-dir web/pkg --target web
 
+# Transpiles the sample plugin into the ES module the demo imports, which is the browser's half of
+# what `make test-plugin-host` does natively over the same component. What jco writes is generated
+# on every build and gitignored, so this runs wherever the demo is built rather than being
+# committed the way the tree-sitter runtime is.
+build-web-plugins: build-plugins
+	cd web && npm ci
+	bash scripts/transpile-plugins.sh hello-wim="$(CURDIR)/$(HELLO_WIM)"
+
 # Builds the demo and serves it at http://127.0.0.1:4173/.
 web: build-web
 	node web/serve.mjs
 
 # Runs the browser E2E against a freshly built demo. The daemon is built too: the file-access
-# run starts it over a directory of its own and drives the demo against it.
-e2e: build-web
+# run starts it over a directory of its own and drives the demo against it, and the plugin run
+# calls it over the very component the demo was given a transpile of.
+e2e: build-web build-web-plugins
 	cargo build -p wim
-	cd web && npm ci && npx playwright install --with-deps chromium && npx playwright test
+	cd web && npx playwright install --with-deps chromium && \
+		WIM_PLUGIN_WASM="$(CURDIR)/$(HELLO_WIM)" npx playwright test
 
 # Refetches the tree-sitter runtime and the grammars the demo highlights with. What it installs is
 # committed under web/vendor/, so this is only run to move a pinned version.
