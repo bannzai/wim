@@ -1,0 +1,12 @@
+name = ":g/pattern/norm runs over the lines it marked, not the ones the keys wrote"
+input = '''
+a
+b
+c
+'''
+keys = ":g/^/norm ddox<lt>Esc><CR>"
+expected = '''
+x
+x
+x
+'''

@@ -1,0 +1,12 @@
+name = ":norm over a range runs over the lines the range named, not the ones the keys wrote"
+input = '''
+a
+b
+c
+'''
+keys = ":%norm ddox<lt>Esc><CR>"
+expected = '''
+x
+x
+x
+'''
