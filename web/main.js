@@ -85,6 +85,13 @@ const atlas = {
 };
 
 /**
+ * The Ctrl combinations the core's grammar has a command for, lower-cased as `parse_keys`
+ * reads them. Every other one is left to the browser, so that Ctrl+F, Ctrl+P and the rest go
+ * on working; add to this when the grammar grows a Ctrl key.
+ */
+const CORE_CTRL_KEYS = new Set(["r"]);
+
+/**
  * The key notation `parse_keys` reads for `event`, or `null` for a key the core has no name
  * for — a bare modifier, an arrow, a browser shortcut — which the browser keeps.
  */
@@ -101,16 +108,34 @@ function keyNotation(event) {
     default:
       break;
   }
-  // Anything longer than one character is a named key the core does not know.
-  if (event.key.length !== 1 || event.metaKey || event.altKey) {
+  // A key that is part of a dead-key or IME composition is the browser's until the composed
+  // character is done; taking it here would type the raw key instead of what is being
+  // composed. Proper composition input, IME included, is issue #36's.
+  if (event.isComposing) {
     return null;
   }
-  if (event.ctrlKey) {
-    // The Ctrl keys the core reads are letters, and `<C-x>` is the only shape `parse_keys`
-    // accepts, so a Ctrl combination on anything else is left to the browser.
-    return /^[a-z]$/i.test(event.key) ? `<C-${event.key}>` : null;
+  // Anything longer than one character is a named key the core does not know.
+  if (event.key.length !== 1 || event.metaKey) {
+    return null;
   }
-  return event.key === "<" ? "<lt>" : event.key;
+  // `<` is the one character the notation spells for itself, so it goes in as its escape.
+  const literal = event.key === "<" ? "<lt>" : event.key;
+  // A key typed with Alt involved is either composed text or a shortcut, and the modifier
+  // flags alone cannot tell the two apart: Firefox on Windows raises the AltGraph state for
+  // plain Ctrl+Alt, and Alt+F is the browser's own menu shortcut. What does tell them apart
+  // is the character itself — AltGr and macOS Option exist to type what a bare key cannot
+  // (`@` on a German layout, `€` on Option), so a composed key never reads as a plain ASCII
+  // letter, digit or space, while a shortcut's key is exactly that: Alt+F is a menu, Alt+Space
+  // the window's system menu, and an AltGr space arrives as a distinct character (U+00A0).
+  if (event.altKey || event.getModifierState("AltGraph")) {
+    return /^[a-zA-Z0-9 ]$/.test(event.key) ? null : literal;
+  }
+  if (event.ctrlKey) {
+    return CORE_CTRL_KEYS.has(event.key.toLowerCase())
+      ? `<C-${event.key.toLowerCase()}>`
+      : null;
+  }
+  return literal;
 }
 
 function handleKeys(keys) {
@@ -289,18 +314,16 @@ function scrolledTop(visibleRows) {
 }
 
 /**
- * The lines the last batch of keys left needing a redraw: the ones whose text changed, the
- * rows a deletion left past the end of the buffer, and the rows the cursor left and landed on.
+ * The lines the last batch of keys left needing a redraw: the damage the editor reported, plus
+ * the rows the cursor left and landed on.
+ *
+ * The damage already counts the rows a deletion emptied, so a row that has fallen past the end
+ * of the buffer is in it and gets the end-of-buffer filler drawn over the text it used to hold.
  */
 function damagedRows() {
   const rows = new Set([view.cursorLine, editor.cursor_line()]);
-  if (lastOutcome.damageEnd > lastOutcome.damageStart) {
-    // Lines that went away leave rows that used to hold text and now hold the end-of-buffer
-    // filler, which the damage range itself stops short of.
-    const end = Math.max(lastOutcome.damageEnd, view.lineCount);
-    for (let line = lastOutcome.damageStart; line < end; line += 1) {
-      rows.add(line);
-    }
+  for (let line = lastOutcome.damageStart; line < lastOutcome.damageEnd; line += 1) {
+    rows.add(line);
   }
   return rows;
 }

@@ -59,6 +59,9 @@ impl Serve {
         };
         let addr = next("listening on ");
         let token = next("token: ");
+        // The root line is read too, so that the pipe is not closed while the daemon is still
+        // in the middle of writing it.
+        next("root: ");
         Self {
             child,
             directory,

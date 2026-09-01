@@ -37,6 +37,10 @@ impl KeyOutcome {
     }
 
     /// One past the last line the keys changed.
+    ///
+    /// A deletion counts the rows it emptied, so the range runs past the end of the buffer it
+    /// left behind: a host that redraws every row in it, drawing the end-of-buffer filler for
+    /// the ones the buffer no longer reaches, is left with nothing of the old text on screen.
     #[wasm_bindgen(getter)]
     pub fn damage_end(&self) -> usize {
         self.damage_end
@@ -127,7 +131,9 @@ impl WimEditor {
 /// The half-open range of lines that differ between `before` and `after`.
 ///
 /// A change that adds or removes a line shifts every line under it, so the range then runs to
-/// the end of the buffer rather than stopping at the last line whose text differs.
+/// the end of the buffer rather than stopping at the last line whose text differs. It is the
+/// longer of the two buffers that ends it: the rows a deletion emptied held text a moment ago
+/// and have to be drawn over, and stopping at `after` would leave the last of them behind.
 fn damaged_lines(before: &[String], after: &[String]) -> (usize, usize) {
     let start = before
         .iter()
@@ -135,7 +141,7 @@ fn damaged_lines(before: &[String], after: &[String]) -> (usize, usize) {
         .take_while(|(before, after)| before == after)
         .count();
     if before.len() != after.len() {
-        return (start, after.len());
+        return (start, before.len().max(after.len()));
     }
     let end = after.len()
         - after
@@ -253,12 +259,20 @@ mod tests {
     }
 
     #[test]
-    fn a_deleted_line_damages_everything_under_it() {
+    fn a_deleted_line_damages_everything_under_it_including_the_row_it_emptied() {
         assert_eq!(
             damaged_lines(
                 &lines(&["alpha", "bravo", "charlie"]),
                 &lines(&["alpha", "charlie"]),
             ),
+            (1, 3)
+        );
+    }
+
+    #[test]
+    fn deleting_the_last_line_damages_the_row_it_left_empty() {
+        assert_eq!(
+            damaged_lines(&lines(&["alpha", "bravo"]), &lines(&["alpha"])),
             (1, 2)
         );
     }
@@ -283,6 +297,15 @@ mod tests {
         assert_eq!(editor.line_count(), 3);
         assert_eq!(editor.line(1), "bravo");
         assert_eq!((outcome.damage_start(), outcome.damage_end()), (1, 3));
+    }
+
+    #[test]
+    fn deleting_the_last_line_damages_the_row_it_used_to_be_drawn_on() {
+        let mut editor = WimEditor::new("alpha\nbravo");
+        let outcome = editor.handle_keys("jdd").expect("keys should parse");
+        assert_eq!(editor.line_count(), 1);
+        // Not the empty range `(1, 1)` an unchanged buffer gives: row 1 still holds `bravo`.
+        assert_eq!((outcome.damage_start(), outcome.damage_end()), (1, 2));
     }
 
     #[test]
