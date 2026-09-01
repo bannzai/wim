@@ -31,12 +31,12 @@ install-wasm-bindgen:
 # Builds the sample plugin as a wasm component. wasm32-wasip2 links the component itself, so the
 # rustup target is the whole toolchain requirement.
 build-plugins:
-	cargo build --manifest-path $(PLUGINS) --target wasm32-wasip2 --release
+	cargo build --manifest-path $(PLUGINS) --target wasm32-wasip2 --release --locked
 	bash scripts/check-wasm-component.sh $(HELLO_WIM)
 
 # Checks the plugins on the host target, where the ABI bindings still compile even though the
 # cdylib cannot be linked. `--lib` is what keeps the test run off that link step.
 check-plugins:
 	cargo fmt --manifest-path $(PLUGINS) --all --check
-	cargo clippy --manifest-path $(PLUGINS) --all-targets -- -D warnings
-	cargo test --manifest-path $(PLUGINS) --lib
+	cargo clippy --manifest-path $(PLUGINS) --all-targets --locked -- -D warnings
+	cargo test --manifest-path $(PLUGINS) --lib --locked

@@ -25,9 +25,10 @@ component としてビルドされる。同じ .wasm がブラウザでもネイ
 ## バージョニング
 
 ABI のバージョンは wit の package バージョン (`wim:plugin@0.1.0`) そのもので、`wit/` 配下で
-1 つに揃える。1.0.0 に達するまでは minor が破壊的変更、patch が後方互換な追加を表し、ホストは
-自分がビルドされた時と major.minor が一致しない component を拒否する。判断の基準は
-`plugin.wit` 冒頭のコメントに書いてある。
+1 つに揃える。1.0.0 に達するまでは minor が ABI の変更 (export への関数追加を含む — 新しい
+ホストは古い component にその export が無いと instantiate できない)、patch が ABI に触れない
+変更を表し、ホストは自分がビルドされた時と major.minor が一致しない component を拒否する。
+判断の基準は `plugin.wit` 冒頭のコメントに書いてある。
 
 ## ビルド
 

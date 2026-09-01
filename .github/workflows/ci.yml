@@ -5,6 +5,10 @@ on:
   push:
     branches: [main]
 
+# Every job runs pull-request-controlled code, so none of them gets more than read access.
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

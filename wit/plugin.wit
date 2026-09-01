@@ -3,9 +3,10 @@
 //
 // バージョニング方針:
 //   - この package のバージョンが ABI のバージョンそのもので、wit/ 配下で 1 つに揃える。
-//   - 1.0.0 に達するまでは minor を破壊的変更に、patch を後方互換な追加に使う。関数・型の
-//     意味を変える、record からフィールドを削る、variant / enum からケースを削る変更は
-//     破壊的として minor を上げる。interface・関数の追加は patch で足りる。
+//   - 1.0.0 に達するまでは minor を ABI の変更に、patch を ABI に触れない変更 (コメント・
+//     ドキュメントの修正) に使う。export される interface への関数追加も minor である:
+//     新しいホストは古い component にその export が無いと instantiate できないため、
+//     「追加」もプラグイン側の再ビルドを要する破壊的変更になる。
 //   - ホストはロードする component の package バージョンを見て、自分がビルドされた時と
 //     major.minor が一致しないものは拒否する。
 package wim:plugin@0.1.0;
