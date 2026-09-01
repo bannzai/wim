@@ -22,6 +22,7 @@ expected_cursor = [0, 4]
 | `expected` | 必須 | キーを打った後のバッファ |
 | `expected_cursor` | 任意 | 打った後のカーソル `[line, col]`。省略するとカーソルを検証しない |
 | `expected_events` | 任意 | 打っている間にコアが報告したイベント名を報告順に並べたもの (`["mode-changed", "text-changed"]` 等)。省略するとイベントを検証しない |
+| `expected_effects` | 任意 | 打っている間にコアがホストへ依頼したこと (イベント以外の Effect) を依頼順に並べたもの。省略すると検証しない |
 
 ここにない名前のフィールドを書くとパースエラーになり、そのケースはファイル名付きで fail する。
 
@@ -49,6 +50,7 @@ alpha
 - ファイル名はケースの内容が分かる kebab-case にする (`motion-word-forward.toml`、`insert-open-line-below.toml`)。ランナーはファイル名順に実行する
 - 検証するのはバッファのテキストと、指定した場合のカーソル位置・イベント名の並びだけ。モード・レジスタ等はコア側のユニットテストで見る
 - イベント名は autocmd が購読する名前そのもの (`documents/CONFIG.md`)。`expected_events` はイベントだけを見るので、`:w` が返す `SaveRequested` のようなホストへの依頼は現れない
+- `expected_effects` の 1 行は「依頼の種類 + それが運ぶ値」で、文字列は前後の空白が見えるように `"` で囲む (`unknown-ex-command upcase "all"`、`error ":upcase takes no range"`、`save "out.txt"`、`quit true`)。イベントは `expected_events` で見るのでここには現れない
 - 改行は LF で書く。Windows のチェックアウトで CRLF になった場合はランナーが LF に正規化してから比較する
 
 ## 追加の手順
@@ -61,4 +63,4 @@ alpha
 
 ## いま入っていないもの
 
-レジスタの中身・モード・undo 履歴の深さのように、バッファのテキストとカーソル位置に現れない状態はこの形式では検証できない。それらはコア側のユニットテスト (`src/editor.rs` 等) で見る。`:w` `:q` が返す `Effect` の中身 (書き込み先のパス・`:q!` の force) も同様で、`src/editor.rs` のユニットテストで見る。イベントは名前と順序だけを `expected_events` で見て、ペイロード (`mode-changed` の遷移元・遷移先) はユニットテストで見る。
+レジスタの中身・モード・undo 履歴の深さのように、バッファのテキストとカーソル位置に現れない状態はこの形式では検証できない。それらはコア側のユニットテスト (`src/editor.rs` 等) で見る。イベントは名前と順序だけを `expected_events` で見て、ペイロード (`mode-changed` の遷移元・遷移先) はユニットテストで見る。

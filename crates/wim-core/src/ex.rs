@@ -7,7 +7,8 @@
 //! What is supported is Vim's shape rather than all of Vim: the range is `%`, `N`, `.`, `$`
 //! or `/pattern/`, optionally as a `first,last` pair, with no `+1` arithmetic and no marks;
 //! `:s` uses `/` as its delimiter, with `\/` for a literal one; and `:g` runs `d`, `s` or
-//! `norm` over the lines it marks.
+//! `norm` over the lines it marks. A name that is none of those is not an error here: it leaves
+//! as an [`Effect::UnknownExCommand`] for the host, which is where a plugin's commands live.
 //!
 //! The keys of `:norm` are read with [`parse_keys`], so a key that has no character of its own
 //! is written in that notation — `:norm A;<Esc>` ends the Insert session `A` opened. Those are
@@ -84,6 +85,13 @@ enum ExKind {
     Delete,
     /// A line with a range and no command, which moves the cursor there.
     Goto,
+    /// A name that is no command of the core's, which the host may have one for.
+    Unknown {
+        /// The name as it was typed.
+        name: String,
+        /// Everything after the name, kept as text for whatever command the host resolves.
+        args: String,
+    },
 }
 
 /// A `:` line, ready to run.
@@ -96,8 +104,6 @@ pub struct ExCommand {
 /// Why a `:` line could not be run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExError {
-    /// The command name is not one wim knows.
-    UnknownCommand(String),
     /// A command was typed without something it cannot run without.
     Incomplete(String),
     /// The range names lines the buffer cannot give.
@@ -116,7 +122,6 @@ pub enum ExError {
 impl fmt::Display for ExError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::UnknownCommand(name) => write!(f, "not an editor command: {name}"),
             Self::Incomplete(complaint) => f.write_str(complaint),
             Self::BadRange(complaint) => f.write_str(complaint),
             Self::BadPattern(error) => error.fmt(f),
@@ -214,6 +219,15 @@ fn run(editor: &mut Editor, command: &ExCommand) -> Result<Vec<Effect>, ExError>
             invert,
             command: over,
         } => global(editor, command.range.as_ref(), pattern, *invert, over),
+        // The lines a range names would be the core's to resolve and nothing carries them over,
+        // so a host's command is one that runs over the buffer it is handed and takes no range.
+        ExKind::Unknown { name, .. } if command.range.is_some() => {
+            Err(ExError::BadRange(format!(":{name} takes no range")))
+        }
+        ExKind::Unknown { name, args } => Ok(vec![Effect::UnknownExCommand {
+            name: name.clone(),
+            args: args.clone(),
+        }]),
     }
 }
 
@@ -478,10 +492,10 @@ fn parse_address(line: &str) -> Option<(Address, &str)> {
 
 fn parse_kind(rest: &str) -> Result<ExKind, ExError> {
     let name: String = rest.chars().take_while(char::is_ascii_alphabetic).collect();
-    let args = &rest[name.len()..];
-    let (force, args) = match args.strip_prefix('!') {
+    let typed = &rest[name.len()..];
+    let (force, args) = match typed.strip_prefix('!') {
         Some(args) => (true, args),
-        None => (false, args),
+        None => (false, typed),
     };
     match name.as_str() {
         "" => Ok(ExKind::Goto),
@@ -501,7 +515,13 @@ fn parse_kind(rest: &str) -> Result<ExKind, ExError> {
         "norm" | "normal" => Ok(ExKind::Normal {
             keys: args.strip_prefix(' ').unwrap_or(args).to_owned(),
         }),
-        _ => Err(ExError::UnknownCommand(name)),
+        // A name the core has none of is a command the host may have, and its arguments are
+        // whatever the host's command makes of them: the `!` is theirs as much as the rest, so
+        // what crosses is the line as it was typed less the one blank after the name.
+        _ => Ok(ExKind::Unknown {
+            name,
+            args: typed.strip_prefix(' ').unwrap_or(typed).to_owned(),
+        }),
     }
 }
 
@@ -587,6 +607,7 @@ impl ExCommand {
             ExKind::Normal { .. } => ":norm",
             ExKind::Delete => ":d",
             ExKind::Goto => "a line number",
+            ExKind::Unknown { .. } => "a command of the host's",
         }
     }
 }
@@ -809,10 +830,29 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_command_is_reported_by_name() {
+    fn a_name_the_core_has_no_command_for_keeps_what_was_typed_after_it() {
         assert_eq!(
-            parse("nope"),
-            Err(ExError::UnknownCommand("nope".to_owned()))
+            kind("nope"),
+            ExKind::Unknown {
+                name: "nope".to_owned(),
+                args: String::new()
+            }
+        );
+        assert_eq!(
+            kind("upcase  a b "),
+            ExKind::Unknown {
+                name: "upcase".to_owned(),
+                args: " a b ".to_owned()
+            },
+            "only the blank that separates the arguments from the name is dropped"
+        );
+        assert_eq!(
+            kind("upcase!"),
+            ExKind::Unknown {
+                name: "upcase".to_owned(),
+                args: "!".to_owned()
+            },
+            "the ! is the host's command to read, not a force the core takes off"
         );
     }
 }

@@ -308,6 +308,58 @@ fn a_plugin_is_not_given_an_event_it_does_not_subscribe_to() {
 }
 
 #[test]
+fn an_ex_line_runs_the_command_a_loaded_plugin_published() {
+    let Some(wasm) = hello_wim() else {
+        return;
+    };
+    // No autocmd is involved: the core hands the name it has no command for to the host, and the
+    // host finds `upcase` among what the loaded plugin published (`wit/plugin.wit`).
+    let workspace = Workspace::new("hello\n", r#"{"autocmds": []}"#);
+    let output = edit(
+        &workspace,
+        ":upcase<CR>:w<CR>",
+        &["--plugin", &declare(&wasm)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(workspace.text(), "HELLO\n");
+    assert_eq!(stdout(&output), ":upcase rewrote the buffer\n");
+}
+
+#[test]
+fn a_macro_replays_the_plugin_command_it_recorded() {
+    let Some(wasm) = hello_wim() else {
+        return;
+    };
+    // The keys of a replay never reach the host — they are typed inside the core — so a `:` line
+    // a macro holds runs only because the core asks for it through an effect of its own. The
+    // second run is over the buffer the first one left, which uppercased text survives unchanged.
+    let workspace = Workspace::new("hello\n", r#"{"autocmds": []}"#);
+    let output = edit(
+        &workspace,
+        "qa:upcase<CR>q@a:w<CR>",
+        &["--plugin", &declare(&wasm)],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(workspace.text(), "HELLO\n");
+    assert_eq!(
+        stdout(&output),
+        ":upcase rewrote the buffer\n:upcase left the buffer alone\n"
+    );
+}
+
+#[test]
+fn an_ex_line_naming_a_command_no_plugin_published_is_refused() {
+    let workspace = Workspace::new("hello\n", r#"{"autocmds": []}"#);
+    let output = edit(&workspace, ":upcase<CR>", &[]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("not an editor command: upcase"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn a_plugin_handler_that_was_never_loaded_is_refused() {
     let workspace = Workspace::new(
         "hello\n",

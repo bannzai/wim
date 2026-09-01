@@ -40,6 +40,11 @@ describes. A handler of kind 'plugin' names a plugin, and --plugin says which .w
 was loaded from; a plugin is only given the events it subscribes to, so one that subscribes to
 none of what it is bound to is refused before a key is typed.
 
+The commands a loaded plugin publishes are Ex commands of the run: ':upcase' runs the command of
+that name over the buffer and applies what it answers with, and what follows the name reaches it
+as arguments split on blanks. A name no loaded plugin published is refused the way any other
+command wim does not have is.
+
 The plugins run with nothing of this machine reachable from inside them: no files, no network, no
 clock.")]
 pub struct Edit {
@@ -239,9 +244,80 @@ impl Session {
                     self.dispatch(&Event::BufferWritePost);
                 }
                 Effect::QuitRequested { .. } => return Ok(Stop::Quit),
+                // A `:` line the core has no command for is one of the loaded plugins' to run.
+                // It ends the run the way a key the core refuses does when no plugin published
+                // the name or the one that did refuses the arguments: the line asked for
+                // something that did not happen.
+                Effect::UnknownExCommand { name, args } => match self.run_command(&name, &args) {
+                    Ok(done) => self.reports.push(format!(":{name} {done}")),
+                    Err(complaint) => {
+                        self.complaint = Some(complaint);
+                        return Ok(Stop::Failed);
+                    }
+                },
             }
         }
         Ok(Stop::Ran)
+    }
+
+    /// Runs the command a `:` line named at the plugin that published it, and applies the edit it
+    /// answers with.
+    ///
+    /// This is what makes the commands of a `--plugin` Ex commands of the run: the core hands
+    /// over the name and what was typed after it, and the arguments are split on blanks here
+    /// because that is what the ABI passes (`wit/plugin.wit`). A name no plugin published is
+    /// refused in the words the core refuses a command of its own with, so a typo reads the same
+    /// whether or not any plugin was loaded.
+    fn run_command(&mut self, name: &str, args: &str) -> Result<String, String> {
+        let buffer = self.snapshot();
+        let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
+        let Some(host) = self.command_host(name)? else {
+            return Err(format!("not an editor command: {name}"));
+        };
+        let edit = host
+            .run(name, &args, &buffer)
+            .map_err(|error| format!(":{name} failed: {error}"))?;
+        let (text, message) = plugin::apply(&buffer.text, edit)?;
+        if text != buffer.text {
+            // One change of the editor the run is holding, the way a handler's edit is applied,
+            // so that `u` walks back over what the command wrote.
+            self.editor.replace_text(&text);
+            return Ok("rewrote the buffer".to_owned());
+        }
+        Ok(message.unwrap_or_else(|| "left the buffer alone".to_owned()))
+    }
+
+    /// The loaded plugin that published `name`, `None` when none did.
+    ///
+    /// The plugins are asked in the order they are keyed, and the first that has the name gets
+    /// the command: two plugins publishing one name is a collision this host does not arbitrate.
+    fn command_host(&mut self, name: &str) -> Result<Option<&mut Host>, String> {
+        for (plugin, host) in &mut self.plugins {
+            let published = host
+                .list_commands()
+                .map_err(|error| format!("{plugin} cannot be asked for its commands: {error}"))?
+                .iter()
+                .any(|command| command.name == name);
+            if published {
+                return Ok(Some(host));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The buffer as a plugin is given it (`wit/plugin.wit`).
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            name: self.path.display().to_string(),
+            text: self.editor.text(),
+            cursor: Position {
+                line: self.editor.cursor().line as u32,
+                // The ABI counts a column in Unicode scalars while the core counts it in
+                // graphemes, and a cluster made of several scalars is where the two part
+                // company.
+                column: self.editor.buffer().scalar_col(self.editor.cursor()) as u32,
+            },
+        }
     }
 
     /// Runs every handler bound to `event`.
@@ -323,17 +399,7 @@ impl Session {
     /// The buffer crosses by value and the answer comes back by value, which is the whole of
     /// what the ABI lets a plugin touch: the edit is applied here, by the host.
     fn call(&mut self, event: &Event, plugin: &str) -> Result<String, String> {
-        let buffer = Snapshot {
-            name: self.path.display().to_string(),
-            text: self.editor.text(),
-            cursor: Position {
-                line: self.editor.cursor().line as u32,
-                // The ABI counts a column in Unicode scalars while the core counts it in
-                // graphemes, and a cluster made of several scalars is where the two part
-                // company (`wit/plugin.wit`).
-                column: self.editor.buffer().scalar_col(self.editor.cursor()) as u32,
-            },
-        };
+        let buffer = self.snapshot();
         let host = self
             .plugins
             .get_mut(plugin)
@@ -497,6 +563,22 @@ mod tests {
         assert!(session.failed);
         assert_eq!(session.reports.len(), 1, "{:?}", session.reports);
         assert!(session.reports[0].starts_with("text-changed keys failed:"));
+    }
+
+    #[test]
+    fn an_ex_line_no_plugin_published_a_command_for_is_refused_in_the_cores_words() {
+        // The core hands the name over instead of refusing it now that a plugin may have a
+        // command under it, so the wording a typo gets is this host's to keep.
+        let mut session = session("ab\n", Config::default());
+        let keys = parse_keys(":nope<CR>").expect("keys should parse");
+        assert_eq!(
+            session.feed(&keys).expect("the run should go through"),
+            Stop::Failed
+        );
+        assert_eq!(
+            session.complaint.as_deref(),
+            Some("not an editor command: nope")
+        );
     }
 
     #[test]

@@ -365,23 +365,6 @@ function handleKeys(keys) {
     pendingKeys.push(keys);
     return lastOutcome;
   }
-  const invocation = pluginInvocation(keys);
-  if (invocation !== null) {
-    // The core has no `:upcase`, and letting it read the line would answer with its own "not an
-    // editor command". `<Esc>` drops the line instead, leaving the editor where a command that
-    // ran would have left it — in Normal mode with the line gone.
-    editor.handle_keys("<Esc>");
-    lastOutcome = { damageStart: 0, damageEnd: 0, effects: [] };
-    runPlugin(invocation);
-    // A plugin may rewrite the whole buffer, and what it did is not in the core's damage.
-    draw({ full: true });
-    syncImeFocus();
-    // The buffer a panel is drawn from may be the one the command just rewrote, and no event
-    // carries that: an edit a command made raises none, and the panels of a handler's edit are
-    // redrawn by the dispatch that ran it.
-    refreshPanels();
-    return lastOutcome;
-  }
   const outcome = editor.handle_keys(keys);
   lastOutcome = {
     damageStart: outcome.damage_start,
@@ -426,7 +409,23 @@ function carryOut(effects) {
   // this batch of keys did is the one to report, so it is put back afterwards.
   const outcome = lastOutcome;
   let renderAfter = false;
+  // What a `:` line was refused with, which is the host's own doing and reaches the status line
+  // the way the core's errors do.
+  let refusal = null;
   for (const effect of effects) {
+    if (effect.kind === "unknown-ex-command") {
+      try {
+        runUnknownEx(effect);
+      } catch (error) {
+        refusal = { kind: "error", message: error.message };
+        continue;
+      }
+      // A plugin may rewrite the whole buffer, and what it did is not in the core's damage. Nor
+      // is it in the events: an edit a command made raises none, so the panels drawn from the
+      // buffer are refreshed from here rather than by a dispatch.
+      draw({ full: true });
+      refreshPanels();
+    }
     if (effect.kind === "event") {
       // A dispatch that ran handlers redrew the panels itself, from the buffer the handlers
       // finally left behind; only a `text-changed` nothing was bound to still needs its render.
@@ -445,6 +444,12 @@ function carryOut(effects) {
     refreshPanels();
   }
   lastOutcome = outcome;
+  if (refusal !== null) {
+    // The status line is drawn from what the batch of keys left behind, and this is the rest of
+    // what the line the core handed over came to: it named a command, and nothing here has one.
+    lastOutcome.effects.push(refusal);
+    draw();
+  }
 }
 
 /** Runs every autocmd bound to the event `name`, and redraws what they changed. */
@@ -508,10 +513,15 @@ function typeAtEditor(keys) {
     throw new Error(failed.message);
   }
   // The events these raise are the handler's own doing, and `inHandler` is what stops them from
-  // running it again; a `:w` inside a handler still writes.
+  // running it again; a `:w` inside a handler still writes, and a `:` line naming a plugin's
+  // command runs it — a handler reaches the same commands a typed line does, as it does natively
+  // (`crates/wim/src/edit.rs`).
   for (const effect of effects) {
     if (effect.kind === "save") {
       void save(effect.path ?? null);
+    }
+    if (effect.kind === "unknown-ex-command") {
+      runUnknownEx(effect);
     }
   }
 }
@@ -565,27 +575,21 @@ function reportAutocmd(message) {
 }
 
 /**
- * The plugin command the batch `keys` submits, `null` when it submits none.
+ * Runs the `:` line the core had no command for, which is where a plugin's commands are reached
+ * from (`crates/wim-core/src/effect.rs`).
  *
- * A plugin's command is taken before the core sees it rather than after: the core has no such
- * command and would answer with an error whose message carries the name but not the arguments
- * that followed it, and `:upcase x` has to reach the plugin as an argument for the plugin to
- * refuse it the way it does natively.
- *
- * A command line is only ever submitted by one `<CR>` on its own here — a key press is handled as
- * it arrives, and what an IME confirms goes in as text — so that is the one batch to look at.
+ * The core hands over the name and the rest of the line as it was typed, so what counts as an
+ * argument is settled here: the ABI passes them split on blanks, and a line with nothing after
+ * the name passes none (`wit/plugin.wit`). A name no loaded plugin published is the host's to
+ * refuse, in the words the core refuses a command of its own with, and that is what this throws.
  */
-function pluginInvocation(keys) {
-  if (keys !== "<CR>") {
-    return null;
-  }
-  const line = editor.command_line();
-  if (line === undefined || !line.startsWith(":")) {
-    return null;
-  }
-  const [name, ...args] = line.slice(1).trim().split(/\s+/);
+function runUnknownEx({ name, args }) {
   const command = pluginCommands.get(name);
-  return command === undefined ? null : { command, args };
+  if (command === undefined) {
+    throw new Error(`not an editor command: ${name}`);
+  }
+  const trimmed = args.trim();
+  runPlugin(command, trimmed === "" ? [] : trimmed.split(/\s+/));
 }
 
 /**
@@ -594,7 +598,7 @@ function pluginInvocation(keys) {
  * The buffer goes over by value and the answer comes back by value, which is the whole of what
  * the ABI lets a plugin touch (`wit/README.md`): the edit is applied here, by the host.
  */
-function runPlugin({ command, args }) {
+function runPlugin(command, args) {
   try {
     // Applying the edit is inside the same `try` as the call that answered with it: an edit the
     // host cannot carry out — a range that is not in the buffer — is the plugin's failure just

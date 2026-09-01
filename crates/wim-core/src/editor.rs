@@ -2132,7 +2132,19 @@ mod tests {
             Vec::new(),
             "an empty line does nothing"
         );
-        assert_eq!(error("ab", ":nope<CR>"), "not an editor command: nope");
+        assert_eq!(
+            effects("ab", ":nope x<CR>"),
+            vec![Effect::UnknownExCommand {
+                name: "nope".to_owned(),
+                args: "x".to_owned()
+            }],
+            "a name the core has no command for is the host's to run or to refuse"
+        );
+        assert_eq!(
+            error("ab", ":%nope<CR>"),
+            ":nope takes no range",
+            "a host's command runs over the buffer it is handed"
+        );
     }
 
     #[test]
