@@ -13,7 +13,7 @@ repository = "https://github.com/bannzai/wim"
 [workspace.dependencies]
 # Pinned rather than left to a caret range: what this generates is the ABI surface itself, so a
 # plugin has to be reproducible from the committed Cargo.lock.
-wit-bindgen = "=0.61.1"
+wit-bindgen = "=0.62.0"
 # The Markdown reader `markdown-preview` renders with, pinned for the same reason the plugins are
 # built from a committed lock: what a plugin turns a buffer into is checked against fixed HTML in
 # its own tests, and a reader that changed under it would move that output without the tree
