@@ -8,7 +8,7 @@
     "test": "playwright test"
   },
   "devDependencies": {
-    "@bytecodealliance/jco": "1.32.1",
-    "@playwright/test": "^1.56.0"
+    "@bytecodealliance/jco": "1.33.0",
+    "@playwright/test": "^1.63.0"
   }
 }
