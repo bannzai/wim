@@ -33,7 +33,7 @@ cap-fs-ext = "4.0"
 # Pinned rather than left to a caret range, the way `wit-bindgen` is in plugins/Cargo.toml: the
 # host bindings this generates are the other half of the ABI, and wasmtime's component API still
 # moves between majors.
-wasmtime = { version = "=48.0.1", default-features = false, features = [
+wasmtime = { version = "=48.0.2", default-features = false, features = [
     "component-model",
     "cranelift",
     "runtime",
