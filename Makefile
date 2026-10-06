@@ -72,3 +72,13 @@ test-plugin-host: build-plugins
 	WIM_PLUGIN_WASM="$(CURDIR)/$(HELLO_WIM)" \
 		WIM_MARKDOWN_PREVIEW_WASM="$(CURDIR)/$(MARKDOWN_PREVIEW)" \
 		cargo test -p wim-plugin-host -p wim --locked
+
+# 引数なしの make で動作確認 (verify) を実行する
+.DEFAULT_GOAL := verify
+
+.PHONY: verify
+verify: check-plugins
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets -- -D warnings
+	bash scripts/vendor-tree-sitter.sh --check
+	cargo test --workspace
