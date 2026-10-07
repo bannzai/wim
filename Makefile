@@ -73,8 +73,9 @@ test-plugin-host: build-plugins
 		WIM_MARKDOWN_PREVIEW_WASM="$(CURDIR)/$(MARKDOWN_PREVIEW)" \
 		cargo test -p wim-plugin-host -p wim --locked
 
-# 引数なしの make で動作確認 (verify) を実行する
-.DEFAULT_GOAL := verify
+# A bare `make` runs `web`: the entry point for trying the editor by hand. Checks and tests are
+# left to CI (`make verify` runs them locally).
+.DEFAULT_GOAL := web
 
 .PHONY: verify
 verify: check-plugins
