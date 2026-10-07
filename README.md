@@ -144,7 +144,7 @@ cargo test --workspace
 make check-plugins  # plugins/ は別 workspace のため --workspace に入りません
 ```
 
-引数なしの `make` は `verify` target を実行し、上の 4 つと `bash scripts/vendor-tree-sitter.sh --check` (CI の lint job が行う vendor 済み tree-sitter の検査) をまとめて走らせます。
+引数なしの `make` は `web` target を実行し、Wasm とプラグインをビルドしてブラウザデモを http://127.0.0.1:4173/ で起動します (人が手で動作確認するための入口で、検査・テストは含めず CI が行います)。`make verify` は上の 4 つと `bash scripts/vendor-tree-sitter.sh --check` (CI の lint job が行う vendor 済み tree-sitter の検査) をまとめて走らせます。
 
 wasm32 ビルド検査 (`cargo build -p wim-core --target wasm32-unknown-unknown`)、プラグインの component ビルド (`make build-plugins`)、ビルドした component を実際にロードするホストのテスト (`make test-plugin-host`)、その component を transpile したブラウザホストを含むデモページの Playwright E2E (`make e2e`) は CI が行います。
 

@@ -12,7 +12,7 @@ cargo test --workspace
 
 `plugins/` は別 workspace のため、ABI とサンプルプラグインの変更時は `make check-plugins` も実行する。検証内容は `Makefile` を参照。
 
-引数なしの `make` は `verify` target を実行し、上の 3 コマンドと `make check-plugins`、`bash scripts/vendor-tree-sitter.sh --check` をまとめて走らせる。
+引数なしの `make` は `web` target を実行し、Wasm とプラグインをビルドしてブラウザデモを http://127.0.0.1:4173/ で起動する (人が手で動作確認するための入口。検査・テストは含めず CI が行う)。`make verify` は上の 3 コマンドと `make check-plugins`、`bash scripts/vendor-tree-sitter.sh --check` をまとめて走らせる。
 
 ローカルの Homebrew Rust には wasm32 の std が無いため、wasm32 ビルド・component ビルド (`make build-plugins`)・Web デモと Playwright E2E (`make e2e`) の検証は CI に委ねる (`.github/workflows/ci.yml`)。
 
