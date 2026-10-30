@@ -14,7 +14,7 @@ cargo test --workspace
 
 引数なしの `make` は `web` target を実行し、Wasm とプラグインをビルドしてブラウザデモを http://127.0.0.1:4173/ で起動する (人が手で動作確認するための入口。検査・テストは含めず CI が行う)。`make verify` は上の 3 コマンドと `make check-plugins`、`bash scripts/vendor-tree-sitter.sh --check` をまとめて走らせる。
 
-ローカルの Homebrew Rust には wasm32 の std が無いため、wasm32 ビルド・component ビルド (`make build-plugins`)・Web デモと Playwright E2E (`make e2e`) の検証は CI に委ねる (`.github/workflows/ci.yml`)。
+ローカルの Homebrew Rust には wasm32 の std が無いため、wasm32 ビルド・component ビルド (`make build-plugins`)の検証は CI に委ねる (`.github/workflows/ci.yml`)。Web デモと Playwright E2E (`make e2e`) は PR ごとには動かさず、必要な時に `gh workflow run e2e.yml --ref <ブランチ>` で起動する (`.github/workflows/e2e.yml`。E2E を PR の必須チェックにしない方針は bannzai/castle の setup-ci skill)。
 
 ## 設計原則
 
