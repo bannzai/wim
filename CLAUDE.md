@@ -14,7 +14,7 @@ cargo test --workspace
 
 引数なしの `make` は `web` target を実行し、Wasm とプラグインをビルドしてブラウザデモを http://127.0.0.1:4173/ で起動する (人が手で動作確認するための入口。検査・テストは含めず CI が行う)。`make verify` は上の 3 コマンドと `make check-plugins`、`bash scripts/vendor-tree-sitter.sh --check` をまとめて走らせる。
 
-ローカルの Homebrew Rust には wasm32 の std が無いため、wasm32 ビルド・component ビルド (`make build-plugins`)の検証は CI に委ねる (`.github/workflows/ci.yml`)。Web デモと Playwright E2E (`make e2e`) は PR ごとには動かさず、必要な時に `gh workflow run e2e.yml --ref <ブランチ>` で起動する (`.github/workflows/e2e.yml`。E2E を PR の必須チェックにしない方針は bannzai/castle の setup-ci skill)。
+ローカルの Homebrew Rust には wasm32 の std が無いため、wasm32 ビルド・component ビルド (`make build-plugins`)の検証は CI に委ねる (`.github/workflows/ci.yml`)。Web デモと Playwright E2E (`make e2e`) は PR ごとには動かさず、必要な時に `gh workflow run e2e.yml --ref <ブランチ>` で起動し、dispatch の run は PR の checks に出ないため、`gh run list --workflow e2e.yml --branch <ブランチ> --limit 1 --json databaseId --jq '.[0].databaseId'` で得た run ID を `gh run watch <run ID> --exit-status` に渡して成否を確かめる (`.github/workflows/e2e.yml`。E2E を PR の必須チェックにしない方針は bannzai/castle の setup-ci skill)。
 
 ## 設計原則
 
