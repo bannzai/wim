@@ -19,7 +19,7 @@ wit-bindgen = "=0.63.0"
 # its own tests, and a reader that changed under it would move that output without the tree
 # changing. `html` is the only feature the plugin uses; the default set also pulls in `getopts`,
 # which is there for the crate's own binary and has no place in a wasm component.
-pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "=0.13.5", default-features = false, features = ["html"] }
 
 [profile.release]
 # Plugins ship as .wasm, where the size of the artifact matters more than the last bit of speed.
